@@ -1,0 +1,9 @@
+*notes.txt
+_Deparsed_XSubs.pm
+cleanup_and_convert*
+*~
++.old
+*.bak
+*.ori
+*.diff
+*.patch
