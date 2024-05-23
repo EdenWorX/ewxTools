@@ -158,7 +158,7 @@ for mkv in "${xInputFiles[@]}"; do
 	fi
 
 	if [[ $hasl -eq 1 ]]; then
-		${CAC} --input "${mkv}" --output "${xTARGET}" ${xSPLITAUDIO} ${xDOUPGRADE} ${xTEMPDIR}
+		${CAC} --input "${mkv}" --output "${dest}" ${xSPLITAUDIO} ${xDOUPGRADE} ${xTEMPDIR}
 		res=$?
 		rm -f "${lock}"
 		
