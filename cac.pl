@@ -202,7 +202,7 @@ defined( $FP ) and ( 0 < length( $FP ) ) and -x $FP or log_error( "No ffprobe av
 # ================	  MAIN  PROGRAM	  ================
 # ---------------------------------------------------------
 $work_done = 1; # From now on we consider this program as at work
-log_info( "Processing start" );
+log_info( "Processing %s start", $path_target );
 
 
 # ---
@@ -328,7 +328,7 @@ END {
 			}
 		}
 
-		( $ret_global > 0 ) and log_error( "Processing FAILED!" ) or log_info( "Processing finished" );
+		( $ret_global > 0 ) and log_error( "Processing %s FAILED!", $path_target ) or log_info( "Processing %s finished", $path_target );
 
 		if ( ( 0 < length( $logfile ) ) && ( -f $logfile ) ) {
 			( ( $ret_global > 0 ) || ( 1 == $do_debug ) ) and printf( "\nSee %s for details\n", $logfile ) or unlink( $logfile );
