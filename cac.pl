@@ -2,9 +2,12 @@
 use strict;
 use warnings FATAL => 'all';
 
+use IPC::System::Simple qw( capturex runx systemx $EXITVAL );
+use POSIX qw( _exit floor :sys_wait_h );
 use threads (
 	'yield',
 	'stack_size' => 64 * 4096,
+	'exit'       => 'threads_only',
 	'stringify'
 );
 use threads::shared;
@@ -13,7 +16,6 @@ use Data::Dumper;
 use File::Basename;
 use Filesys::Df;
 use Getopt::Long;
-use IPC::System::Simple qw( capturex runx systemx $EXITVAL );
 use Pod::Usage;
 use Readonly;
 use Time::HiRes qw( usleep );
@@ -43,9 +45,24 @@ Readonly my $VERSION => "1.0.0";
 # Shared Variables
 # ---------------------------------------------------------
 our ( $death_note, $do_debug, $have_progress_msg, $logfile, $ret_global ) :shared;
+our %work_children :shared;
+our %work_result :shared;
 our @work_status :shared;
 our ( $THR_INACTIVE, $THR_CREATED, $THR_RUNNING, $THR_FINISHED, $THR_STOPPED, $THR_JOINED ) :shared;
 
+
+# ---------------------------------------------------------
+# REAPER function - $SIG{CHLD} exit handler
+# ---------------------------------------------------------
+sub reaper {
+	while ( my $kid          = waitpid( -1, POSIX::WNOHANG ) > 0 ) {
+		$work_children{$kid} = 0;
+	}
+
+	local $SIG{CHLD} = \&reaper;
+
+	return 1;
+}
 
 # ---------------------------------------------------------
 # Worker Threads
@@ -53,6 +70,24 @@ our ( $THR_INACTIVE, $THR_CREATED, $THR_RUNNING, $THR_FINISHED, $THR_STOPPED, $T
 sub worker {
 	my ( $tid, @cmd ) = @_;
 	my $result        = 0;
+	my $kid           = 0;
+	my $killme        = 0;
+
+	# Handle signals internally
+	local $SIG{CHLD} = \&reaper;
+	local $SIG{KILL} = sub {
+		( $kid > 0 ) and log_warning( "Sending KILL to pid %d", $kid ) and kill( 'KILL', $kid ) and reaper()
+		or $work_children{$kid} = 0;
+		$killme                 = 1;
+	};
+	local $SIG{TERM} = sub {
+		( $kid > 0 ) and log_warning( "Sending TERM to pid %d", $kid ) and kill( 'TERM', $kid ) and reaper();
+		$killme      = 1;
+	};
+
+	# Re-route warnings and errors to the log file
+	local $SIG{__WARN__} = \&warnHandler;
+	local $SIG{__DIE__}  = \&dieHandler;
 
 	# Mark this thread as started
 	$work_status[$tid] = $THR_CREATED;
@@ -70,20 +105,42 @@ sub worker {
 		return $result;
 	}
 
-	# Run the command
-	eval {
-		runx( @cmd );
-	};
+	# We do not run this ourselves, we fork out and check for the fork finishing.
+	$kid = fork();
 
-	if ( defined( $@ ) && ( 0 < length( $@ ) ) ) {
-		log_error( "Thread failed:\n%s", $@ );
-		$result = $EXITVAL;
+	if ( 0 == $kid ) {
+		# This is the fork, so run the command
+		eval {
+			runx( @cmd );
+		};
+
+		if ( defined( $@ ) && ( 0 < length( $@ ) ) ) {
+			log_error( "Thread failed:\n%s", $@ );
+			$result = $EXITVAL;
+		}
+
+		$work_result{$$} = $result;
+
+		# Use posix _exit() or forks from multiple threads block each other
+		_exit( $result );
+	}
+
+	# Now we wait for the child to make itself go away
+	$work_children{$kid} = 1;
+	while ( ( 1 == $work_children{$kid} ) && ( 0 == $killme ) ) {
+		yield();
+		usleep( 100000 ); ## 10 checks per second should be enough
+		yield();
 	}
 
 	# Mark this thread as finished
 	$work_status[$tid] = $THR_FINISHED;
 
-	return $result;
+	# If we are killed, log it
+	( 1 == $killme ) and log_error( "Thread %d KILLED", $tid );
+
+	# Now either give the work or our result back
+	return defined( $work_result{$kid} ) ? $work_result{$kid} : $result;
 }
 
 
@@ -186,8 +243,10 @@ BEGIN {
 	$THR_JOINED   = 5;
 
 	# signal handling
-	$death_note  = 0;
-	@work_status = ( $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE );
+	$death_note    = 0;
+	%work_children = ();
+	%work_result   = ();
+	@work_status   = ( $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE );
 
 	# logging
 	$do_debug          = 0;
@@ -337,6 +396,9 @@ if ( can_work() ) {
 		}
 	}
 }
+
+
+exit $ret_global;
 
 
 # ---------------------------------------------------------
@@ -759,11 +821,6 @@ sub dieHandler {
 	return log_error( "%s", $err );
 }
 
-sub floor {
-	my ( $float ) = @_;
-	return sprintf( "%d", $float );
-}
-
 sub format_bitrate {
 	my ( $float ) = @_;
 	return lc( human_readable_size( $float )) . "bits/s";
@@ -863,7 +920,9 @@ sub load_progress {
 	defined( $prgData->{total_size} ) or $prgData->{total_size}   = 0;
 
 	# Leave early if the log file is not there (yet)
-	( ( 0 == length( $prgLog ) ) || ( !-f $prgLog ) || ( 0 == -s $prgLog ) || !open( my $fIn, "<", $prgLog ) ) and return 0;
+	( ( 0 == length( $prgLog ) ) || ( !-f $prgLog ) || !open( my $fIn, "<", $prgLog ) ) and return 1;
+	# Note: We return 1 here, because it is not a problem if ffmpeg neads a while to start up, especially
+	#       on very large video files which may hang during analysis phase.
 	close( $fIn ); # We do not read it like that, it was just for testing if the file cvan be opened.
 
 	my $line_num    = 0;
@@ -1095,7 +1154,7 @@ sub watch_my_threads {
 	my @workers      = @{ $data->{thr} // [] };
 	my $thr_count    = $data->{cnt} // scalar @workers;
 	my $thr_active   = $thr_count;
-	my @thr_progress = ( 20, 20, 20, 20 );
+	my @thr_progress = ( 84, 84, 84, 84 ); # 60 intervals = 30 seconds, plus 24 intervals for 4 phases with 4 seconds each
 
 	# The whole watching is done in two phases.
 	log_debug( "Progress Logs: %s", join( ', ', @prgLogs ));
@@ -1109,19 +1168,20 @@ sub watch_my_threads {
 
 		# Load the current progress data
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( $workers[$i]->is_joinable() && ( $THR_FINISHED == $work_status[$i] ) ) {
+			if ( !( defined( $workers[$i] ) && ( $workers[$i]->is_running() ) ) ) {
 				--$thr_active;
 				$work_status[$i] = $THR_STOPPED; # Thread acknowledged as being stopped
 			}
 
 			# Load progress of the current thread
-			load_progress( $prgLogs[$i], \%prgData ) or --$thr_progress[$i];
+			load_progress( $prgLogs[$i], \%prgData ) and $thr_progress[$i] = 84 or --$thr_progress[$i];
 			yield();
 
 			# If the thread has not been started, start it now
-			( $THR_CREATED == $work_status[$i] ) and $work_status[$i] = $THR_RUNNING
-			and $thr_progress[$i]                                     = 20; ## reset the progress counter
-		}                                                                   ## end of looping threads
+			( $THR_CREATED == $work_status[$i] )
+			and $work_status[$i]  = $THR_RUNNING
+			and $thr_progress[$i] = 84; ## reset the progress counter
+		}                               ## end of looping threads
 
 		# If all threads are inactive now, log the final progress
 		( 0 == $thr_active ) and show_progress( $thr_count, $thr_active, \%prgData, 1 ) and next;
@@ -1129,16 +1189,29 @@ sub watch_my_threads {
 		# Otherwise show the accumulated progress data
 		show_progress( $thr_count, $thr_active, \%prgData, 0 );
 
+		# If we are called to kill via signal, be mean to the threads and let them kill their forks (Not all at once, though)
+		if ( $death_note > 0 ) {
+			for ( my $i = 0; $i < $thr_count; ++$i ) {
+				( 1 == $death_note ) and defined( $workers[$i] ) and $workers[$i]->is_running()
+				and log_warning( "TERMing thread %d", $i ) and $workers[$i]->kill( 'TERM' );
+				# Note: 5 is after 2 seconds
+				( 5 == $death_note ) and defined( $workers[$i] ) and $workers[$i]->is_running()
+				and log_warning( "KILLing thread %d", $i ) and $workers[$i]->kill( 'KILL' );
+			}
+			++$death_note;
+		}
+
 		# if any thread has not returned 0 from load_progress() for 10 seconds, we consider it frozen
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
+			can_work() or last; ## Do not unfreeze while killing
 			( ( $thr_progress[$i] > 0 ) or ( $work_status[$i] != $THR_RUNNING ) ) and next;
 
-			# We do this in five phases, but check them in reverse:
-			if ( -4 > $thr_progress[$i] ) {
+			# We do this in five phases, each has 3 seconds, but check them in reverse:
+			if ( $thr_progress[$i] < 1 ) {
 				# Phase 5: It is time to restart the thread
 				log_warning( "Re-starting frozen thread %d", $i );
 				$workers[$i] = threads->create( \&worker, $i, @{ $ffargs[$i] } );
-			} elsif ( -3 == $thr_progress[$i] ) {
+			} elsif ( ( $thr_progress[$i] > 0 ) && ( $thr_progress[$i] < 7 ) ) {
 				# Phase 4: We had two termination and a kill signal. It is time to detach the thread
 				if ( defined( $workers[$i] ) ) {
 					if ( $workers[$i]->is_joinable() ) {
@@ -1152,18 +1225,18 @@ sub watch_my_threads {
 				}
 				$work_status[$i] = $THR_INACTIVE;
 				-f $prgLogs[$i] and unlink( $prgLogs[$i] );
-			} elsif ( -2 == $thr_progress[$i] ) {
+			} elsif ( ( $thr_progress[$i] > 6 ) && ( $thr_progress[$i] < 13 ) ) {
 				# Phase 3: Send a SIGKILL
 				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending SIGKILL to frozen thread %d", $i )
-				and $workers[$i]->kill( 'SIGKILL' ) or $thr_progress[$i] = -3;
-			} elsif ( -1 == $thr_progress[$i] ) {
+				and $workers[$i]->kill( 'KILL' ) or $thr_progress[$i] = 6;
+			} elsif ( ( $thr_progress[$i] > 12 ) && ( $thr_progress[$i] < 19 ) ) {
 				# Phase 2: Send another SIGTERM
 				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending second SIGTERM to frozen thread %d", $i )
-				and $workers[$i]->kill( 'SIGTERM' ) or $thr_progress[$i] = -3;
-			} elsif ( 0 == $thr_progress[$i] ) {
+				and $workers[$i]->kill( 'TERM' ) or $thr_progress[$i] = 6;
+			} elsif ( ( $thr_progress[$i] > 18 ) && ( $thr_progress[$i] < 25 ) ) {
 				# Phase 1: Send a SIGTERM
 				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending first SIGTERM to frozen thread %d", $i )
-				and $workers[$i]->kill( 'SIGTERM' ) or $thr_progress[$i] = -3;
+				and $workers[$i]->kill( 'TERM' ) or $thr_progress[$i] = 6;
 			}
 		}
 
@@ -1177,9 +1250,10 @@ sub watch_my_threads {
 	# Phase 2: Join all Threads back and handle result values
 	while ( $thr_active > 0 ) {
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( $workers[$i]->is_joinable() && ( $THR_STOPPED == $work_status[$i] ) ) {
-				my $res          = $workers[$i]->join();
+			if ( !( defined( $workers[$i] ) && $workers[$i]->is_running() ) ) {
+				my $res          = ( defined( $workers[$i] ) && $workers[$i]->is_joinable() ) ? $workers[$i]->join() : 0;
 				$work_status[$i] = $THR_JOINED;
+				defined( $workers[$i] ) and undef( $workers[$i] );
 				if ( $res != 0 ) {
 					log_error( "Thread %d failed [%d]", $i, $res );
 					$result = 0;
