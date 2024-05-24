@@ -2,6 +2,13 @@
 use strict;
 use warnings FATAL => 'all';
 
+use threads (
+	'yield',
+	'stack_size' => 64 * 4096,
+	'stringify'
+);
+use threads::shared;
+
 use Data::Dumper;
 use File::Basename;
 use Filesys::Df;
@@ -9,13 +16,6 @@ use Getopt::Long;
 use IPC::System::Simple qw( capturex runx systemx $EXITVAL );
 use Pod::Usage;
 use Readonly;
-use threads (
-	'yield',
-	'stack_size' => 64 * 4096,
-	'exit'       => 'threads_only',
-	'stringify'
-);
-use threads::shared;
 use Time::HiRes qw( usleep );
 
 
@@ -42,23 +42,48 @@ Readonly my $VERSION => "1.0.0";
 # ---------------------------------------------------------
 # Shared Variables
 # ---------------------------------------------------------
-our ( $death_note, $do_debug, $ret_global ) :shared;
+our ( $death_note, $do_debug, $have_progress_msg, $logfile, $ret_global ) :shared;
+our @work_status :shared;
+our ( $THR_INACTIVE, $THR_CREATED, $THR_RUNNING, $THR_FINISHED, $THR_STOPPED, $THR_JOINED ) :shared;
 
 
 # ---------------------------------------------------------
 # Worker Threads
 # ---------------------------------------------------------
 sub worker {
-	my @cmd = @_;
+	my ( $tid, @cmd ) = @_;
+	my $result        = 0;
+
+	# Mark this thread as started
+	$work_status[$tid] = $THR_CREATED;
+
+	# Wait for the signal to run the command
+	while ( $THR_CREATED == $work_status[$tid] ) {
+		yield();
+		usleep( 250000 ); ## We check max 4 times a second.
+		yield();
+	}
+
+	# If the thread was not set to active mode leave now
+	if ( $THR_RUNNING != $work_status[$tid] ) {
+		$work_status[$tid] = $THR_FINISHED;
+		return $result;
+	}
+
+	# Run the command
 	eval {
 		runx( @cmd );
 	};
 
 	if ( defined( $@ ) && ( 0 < length( $@ ) ) ) {
 		log_error( "Thread failed:\n%s", $@ );
-		return $EXITVAL;
+		$result = $EXITVAL;
 	}
-	return 0;
+
+	# Mark this thread as finished
+	$work_status[$tid] = $THR_FINISHED;
+
+	return $result;
 }
 
 
@@ -70,8 +95,6 @@ our Readonly $LOG_STATUS;
 our Readonly $LOG_INFO;
 our Readonly $LOG_WARNING;
 our Readonly $LOG_ERROR;
-
-our $logfile;
 
 
 # ---------------------------------------------------------
@@ -123,7 +146,6 @@ my $do_print_help      = 0;
 my $do_print_version   = 0;
 my $do_split_audio     = 0;
 my $force_upgrade      = 0;
-my $have_progress_msg  = 0;
 my $max_fps            = 0;
 my $target_fps         = 0;
 my @path_source        = ();
@@ -155,12 +177,22 @@ BEGIN {
 	$LOG_WARNING = 3;
 	$LOG_ERROR   = 4;
 
+	# thread status
+	$THR_INACTIVE = 0;
+	$THR_CREATED  = 1;
+	$THR_RUNNING  = 2;
+	$THR_FINISHED = 3;
+	$THR_STOPPED  = 4;
+	$THR_JOINED   = 5;
+
 	# signal handling
-	$death_note = 0;
+	$death_note  = 0;
+	@work_status = ( $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE );
 
 	# logging
-	$do_debug = 0;
-	$logfile  = "";
+	$do_debug          = 0;
+	$have_progress_msg = 0;
+	$logfile           = "";
 
 	# Global return value, is set to 1 by log_error()
 	$ret_global = 0;
@@ -678,11 +710,12 @@ sub create_target_file {
 	               @FF_ARGS_CODEC_h264, $path_target, @mapVoice );
 
 	log_debug( "Starting Thread for:\n%s", join( ' ', @ffargs ));
-	#@type threads
-	my $worker = threads->create( \&worker, @ffargs );
+	#@type Thread
+	my $worker = threads->create( \&worker, 0, @ffargs );
 
 	# Watch and join
 	return watch_my_threads( {
+		arg => [ \@ffargs ],
 		cnt => 1,
 		prg => [ $prgfile ],
 		src => "",
@@ -768,7 +801,7 @@ sub interpolate_source_group {
 	can_work() or return 1;
 
 	# We do not need any fancy loops here, because there will always be 4 segments, and thus 4 threads. No exceptions.
-	#@type threads
+	#@type Thread
 	my @workers = ( undef, undef, undef, undef );
 	my @prgLogs = (
 		sprintf( $source_groups{$gid}{prg}, 0 ),
@@ -791,22 +824,24 @@ sub interpolate_source_group {
 
 	# Building the four worker threads is quite trivial
 	can_work() or return 1;
+	my @ffargs  = ( [], [], [], [] );
 	for ( my $i = 0; $i < 4; ++$i ) {
 		# Let's build the command line arguments:
-		my @ffargs = ( $FF, @FF_ARGS_START, "-progress", $prgLogs[$i],
-		               ( ( "guess" ne $audio_layout ) ? ( "-guess_layout_max", "0" ) : () ),
-		               @FF_ARGS_INPUT_VULK, sprintf( $source_groups{$gid}{$tmp_from}, $i ),
-		               @FF_ARGS_ACOPY_FIL, $F_assembled, "-fps_mode", "cfr", @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV,
-		               sprintf( $source_groups{$gid}{$tmp_to}, $i )
-		);
+		$ffargs[$i] = [ $FF, @FF_ARGS_START, "-progress", $prgLogs[$i],
+		                ( ( "guess" ne $audio_layout ) ? ( "-guess_layout_max", "0" ) : () ),
+		                @FF_ARGS_INPUT_VULK, sprintf( $source_groups{$gid}{$tmp_from}, $i ),
+		                @FF_ARGS_ACOPY_FIL, $F_assembled, "-fps_mode", "cfr", @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV,
+		                sprintf( $source_groups{$gid}{$tmp_to}, $i )
+		];
 
 		log_debug( "Starting Thread for:\n%s", join( ' ', @ffargs ));
-		#@type threads
-		$workers[$i] = threads->create( \&worker, @ffargs );
+		#@type Thread
+		$workers[$i] = threads->create( \&worker, $i, @{ $ffargs[$i] } );
 	}
 
 	# Watch and join
 	return watch_my_threads( {
+		arg => \@ffargs,
 		cnt => 4,
 		prg => \@prgLogs,
 		src => $source_groups{$gid}{$tmp_from},
@@ -830,7 +865,7 @@ sub load_progress {
 	defined( $prgData->{total_size} ) or $prgData->{total_size}   = 0;
 
 	# Leave early if the log file is not there (yet)
-	( ( 0 == length( $prgLog ) ) || ( !-f $prgLog ) || !open( my $fIn, "<", $prgLog ) ) and return 1;
+	( ( 0 == length( $prgLog ) ) || ( !-f $prgLog ) || ( 0 == -s $prgLog ) || !open( my $fIn, "<", $prgLog ) ) and return 0;
 	close( $fIn ); # We do not read it like that, it was just for testing if the file cvan be opened.
 
 	my $line_num    = 0;
@@ -867,7 +902,7 @@ sub load_progress {
 		++$line_num;
 	}
 
-	return 1;
+	return ( 2 == $progress_no ) ? 1 : 0; ## If the progress line count is 0 or 1, the process is not (really) started (, yet)
 }
 
 sub logMsg {
@@ -982,11 +1017,12 @@ sub segment_source_group {
 	               $source_groups{$gid}{tmp} );
 
 	log_debug( "Starting Thread for:\n%s", join( ' ', @ffargs ));
-	#@type threads
-	my $worker = threads->create( \&worker, @ffargs );
+	#@type Thread
+	my $worker = threads->create( \&worker, 0, @ffargs );
 
 	# Watch and join
 	my $result = watch_my_threads( {
+		arg => [ \@ffargs ],
 		cnt => 1,
 		prg => [ $prgfile ],
 		src => "",
@@ -1044,14 +1080,16 @@ sub warnHandler {
 
 # This is a watchdog function that displays progress and joins all threads nicely if needed
 sub watch_my_threads {
-	my ( $data )   = @_;
-	my $result     = 1;
-	my @prgLogs    = @{ $data->{prg} // [] };
-	my $src_fmt    = $data->{src} // "unknown_src_%d.mkv";
-	my $tgt_fmt    = $data->{tgt} // "unknown_tgt_%d.mkv";
-	my @workers    = @{ $data->{thr} // [] };
-	my $thr_count  = $data->{cnt} // scalar @workers;
-	my $thr_active = $thr_count;
+	my ( $data )     = @_;
+	my $result       = 1;
+	my @ffargs       = @{ $data->{arg} // [ [], [], [], [] ] };
+	my @prgLogs      = @{ $data->{prg} // [] };
+	my $src_fmt      = $data->{src} // "unknown_src_%d.mkv";
+	my $tgt_fmt      = $data->{tgt} // "unknown_tgt_%d.mkv";
+	my @workers      = @{ $data->{thr} // [] };
+	my $thr_count    = $data->{cnt} // scalar @workers;
+	my $thr_active   = $thr_count;
+	my @thr_progress = ( 20, 20, 20, 20 );
 
 	# The whole watching is done in two phases.
 	log_debug( "Progress Logs: %s", join( ', ', @prgLogs ));
@@ -1062,33 +1100,77 @@ sub watch_my_threads {
 	# Phase 1: show logged progress as long as there are non-joinable threads left
 	while ( $thr_active > 0 ) {
 		my %prgData = ();
-		$thr_active = $thr_count;
+
+		# Load the current progress data
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( $workers[$i]->is_joinable() ) {
+			if ( $workers[$i]->is_joinable() && ( $THR_FINISHED == $work_status[$i] ) ) {
 				--$thr_active;
+				$work_status[$i] = $THR_STOPPED; # Thread acknowledged as being stopped
 			}
+
 			# Load progress of the current thread
-			load_progress( $prgLogs[$i], \%prgData );
+			load_progress( $prgLogs[$i], \%prgData ) or --$thr_progress[$i];
 			yield();
-		} # end of looping threads
+
+			# If the thread has not been started, start it now
+			( $THR_CREATED == $work_status[$i] ) and $work_status[$i] = $THR_RUNNING
+			and $thr_progress[$i]                                     = 20; ## reset the progress counter
+		}                                                                   ## end of looping threads
 
 		# Now show the accumulated progress data
 		show_progress( $thr_count, $thr_active, \%prgData );
 		usleep( 500000 ); # Sleep for half a second
-	}                     ## End of showing threads progress
+
+		# if any thread has not returned 0 from load_progress() for 10 seconds, we consider it frozen
+		for ( my $i = 0; $i < $thr_count; ++$i ) {
+			( ( $thr_progress[$i] > 0 ) or ( $work_status[$i] != $THR_RUNNING ) ) and next;
+
+			# We do this in five phases, but check them in reverse:
+			if ( -4 > $thr_progress[$i] ) {
+				# Phase 5: It is time to restart the thread
+				log_warning( "Re-starting frozen thread %d", $i );
+				$workers[$i] = threads->create( \&worker, $i, @{ $ffargs[$i] } );
+			} elsif ( -3 == $thr_progress[$i] ) {
+				# Phase 4: We had two termination and a kill signal. It is time to detach the thread
+				if ( defined( $workers[$i] ) ) {
+					if ( $workers[$i]->is_joinable() ) {
+						log_warning( "Joining frozen thread %d", $i );
+						$workers[$i]->join();
+					} elsif ( !$workers[$i]->is_detached() ) {
+						log_warning( "DETACHING frozen thread %d", $i );
+						$workers[$i]->detach();
+					}
+					undef( $workers[$i] );
+				}
+				$work_status[$i] = $THR_INACTIVE;
+				-f $prgLogs[$i] and unlink( $prgLogs[$i] );
+			} elsif ( -2 == $thr_progress[$i] ) {
+				# Phase 3: Send a SIGKILL
+				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending SIGKILL to frozen thread %d", $i )
+				and $workers[$i]->kill( 'SIGKILL' ) or $thr_progress[$i] = -3;
+			} elsif ( -1 == $thr_progress[$i] ) {
+				# Phase 2: Send another SIGTERM
+				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending second SIGTERM to frozen thread %d", $i )
+				and $workers[$i]->kill( 'SIGTERM' ) or $thr_progress[$i] = -3;
+			} elsif ( 0 == $thr_progress[$i] ) {
+				# Phase 1: Send a SIGTERM
+				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending first SIGTERM to frozen thread %d", $i )
+				and $workers[$i]->kill( 'SIGTERM' ) or $thr_progress[$i] = -3;
+			}
+		}
+	} ## End of showing threads progress
 
 	# Reset active count, as we have to count them down again
 	$thr_active = $thr_count;
 
 	# Phase 2: Join all Threads back and handle result values
 	while ( $thr_active > 0 ) {
-		$thr_active = $thr_count;
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( $workers[$i]->is_joinable() ) {
-				my $tid = $workers[$i]->tid();
-				my $res = $workers[$i]->join();
+			if ( $workers[$i]->is_joinable() && ( $THR_STOPPED == $work_status[$i] ) ) {
+				my $res          = $workers[$i]->join();
+				$work_status[$i] = $THR_JOINED;
 				if ( $res != 0 ) {
-					log_error( "Thread %d failed [%d]", $tid, $res );
+					log_error( "Thread %d failed [%d]", $i, $res );
 					$result = 0;
 
 					# We do not need the target file any more, the thread failed! (if an fmt is set)
@@ -1114,6 +1196,12 @@ sub watch_my_threads {
 			yield();
 		} # end of looping threads
 	}     ## End of joining worker threads
+
+	# Eventually mark all threads as inactive / gone
+	for ( my $i = 0; $i < $thr_count; ++$i ) {
+		defined( $data->{thr}[$i] ) and undef( $data->{thr}[$i] );
+		$work_status[$i] = $THR_INACTIVE;
+	}
 
 	return $result;
 }
