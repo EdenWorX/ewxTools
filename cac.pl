@@ -362,9 +362,7 @@ END {
 
 		( $ret_global > 0 ) and log_error( "Processing %s FAILED!", $path_target ) or log_info( "Processing %s finished", $path_target );
 
-		if ( ( 0 < length( $logfile ) ) && ( -f $logfile ) ) {
-			( ( $ret_global > 0 ) || ( 1 == $do_debug ) ) and printf( "\nSee %s for details\n", $logfile ) or unlink( $logfile );
-		}
+		( ( 0 < length( $logfile ) ) && ( -f $logfile ) ) and ( ( $ret_global > 0 ) || ( 1 == $do_debug ) ) and printf( "\nSee %s for details\n", $logfile );
 	}
 } ## End END
 
