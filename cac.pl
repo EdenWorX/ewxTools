@@ -55,6 +55,10 @@ our ( $THR_INACTIVE, $THR_CREATED, $THR_RUNNING, $THR_FINISHED, $THR_STOPPED, $T
 # REAPER function - $SIG{CHLD} exit handler
 # ---------------------------------------------------------
 sub reaper {
+	my @args = @_;
+
+	log_debug( "reaper called with: '%s'", join( ", ", @args ));
+
 	while ( my $kid          = waitpid( -1, POSIX::WNOHANG ) > 0 ) {
 		$work_children{$kid} = 0;
 	}
@@ -82,7 +86,7 @@ sub worker {
 	};
 	local $SIG{TERM} = sub {
 		( $kid > 0 ) and log_warning( "Sending TERM to pid %d", $kid ) and kill( 'TERM', $kid ) and reaper();
-		$killme      = 1;
+		$killme = 1;
 	};
 
 	# Re-route warnings and errors to the log file
@@ -121,15 +125,19 @@ sub worker {
 
 		$work_result{$$} = $result;
 
-		# Use posix _exit() or forks from multiple threads block each other
-		_exit( $result );
+		exit;
 	}
 
 	# Now we wait for the child to make itself go away
 	$work_children{$kid} = 1;
 	while ( ( 1 == $work_children{$kid} ) && ( 0 == $killme ) ) {
 		yield();
-		usleep( 100000 ); ## 10 checks per second should be enough
+		usleep( ( $do_debug > 0 ) ? 1000000 : 100000 ); ## 1/10 checks per second should be enough
+		# Let's see whether this one is ready
+		my $pid = waitpid( $kid, POSIX::WNOHANG );
+		log_debug( "kid %d status: %d, waitpid: %d", $kid, $work_children{$kid}, $pid );
+		( $kid == $pid ) and $work_children{$kid} = 0; ## gone...
+		( -1 == $pid ) and $killme                = 1; ## something bad happened...
 		yield();
 	}
 
@@ -398,9 +406,6 @@ if ( can_work() ) {
 }
 
 
-exit $ret_global;
-
-
 # ---------------------------------------------------------
 # END Handler
 # ---------------------------------------------------------
@@ -427,6 +432,9 @@ END {
 		( ( 0 < length( $logfile ) ) && ( -f $logfile ) ) and ( ( $ret_global > 0 ) || ( 1 == $do_debug ) ) and printf( "\nSee %s for details\n", $logfile );
 	}
 } ## End END
+
+
+exit $ret_global;
 
 
 # ---------------------------------------------------------
@@ -889,7 +897,7 @@ sub interpolate_source_group {
 		                sprintf( $source_groups{$gid}{$tmp_to}, $i )
 		];
 
-		log_debug( "Starting Thread for:\n%s", join( ' ', @ffargs ));
+		log_debug( "Starting Thread for:\n%s", join( ' ', @{ $ffargs[$i] } ));
 		#@type Thread
 		$workers[$i] = threads->create( \&worker, $i, @{ $ffargs[$i] } );
 	}
