@@ -1039,7 +1039,7 @@ sub segment_source_group {
 
 # Show data from between the last two "progress=<state>" lines in the given log file
 sub show_progress {
-	my ( $thr_count, $thr_active, $prgData ) = @_;
+	my ( $thr_count, $thr_active, $prgData, $log_as_info ) = @_;
 
 	# Formualate the progress line
 	my $size_str    = human_readable_size( $prgData->{total_size} // 0 );
@@ -1060,12 +1060,20 @@ sub show_progress {
 
 	my $progress_str = sprintf( "[%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ",
 	                            $thr_active, $prgData->{frames}, $prgData->{drop_frames}, $prgData->{dup_frames}, $time_str, $prgData->{fps}, $bitrate_str, $size_str );
-	( $have_progress_msg > 0 )
-	and print "\r" . ( ' ' x length( $progress_str ) ) . "\r"
-	or $have_progress_msg = 1;
 
-	local $| = 1;
-	print "${progress_str}";
+	# Clear a previous progress line
+	( $have_progress_msg > 0 ) and print "\r" . ( ' ' x length( $progress_str ) ) . "\r";
+
+	if ( 0 < $log_as_info ) {
+		# Write into log file
+		$have_progress_msg = 0;
+		log_info( "%s", $progress_str );
+	} else {
+		# Output on console
+		$have_progress_msg = 1;
+		local $|           = 1;
+		print "${progress_str}";
+	}
 
 	return 1;
 }
@@ -1117,9 +1125,11 @@ sub watch_my_threads {
 			and $thr_progress[$i]                                     = 20; ## reset the progress counter
 		}                                                                   ## end of looping threads
 
-		# Now show the accumulated progress data
-		show_progress( $thr_count, $thr_active, \%prgData );
-		usleep( 500000 ); # Sleep for half a second
+		# If all threads are inactive now, log the final progress
+		( 0 == $thr_active ) and show_progress( $thr_count, $thr_active, \%prgData, 1 ) and next;
+
+		# Otherwise show the accumulated progress data
+		show_progress( $thr_count, $thr_active, \%prgData, 0 );
 
 		# if any thread has not returned 0 from load_progress() for 10 seconds, we consider it frozen
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
@@ -1158,6 +1168,9 @@ sub watch_my_threads {
 				and $workers[$i]->kill( 'SIGTERM' ) or $thr_progress[$i] = -3;
 			}
 		}
+
+		# Sleep for half a second before going back to the loop start
+		usleep( 500000 );
 	} ## End of showing threads progress
 
 	# Reset active count, as we have to count them down again
