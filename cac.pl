@@ -2,7 +2,6 @@
 use strict;
 use warnings FATAL => 'all';
 
-use IPC::System::Simple qw( capturex runx systemx $EXITVAL );
 use POSIX qw( _exit floor :sys_wait_h );
 use threads (
 	'yield',
@@ -12,8 +11,10 @@ use threads (
 );
 use threads::shared;
 
+use Capture::Tiny qw( capture_stdout );
 use Data::Dumper;
 use File::Basename;
+use File::Spec;
 use Filesys::Df;
 use Getopt::Long;
 use Pod::Usage;
@@ -56,10 +57,10 @@ our ( $THR_INACTIVE, $THR_CREATED, $THR_RUNNING, $THR_FINISHED, $THR_STOPPED, $T
 # ---------------------------------------------------------
 sub reaper {
 	my @args = @_;
+	my $kid;
 
-	log_debug( "reaper called with: '%s'", join( ", ", @args ));
-
-	while ( my $kid          = waitpid( -1, POSIX::WNOHANG ) > 0 ) {
+	while ( ( $kid = waitpid( -1, POSIX::WNOHANG ) ) > 0 ) {
+		log_debug( "(reaper) KID %d finished", $kid );
 		$work_children{$kid} = 0;
 	}
 
@@ -67,6 +68,27 @@ sub reaper {
 
 	return 1;
 }
+
+
+# ---------------------------------------------------------
+# TERM/KILL handler for sending signals to forked children
+# ---------------------------------------------------------
+sub terminator {
+	my ( $kid, $signal ) = @_;
+
+	if ( $kid > 0 ) {
+		log_warning( "Sending KILL to pid %d", $kid );
+		if ( kill( $signal, $kid ) ) {
+			threads::yield();
+			reaper();
+		} else {
+			$work_children{$kid} = 0;
+		}
+	}
+
+	return 1;
+}
+
 
 # ---------------------------------------------------------
 # Worker Threads
@@ -80,12 +102,11 @@ sub worker {
 	# Handle signals internally
 	local $SIG{CHLD} = \&reaper;
 	local $SIG{KILL} = sub {
-		( $kid > 0 ) and log_warning( "Sending KILL to pid %d", $kid ) and kill( 'KILL', $kid ) and reaper()
-		or $work_children{$kid} = 0;
-		$killme                 = 1;
+		terminator( $kid, 'KILL' );
+		$killme = 1;
 	};
 	local $SIG{TERM} = sub {
-		( $kid > 0 ) and log_warning( "Sending TERM to pid %d", $kid ) and kill( 'TERM', $kid ) and reaper();
+		terminator( $kid, 'TERM' );
 		$killme = 1;
 	};
 
@@ -98,9 +119,9 @@ sub worker {
 
 	# Wait for the signal to run the command
 	while ( $THR_CREATED == $work_status[$tid] ) {
-		yield();
+		threads::yield();
 		usleep( 250000 ); ## We check max 4 times a second.
-		yield();
+		threads::yield();
 	}
 
 	# If the thread was not set to active mode leave now
@@ -113,17 +134,21 @@ sub worker {
 	$kid = fork();
 
 	if ( 0 == $kid ) {
-		# This is the fork, so run the command
-		eval {
-			runx( @cmd );
-		};
+		# This is the fork, so run the command after closing STD*
+		my $devnull = File::Spec->devnull();
+		open( STDIN, '<', $devnull );
+		open( STDOUT, '>', $devnull );
+		open( STDERR, '>', $devnull );
+		my $res = system( @cmd );
 
-		if ( defined( $@ ) && ( 0 < length( $@ ) ) ) {
-			log_error( "Thread failed:\n%s", $@ );
-			$result = $EXITVAL;
+		if ( $res == -1 ) {
+			log_error( "failed to execute '%s': %s", $cmd[0], $! );
+		} elsif ( $res & 127 ) {
+			log_error( "%s died with signal %d, %s coredump", $cmd[0], ( $res & 127 ), ( $res & 128 ) ? "with" : "without" );
+		} elsif ( $res != 0 ) {
+			log_warning( "'%s' exited with value %d", $cmd[0], $res >> 8 );
 		}
-
-		$work_result{$$} = $result;
+		$work_result{$$} = $res;
 
 		exit;
 	}
@@ -131,14 +156,21 @@ sub worker {
 	# Now we wait for the child to make itself go away
 	$work_children{$kid} = 1;
 	while ( ( 1 == $work_children{$kid} ) && ( 0 == $killme ) ) {
-		yield();
-		usleep( ( $do_debug > 0 ) ? 1000000 : 100000 ); ## 1/10 checks per second should be enough
+		threads::yield();
+		usleep( 100000 ); ## 1/10 checks per second should be enough
 		# Let's see whether this one is ready
-		my $pid = waitpid( $kid, POSIX::WNOHANG );
-		log_debug( "kid %d status: %d, waitpid: %d", $kid, $work_children{$kid}, $pid );
+		my $pid                                   = waitpid( $kid, POSIX::WNOHANG );
 		( $kid == $pid ) and $work_children{$kid} = 0; ## gone...
 		( -1 == $pid ) and $killme                = 1; ## something bad happened...
-		yield();
+		threads::yield();
+	}
+
+	# Ensure to not zombie out, as we only have left the watch loop right now
+	if ( $work_children{$kid} > 0 ) {
+		my $pid = waitpid( $kid, POSIX::WNOHANG );
+		log_debug( "kid %d status: %d, waitpid: %d", $kid, $work_children{$kid}, $pid );
+		( 0 == $pid ) and terminator( $kid, 'KILL' ) and threads::yield() and waitpid( $kid, 0 ); # Kill and complete the wait
+		$work_children{$kid} = 0;                                                                 # Now it is gone.
 	}
 
 	# Mark this thread as finished
@@ -174,6 +206,9 @@ local $SIG{__WARN__} = \&warnHandler;
 
 # And fatal errors go to the log as well
 local $SIG{__DIE__} = \&dieHandler;
+
+# Global SIGCHLD handler
+local $SIG{CHLD} = \&reaper;
 
 
 # ---------------------------------------------------------
@@ -265,8 +300,8 @@ BEGIN {
 	$ret_global = 0;
 
 	# ffmpeg default values
-	chomp( $FF = capturex( "which", "ffmpeg" ));
-	chomp( $FP = capturex( "which", "ffprobe" ));
+	chomp( $FF = `which ffmpeg` );
+	chomp( $FP = `which ffprobe` );
 } ## End BEGIN
 
 
@@ -466,7 +501,8 @@ sub analyze_inputs {
 		my $stream_fields = "avg_frame_rate,duration";
 		my @fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", "-probesize", $source_info{$src}{probeSize}, $src );
 		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		my @fplines        = capturex( @fpcmd );
+		my $fpout          = capture_stdout { system( @fpcmd ) };
+		my @fplines        = split( '\n', $fpout );
 		my $avg_frame_rate = 0;
 		my $duration       = 0;
 		my $probeDura      = 0;
@@ -497,7 +533,8 @@ sub analyze_inputs {
 		$stream_fields = "avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration";
 		@fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", split( / /, $source_info{$src}{probeStrings} ), $src );
 		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		@fplines = capturex( @fpcmd );
+		$fpout   = capture_stdout { system( @fpcmd ) };
+		@fplines = split( '\n', $fpout );
 		foreach my $line ( @fplines ) {
 			chomp $line;
 			#log_debug("RAW[%s]", $line);
@@ -938,7 +975,8 @@ sub load_progress {
 
 	# Suck up the last 20 lines (This *should* be enough to get 2 progress=xxx lines)
 	my @args     = ( "tail", "-n", "20", $prgLog );
-	my @lines    = reverse capturex( @args );
+	my $tailout  = capture_stdout { system( @args ) };
+	my @lines    = reverse split( '\n', $tailout );
 	my $line_cnt = scalar @lines;
 
 	# Go beyond first progress=xxx line found
@@ -1123,8 +1161,10 @@ sub show_progress {
 	defined( $size_str ) or log_error( "%s NOT DEFINED", "\$size_str" ) and $killme                             = 1;
 	( 0 == $killme ) or exit 99;
 
-	my $progress_str = sprintf( "[%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ",
-	                            $thr_active, $prgData->{frames}, $prgData->{drop_frames}, $prgData->{dup_frames}, $time_str, $prgData->{fps}, $bitrate_str, $size_str );
+	my $progress_str = sprintf( "[%d/%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ",
+	                            $thr_active, $thr_count,
+	                            $prgData->{frames}, $prgData->{drop_frames}, $prgData->{dup_frames},
+	                            $time_str, $prgData->{fps}, $bitrate_str, $size_str );
 
 	# Clear a previous progress line
 	( $have_progress_msg > 0 ) and print "\r" . ( ' ' x length( $progress_str ) ) . "\r";
@@ -1137,7 +1177,7 @@ sub show_progress {
 		# Output on console
 		$have_progress_msg = 1;
 		local $|           = 1;
-		print "${progress_str}";
+		print "\r${progress_str}";
 	}
 
 	return 1;
@@ -1162,7 +1202,8 @@ sub watch_my_threads {
 	my @workers      = @{ $data->{thr} // [] };
 	my $thr_count    = $data->{cnt} // scalar @workers;
 	my $thr_active   = $thr_count;
-	my @thr_progress = ( 84, 84, 84, 84 ); # 60 intervals = 30 seconds, plus 24 intervals for 4 phases with 4 seconds each
+	my @thr_progress = ( 60, 60, 60, 60 ); # 60 intervals = 30 seconds
+	my @thr_strikes  = ( 0, 0, 0, 0 );
 
 	# The whole watching is done in two phases.
 	log_debug( "Progress Logs: %s", join( ', ', @prgLogs ));
@@ -1175,21 +1216,28 @@ sub watch_my_threads {
 		my %prgData = ();
 
 		# Load the current progress data
+		$thr_active = $thr_count;
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( !( defined( $workers[$i] ) && ( $workers[$i]->is_running() ) ) ) {
+			if ( !( defined( $workers[$i] ) && $workers[$i]->is_running() && ( $THR_RUNNING == $work_status[$i] ) ) ) {
 				--$thr_active;
-				$work_status[$i] = $THR_STOPPED; # Thread acknowledged as being stopped
+				( $work_status[$i] == $THR_FINISHED ) and $work_status[$i] = $THR_STOPPED; # Thread acknowledged as being stopped
+			}
+
+			# If the thread has not been started, start it now
+			if ( $THR_CREATED == $work_status[$i] ) {
+				log_debug( "Starting Thread %d in one second...", $i );
+				sleep( 1 );
+				$work_status[$i]  = $THR_RUNNING;
+				$thr_progress[$i] = 60;
+				$thr_strikes[$i]  = 0;
+				log_debug( "Thread %d started", $i );
+				threads::yield();
 			}
 
 			# Load progress of the current thread
-			load_progress( $prgLogs[$i], \%prgData ) and $thr_progress[$i] = 84 or --$thr_progress[$i];
-			yield();
-
-			# If the thread has not been started, start it now
-			( $THR_CREATED == $work_status[$i] )
-			and $work_status[$i]  = $THR_RUNNING
-			and $thr_progress[$i] = 84; ## reset the progress counter
-		}                               ## end of looping threads
+			load_progress( $prgLogs[$i], \%prgData ) and $thr_progress[$i] = 60 or --$thr_progress[$i];
+			threads::yield();
+		} ## end of looping threads
 
 		# If all threads are inactive now, log the final progress
 		( 0 == $thr_active ) and show_progress( $thr_count, $thr_active, \%prgData, 1 ) and next;
@@ -1214,13 +1262,33 @@ sub watch_my_threads {
 			can_work() or last; ## Do not unfreeze while killing
 			( ( $thr_progress[$i] > 0 ) or ( $work_status[$i] != $THR_RUNNING ) ) and next;
 
-			# We do this in five phases, each has 3 seconds, but check them in reverse:
-			if ( $thr_progress[$i] < 1 ) {
-				# Phase 5: It is time to restart the thread
-				log_warning( "Re-starting frozen thread %d", $i );
-				$workers[$i] = threads->create( \&worker, $i, @{ $ffargs[$i] } );
-			} elsif ( ( $thr_progress[$i] > 0 ) && ( $thr_progress[$i] < 7 ) ) {
-				# Phase 4: We had two termination and a kill signal. It is time to detach the thread
+			# Give the thread a strike
+			++$thr_strikes[$i];
+
+			# Now act according to strikes:
+			if ( 1 == $thr_strikes[$i] ) {
+				# --- First strike after $thr_progress ran out (30 seconds) ---
+				# -------------------------------------------------------------
+				if ( defined( $workers[$i] ) && $workers[$i]->is_running() ) {
+					log_warning( "Sending SIGTERM to frozen thread %d", $i );
+					$workers[$i]->kill( 'TERM' );
+				} else {
+					log_error( "Thread %d is gone! Will restart...", $i );
+					$thr_strikes[$i] = 13; # Thread is already gone, start a new one.
+				}
+			} elsif ( 7 == $thr_strikes[$i] ) {
+				# --- Second strike, 3 seconds after $thr_progress timeout  ---
+				# -------------------------------------------------------------
+				if ( defined( $workers[$i] ) && $workers[$i]->is_running() ) {
+					log_warning( "Sending SIGKILL to frozen thread %d", $i );
+					$workers[$i]->kill( 'KILL' );
+				} else {
+					log_error( "Thread %d is gone! Will restart...", $i );
+					$thr_strikes[$i] = 13; # Thread is already gone, start a new one.
+				}
+			} elsif ( 13 == $thr_strikes[$i] ) {
+				# --- Third strike, 6 seconds after $thr_progress timeout  ---
+				# -------------------------------------------------------------
 				if ( defined( $workers[$i] ) ) {
 					if ( $workers[$i]->is_joinable() ) {
 						log_warning( "Joining frozen thread %d", $i );
@@ -1229,24 +1297,21 @@ sub watch_my_threads {
 						log_warning( "DETACHING frozen thread %d", $i );
 						$workers[$i]->detach();
 					}
-					undef( $workers[$i] );
 				}
+				undef( $workers[$i] );
+				undef( $data->{thr}[$i] );
 				$work_status[$i] = $THR_INACTIVE;
 				-f $prgLogs[$i] and unlink( $prgLogs[$i] );
-			} elsif ( ( $thr_progress[$i] > 6 ) && ( $thr_progress[$i] < 13 ) ) {
-				# Phase 3: Send a SIGKILL
-				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending SIGKILL to frozen thread %d", $i )
-				and $workers[$i]->kill( 'KILL' ) or $thr_progress[$i] = 6;
-			} elsif ( ( $thr_progress[$i] > 12 ) && ( $thr_progress[$i] < 19 ) ) {
-				# Phase 2: Send another SIGTERM
-				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending second SIGTERM to frozen thread %d", $i )
-				and $workers[$i]->kill( 'TERM' ) or $thr_progress[$i] = 6;
-			} elsif ( ( $thr_progress[$i] > 18 ) && ( $thr_progress[$i] < 25 ) ) {
-				# Phase 1: Send a SIGTERM
-				defined( $workers[$i] ) and $workers[$i]->is_running() and log_warning( "Sending first SIGTERM to frozen thread %d", $i )
-				and $workers[$i]->kill( 'TERM' ) or $thr_progress[$i] = 6;
+			} elsif ( 18 < $thr_strikes[$i] ) {
+				# --- Last strike, 9 seconds after $thr_progress timeout  ---
+				# -------------------------------------------------------------
+				log_warning( "Re-starting frozen thread %d", $i );
+				$thr_progress[$i] = 60;
+				$thr_strikes[$i]  = 0;
+				$workers[$i]      = threads->create( \&worker, $i, @{ $ffargs[$i] } );
+				$data->{thr}[$i]  = $workers[$i];
 			}
-		}
+		} ## End of going through possible thread strikes
 
 		# Sleep for half a second before going back to the loop start
 		usleep( 500000 );
@@ -1258,7 +1323,7 @@ sub watch_my_threads {
 	# Phase 2: Join all Threads back and handle result values
 	while ( $thr_active > 0 ) {
 		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( !( defined( $workers[$i] ) && $workers[$i]->is_running() ) ) {
+			if ( !( defined( $workers[$i] ) && $workers[$i]->is_running() && ( $THR_RUNNING == $work_status[$i] ) ) ) {
 				my $res          = ( defined( $workers[$i] ) && $workers[$i]->is_joinable() ) ? $workers[$i]->join() : 0;
 				$work_status[$i] = $THR_JOINED;
 				defined( $workers[$i] ) and undef( $workers[$i] );
@@ -1286,7 +1351,7 @@ sub watch_my_threads {
 					}
 				}
 			}
-			yield();
+			threads::yield();
 		} # end of looping threads
 	}     ## End of joining worker threads
 
