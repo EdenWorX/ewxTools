@@ -2,19 +2,10 @@
 use strict;
 use warnings FATAL => 'all';
 
-use POSIX qw( _exit floor :sys_wait_h );
-use threads (
-	'yield',
-	'stack_size' => 64 * 4096,
-	'exit'       => 'threads_only',
-	'stringify'
-);
-use threads::shared;
-
-use Capture::Tiny qw( capture_stdout );
+use POSIX qw( floor :sys_wait_h );
+use IPC::Cmd qw( run_forked );
 use Data::Dumper;
 use File::Basename;
-use File::Spec;
 use Filesys::Df;
 use Getopt::Long;
 use Pod::Usage;
@@ -27,9 +18,12 @@ use Time::HiRes qw( usleep );
 # ===============
 # Version  Date        Maintainer     Changes
 # 1.0.0    2024-05-23  sed, EdenWorX  First fully working version of the per variant. The Bash variant is dead now.
+# 1.0.1    2024-05-29  sed, EdenWorX  Use IPC::Cmd::run_forked instead of using system()
+# 1.0.2    2024-05-30  sed, EdenWorX  Rewrote the workers to be true forks instead of using iThreads.
 #
 # Please keep this current:
-Readonly my $VERSION => "1.0.0";
+Readonly my $VERSION => "1.0.2";
+
 
 # =======================================================================================
 # Workflow:
@@ -45,143 +39,9 @@ Readonly my $VERSION => "1.0.0";
 # ---------------------------------------------------------
 # Shared Variables
 # ---------------------------------------------------------
-our ( $death_note, $do_debug, $have_progress_msg, $logfile, $ret_global ) :shared;
-our %work_children :shared;
-our %work_result :shared;
-our @work_status :shared;
-our ( $THR_INACTIVE, $THR_CREATED, $THR_RUNNING, $THR_FINISHED, $THR_STOPPED, $THR_JOINED ) :shared;
-
-
-# ---------------------------------------------------------
-# REAPER function - $SIG{CHLD} exit handler
-# ---------------------------------------------------------
-sub reaper {
-	my @args = @_;
-	my $kid;
-
-	while ( ( $kid = waitpid( -1, POSIX::WNOHANG ) ) > 0 ) {
-		log_debug( "(reaper) KID %d finished", $kid );
-		$work_children{$kid} = 0;
-	}
-
-	local $SIG{CHLD} = \&reaper;
-
-	return 1;
-}
-
-
-# ---------------------------------------------------------
-# TERM/KILL handler for sending signals to forked children
-# ---------------------------------------------------------
-sub terminator {
-	my ( $kid, $signal ) = @_;
-
-	if ( $kid > 0 ) {
-		log_warning( "Sending KILL to pid %d", $kid );
-		if ( kill( $signal, $kid ) ) {
-			threads::yield();
-			reaper();
-		} else {
-			$work_children{$kid} = 0;
-		}
-	}
-
-	return 1;
-}
-
-
-# ---------------------------------------------------------
-# Worker Threads
-# ---------------------------------------------------------
-sub worker {
-	my ( $tid, @cmd ) = @_;
-	my $result        = 0;
-	my $kid           = 0;
-	my $killme        = 0;
-
-	# Handle signals internally
-	local $SIG{CHLD} = \&reaper;
-	local $SIG{KILL} = sub {
-		terminator( $kid, 'KILL' );
-		$killme = 1;
-	};
-	local $SIG{TERM} = sub {
-		terminator( $kid, 'TERM' );
-		$killme = 1;
-	};
-
-	# Re-route warnings and errors to the log file
-	local $SIG{__WARN__} = \&warnHandler;
-	local $SIG{__DIE__}  = \&dieHandler;
-
-	# Mark this thread as started
-	$work_status[$tid] = $THR_CREATED;
-
-	# Wait for the signal to run the command
-	while ( $THR_CREATED == $work_status[$tid] ) {
-		threads::yield();
-		usleep( 250000 ); ## We check max 4 times a second.
-		threads::yield();
-	}
-
-	# If the thread was not set to active mode leave now
-	if ( $THR_RUNNING != $work_status[$tid] ) {
-		$work_status[$tid] = $THR_FINISHED;
-		return $result;
-	}
-
-	# We do not run this ourselves, we fork out and check for the fork finishing.
-	$kid = fork();
-
-	if ( 0 == $kid ) {
-		# This is the fork, so run the command after closing STD*
-		my $devnull = File::Spec->devnull();
-		open( STDIN, '<', $devnull );
-		open( STDOUT, '>', $devnull );
-		open( STDERR, '>', $devnull );
-		my $res = system( @cmd );
-
-		if ( $res == -1 ) {
-			log_error( "failed to execute '%s': %s", $cmd[0], $! );
-		} elsif ( $res & 127 ) {
-			log_error( "%s died with signal %d, %s coredump", $cmd[0], ( $res & 127 ), ( $res & 128 ) ? "with" : "without" );
-		} elsif ( $res != 0 ) {
-			log_warning( "'%s' exited with value %d", $cmd[0], $res >> 8 );
-		}
-		$work_result{$$} = $res;
-
-		exit;
-	}
-
-	# Now we wait for the child to make itself go away
-	$work_children{$kid} = 1;
-	while ( ( 1 == $work_children{$kid} ) && ( 0 == $killme ) ) {
-		threads::yield();
-		usleep( 100000 ); ## 1/10 checks per second should be enough
-		# Let's see whether this one is ready
-		my $pid                                   = waitpid( $kid, POSIX::WNOHANG );
-		( $kid == $pid ) and $work_children{$kid} = 0; ## gone...
-		( -1 == $pid ) and $killme                = 1; ## something bad happened...
-		threads::yield();
-	}
-
-	# Ensure to not zombie out, as we only have left the watch loop right now
-	if ( $work_children{$kid} > 0 ) {
-		my $pid = waitpid( $kid, POSIX::WNOHANG );
-		log_debug( "kid %d status: %d, waitpid: %d", $kid, $work_children{$kid}, $pid );
-		( 0 == $pid ) and terminator( $kid, 'KILL' ) and threads::yield() and waitpid( $kid, 0 ); # Kill and complete the wait
-		$work_children{$kid} = 0;                                                                 # Now it is gone.
-	}
-
-	# Mark this thread as finished
-	$work_status[$tid] = $THR_FINISHED;
-
-	# If we are killed, log it
-	( 1 == $killme ) and log_error( "Thread %d KILLED", $tid );
-
-	# Now either give the work or our result back
-	return defined( $work_result{$kid} ) ? $work_result{$kid} : $result;
-}
+our ( $death_note, $do_debug, $have_progress_msg, $logfile, $ret_global );
+our ( $work_PIDS, $work_data );
+our ( $FF_CREATED, $FF_RUNNING, $FF_FINISHED, $FF_REAPED );
 
 
 # ---------------------------------------------------------
@@ -277,19 +137,18 @@ BEGIN {
 	$LOG_WARNING = 3;
 	$LOG_ERROR   = 4;
 
-	# thread status
-	$THR_INACTIVE = 0;
-	$THR_CREATED  = 1;
-	$THR_RUNNING  = 2;
-	$THR_FINISHED = 3;
-	$THR_STOPPED  = 4;
-	$THR_JOINED   = 5;
+	# sub process housekeeping
+	$work_data = {};
+	$work_PIDS = [];
+
+	# sub process status
+	$FF_CREATED  = 1;
+	$FF_RUNNING  = 2;
+	$FF_FINISHED = 3;
+	$FF_REAPED   = 5;
 
 	# signal handling
-	$death_note    = 0;
-	%work_children = ();
-	%work_result   = ();
-	@work_status   = ( $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE, $THR_INACTIVE );
+	$death_note = 0;
 
 	# logging
 	$do_debug          = 0;
@@ -501,7 +360,7 @@ sub analyze_inputs {
 		my $stream_fields = "avg_frame_rate,duration";
 		my @fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", "-probesize", $source_info{$src}{probeSize}, $src );
 		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		my $fpout          = capture_stdout { system( @fpcmd ) };
+		my $fpout          = capture_cmd( @fpcmd );
 		my @fplines        = split( '\n', $fpout );
 		my $avg_frame_rate = 0;
 		my $duration       = 0;
@@ -533,7 +392,7 @@ sub analyze_inputs {
 		$stream_fields = "avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration";
 		@fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", split( / /, $source_info{$src}{probeStrings} ), $src );
 		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		$fpout   = capture_stdout { system( @fpcmd ) };
+		$fpout   = capture_cmd( @fpcmd );
 		@fplines = split( '\n', $fpout );
 		foreach my $line ( @fplines ) {
 			chomp $line;
@@ -650,6 +509,62 @@ sub build_source_groups {
 
 sub can_work {
 	return 0 == $death_note;
+}
+
+# ----------------------------------------------------------------
+# Simple Wrapper around IPC::Cmd to capture simple command outputs
+# ----------------------------------------------------------------
+sub capture_cmd {
+	my ( @cmd ) = @_;
+	my $kid     = fork();
+	defined( $kid ) or die( "Cannot fork()! $!\n" );
+
+	if ( 0 == $kid ) {
+		# === THIS IS THE FORK ===
+		# ========================
+		my $pid                    = $$;
+		$work_data->{$pid}{status} = $FF_CREATED;
+		my $devnull                = "/dev/null";
+		close( STDIN ) and open( STDIN, '<', $devnull );
+		close( STDOUT ) and open( STDOUT, '>', $devnull );
+		close( STDERR ) and open( STDERR, '>', $devnull );
+
+		while ( $FF_RUNNING != $work_data->{$pid}{status} ) {
+			usleep( 500 ); ## poll each half millisecond
+		}
+
+		my $result = run_forked( \@cmd, {
+			'discard_output'                   => 0,
+			'terminate_on_parent_sudden_death' => 1
+		} );
+		# We only have to "transport" the results:
+		$work_data->{$pid} = {
+			result    => $result->{'err_msg'},
+			exit_code => $result->{'exit_code'},
+			status    => $FF_FINISHED
+		};
+		exit;
+	}
+
+	# === THIS IS THE MAIN PROGRAM ===
+	# ================================
+	push( @{ $work_PIDS }, $kid );
+	$work_data->{$kid} = {
+		'result'    => "",
+		'exit_code' => 0
+	};
+
+	usleep( 0 ); ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
+	$work_data->{$kid}{'status'} = $FF_RUNNING;
+	log_debug( "Process %d forked out", $kid );
+
+	# Now wait for the result
+	waitpid( $kid, 0 );
+
+	( 0 == $work_data->{$kid}{'exit_code'} )
+	or log_error( "Command '%s' FAILED [%d] : %s", join( ' ', @cmd ), $work_data->{$kid}{'exit_code'}, $work_data->{$kid}{result} ) and die( "capture_cmd() crashed" );
+
+	return $work_data->{$kid}{result};
 }
 
 sub channels_to_layout {
@@ -814,19 +729,16 @@ sub create_target_file {
 	               @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled, "-fps_mode", "vfr", @FF_ARGS_FORMAT,
 	               @FF_ARGS_CODEC_h264, $path_target, @mapVoice );
 
-	log_debug( "Starting Thread for:\n%s", join( ' ', @ffargs ));
-	#@type Thread
-	my $worker = threads->create( \&worker, 0, @ffargs );
+	log_debug( "Starting Worker 1 for:\n%s", join( ' ', @ffargs ));
+	my $pid = start_work( 1, @ffargs );
+	defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
+	$work_data->{$pid}{args}    = \@ffargs;
+	$work_data->{$pid}{prgfile} = $prgfile;
+	$work_data->{$pid}{source}  = "";
+	$work_data->{$pid}{target}  = "";
 
 	# Watch and join
-	return watch_my_threads( {
-		arg => [ \@ffargs ],
-		cnt => 1,
-		prg => [ $prgfile ],
-		src => "",
-		tgt => "",
-		thr => [ $worker ]
-	} );
+	return watch_my_forks();
 }
 
 sub commify {
@@ -901,8 +813,6 @@ sub interpolate_source_group {
 	can_work() or return 1;
 
 	# We do not need any fancy loops here, because there will always be 4 segments, and thus 4 threads. No exceptions.
-	#@type Thread
-	my @workers = ( undef, undef, undef, undef );
 	my @prgLogs = (
 		sprintf( $source_groups{$gid}{prg}, 0 ),
 		sprintf( $source_groups{$gid}{prg}, 1 ),
@@ -934,20 +844,18 @@ sub interpolate_source_group {
 		                sprintf( $source_groups{$gid}{$tmp_to}, $i )
 		];
 
-		log_debug( "Starting Thread for:\n%s", join( ' ', @{ $ffargs[$i] } ));
-		#@type Thread
-		$workers[$i] = threads->create( \&worker, $i, @{ $ffargs[$i] } );
+		log_debug( "Starting Worker %d for:\n%s", $i + 1, join( ' ', @{ $ffargs[$i] } ));
+		my $pid = start_work( $i, @{ $ffargs[$i] } );
+		defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
+		$work_data->{$pid}{args}    = \@ffargs;
+		$work_data->{$pid}{id}      = $i;
+		$work_data->{$pid}{prgfile} = $prgLogs[$i];
+		$work_data->{$pid}{source}  = $source_groups{$gid}{$tmp_from};
+		$work_data->{$pid}{target}  = $source_groups{$gid}{$tmp_to};
 	}
 
 	# Watch and join
-	return watch_my_threads( {
-		arg => \@ffargs,
-		cnt => 4,
-		prg => \@prgLogs,
-		src => $source_groups{$gid}{$tmp_from},
-		tgt => $source_groups{$gid}{$tmp_to},
-		thr => \@workers
-	} );
+	return watch_my_forks();
 }
 
 # Load data from between the last two "progress=<state>" lines in the given log file, and store it in the given hash
@@ -975,7 +883,7 @@ sub load_progress {
 
 	# Suck up the last 20 lines (This *should* be enough to get 2 progress=xxx lines)
 	my @args     = ( "tail", "-n", "20", $prgLog );
-	my $tailout  = capture_stdout { system( @args ) };
+	my $tailout  = capture_cmd( @args );
 	my @lines    = reverse split( '\n', $tailout );
 	my $line_cnt = scalar @lines;
 
@@ -1068,8 +976,30 @@ sub log_debug {
 	return logMsg( $LOG_DEBUG, $fmt, @args );
 } ## end sub log_debug
 
-# A signal handler that sets global vars according to the signal given.
+
+# ---------------------------------------------------------
+# REAPER function - $SIG{CHLD} exit handler
+# ---------------------------------------------------------
+sub reaper {
+	my @args = @_;
+	my $kid;
+
+	while ( ( $kid = waitpid( -1, POSIX::WNOHANG ) ) > 0 ) {
+		log_debug( "(reaper) KID %d finished [%s]", $kid, join( ',', @args ));
+		$work_data->{$kid}{status} = $FF_REAPED;
+	}
+
+	local $SIG{CHLD} = \&reaper;
+
+	return 1;
+}
+
+
+# ---------------------------------------------------------
+# A signal handler that sets global vars according to the
+# signal given.
 # Unknown signals are ignored.
+# ---------------------------------------------------------
 sub sigHandler {
 	my ( $sig ) = @_;
 	if ( "INT" eq $sig ) {
@@ -1082,6 +1012,9 @@ sub sigHandler {
 	} elsif ( "TERM" eq $sig ) {
 		$death_note = 1;
 		log_warning( "Caught Terminate Signal - Ending Tasks..." );
+	} elsif ( "CHLD" eq $sig ) {
+		log_warning( "Caught Child Signal - Handing over to reaper(), this should not have been here!" );
+		return reaper( $sig );
 	} else {
 		log_warning( "Caught Unknown Signal [%s] ... ignoring Signal!", $sig );
 	}
@@ -1119,19 +1052,16 @@ sub segment_source_group {
 	               "-f", "segment", "-segment_time", "$seg_len",
 	               $source_groups{$gid}{tmp} );
 
-	log_debug( "Starting Thread for:\n%s", join( ' ', @ffargs ));
-	#@type Thread
-	my $worker = threads->create( \&worker, 0, @ffargs );
+	log_debug( "Starting Worker %d for:\n%s", 1, join( ' ', @ffargs ));
+	my $pid = start_work( 1, @ffargs );
+	defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
+	$work_data->{$pid}{args}    = \@ffargs;
+	$work_data->{$pid}{prgfile} = $prgfile;
+	$work_data->{$pid}{source}  = "";
+	$work_data->{$pid}{target}  = "";
 
 	# Watch and join
-	my $result = watch_my_threads( {
-		arg => [ \@ffargs ],
-		cnt => 1,
-		prg => [ $prgfile ],
-		src => "",
-		tgt => "",
-		thr => [ $worker ]
-	} );
+	my $result = watch_my_forks();
 
 	# The list file is no longer needed.
 	-f $source_groups{$gid}{lst} and ( 0 == $do_debug ) and unlink( $source_groups{$gid}{lst} );
@@ -1184,6 +1114,94 @@ sub show_progress {
 }
 
 
+# ---------------------------------------------------------
+# Start a command asynchronously
+# ---------------------------------------------------------
+sub start_work {
+	my ( $tid, @cmd ) = @_;
+	my $kid           = fork();
+	defined( $kid ) or die( "Cannot fork()! $!\n" );
+
+	if ( 0 == $kid ) {
+		# === THIS IS THE FORK ===
+		# ========================
+		my $pid                    = $$;
+		$work_data->{$pid}{status} = $FF_CREATED;
+		my $devnull                = "/dev/null";
+		close( STDIN ) and open( STDIN, '<', $devnull );
+		close( STDOUT ) and open( STDOUT, '>', $devnull );
+		close( STDERR ) and open( STDERR, '>', $devnull );
+
+		# Wait until we got started, poll each ms
+		while ( $FF_RUNNING != $work_data->{$pid}{status} ) {
+			usleep( 1000 ); # poll until the bookkeeping is initialized
+		}
+
+		# Now we can run the command as desired
+		my $result = run_forked( \@cmd, {
+			'discard_output'                   => 1,
+			'stderr_handler'                   => sub { log_error( "%s", join( '\n', @_ )); },
+			'stdout_handler'                   => sub { log_debug( "%s", join( '\n', @_ )); },
+			'terminate_on_parent_sudden_death' => 1,
+			'wait_loop_callback'               => sub { ( 1 == $death_note ) and kill( 'TERM', $$ ) or ( 4 < $death_note ) and kill( 'KILL', $$ ); }
+		} );
+		# We only have to "transport" the results:
+		$work_data->{$pid} = {
+			'result'    => $result->{'err_msg'},
+			'exit_code' => $result->{'exit_code'},
+			'status'    => $FF_FINISHED
+		};
+		exit;
+	}
+
+	# === THIS IS THE MAIN PROGRAM ===
+	# ================================
+	push( @{ $work_PIDS }, $kid );
+	$work_data->{$kid} = {
+		'result'    => "",
+		'exit_code' => 0
+	};
+
+	usleep( 0 ); ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
+	$work_data->{$kid}{status} = $FF_RUNNING;
+	log_info( "Worker %d forked out", $tid );
+
+	return 1;
+}
+
+
+# ---------------------------------------------------------
+# TERM/KILL handler for sending signals to forked children
+# ---------------------------------------------------------
+sub terminator {
+	my ( $kid, $signal ) = @_;
+
+	defined( $kid ) or log_error( "BUG! terminator() called with UNDEF kid argument!" ) and return 0;
+	defined( $signal ) or log_error( "BUG! terminator() called with UNDEF signal argument!" ) and return 0;
+
+	if ( !( ( "TERM" eq $signal ) || ( "KILL" eq $signal ) ) ) {
+		log_error( "Bug: terminator(%d, '%s') called, only TERM and KILL supported!", $kid, $signal );
+		return 0;
+	}
+
+	if ( ( $kid ) > 0 ) {
+		log_warning( "Sending %s to pid %d", $signal, $kid );
+		if ( kill( $signal, $kid ) > 0 ) {
+			usleep( 100000 );
+			reaper( "terminator" );
+		} else {
+			$work_data->{$kid}{status} = $FF_REAPED;
+		}
+	} else {
+		foreach my $pid ( @{ $work_PIDS } ) {
+			( $FF_REAPED == $work_data->{$kid}{status} ) or terminator( $pid, $signal );
+		}
+	}
+
+	return 1;
+}
+
+
 # A warnings handler that lets perl warnings be printed via log
 sub warnHandler {
 	my ( $warn ) = @_;
@@ -1192,174 +1210,172 @@ sub warnHandler {
 
 
 # This is a watchdog function that displays progress and joins all threads nicely if needed
-sub watch_my_threads {
-	my ( $data )     = @_;
+sub watch_my_forks {
 	my $result       = 1;
-	my @ffargs       = @{ $data->{arg} // [ [], [], [], [] ] };
-	my @prgLogs      = @{ $data->{prg} // [] };
-	my $src_fmt      = $data->{src} // "unknown_src_%d.mkv";
-	my $tgt_fmt      = $data->{tgt} // "unknown_tgt_%d.mkv";
-	my @workers      = @{ $data->{thr} // [] };
-	my $thr_count    = $data->{cnt} // scalar @workers;
-	my $thr_active   = $thr_count;
-	my @thr_progress = ( 60, 60, 60, 60 ); # 60 intervals = 30 seconds
-	my @thr_strikes  = ( 0, 0, 0, 0 );
+	my $fork_count   = scalar @{ $work_PIDS };
+	my $forks_active = $fork_count;
+	my %fork_timeout = (); # 60 intervals = 30 seconds
+	my %fork_strikes = ();
 
 	# The whole watching is done in two phases.
-	log_debug( "Progress Logs: %s", join( ', ', @prgLogs ));
-	log_debug( "Source FMT   : %s", $src_fmt );
-	log_debug( "Target FMT   : %s", $tgt_fmt );
-	log_debug( "Threads      : %s", join( ', ', @workers ));
+	log_debug( "Forks : %s", join( ', ', @{ $work_PIDS } ));
 
-	# Phase 1: show logged progress as long as there are non-joinable threads left
-	while ( $thr_active > 0 ) {
+	# Phase 1: show logged progress as long as there are running forks left
+	while ( $forks_active > 0 ) {
 		my %prgData = ();
 
 		# Load the current progress data
-		$thr_active = $thr_count;
-		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( !( defined( $workers[$i] ) && $workers[$i]->is_running() && ( $THR_RUNNING == $work_status[$i] ) ) ) {
-				--$thr_active;
-				( $work_status[$i] == $THR_FINISHED ) and $work_status[$i] = $THR_STOPPED; # Thread acknowledged as being stopped
-			}
+		$forks_active = $fork_count;
+		foreach my $pid ( @{ $work_PIDS } ) {
+			defined( $fork_timeout{$pid} ) or $fork_timeout{$pid} = 60;
+			defined( $fork_strikes{$pid} ) or $fork_strikes{$pid} = 0;
+			( $FF_RUNNING == $work_data->{$pid}{status} ) || --$forks_active;
 
-			# If the thread has not been started, start it now
-			if ( $THR_CREATED == $work_status[$i] ) {
-				log_debug( "Starting Thread %d in one second...", $i );
-				sleep( 1 );
-				$work_status[$i]  = $THR_RUNNING;
-				$thr_progress[$i] = 60;
-				$thr_strikes[$i]  = 0;
-				log_debug( "Thread %d started", $i );
-				threads::yield();
-			}
 
-			# Load progress of the current thread
-			load_progress( $prgLogs[$i], \%prgData ) and $thr_progress[$i] = 60 or --$thr_progress[$i];
-			threads::yield();
+			# Load progress of the current fork
+			load_progress( $work_data->{$pid}{prgfile}, \%prgData ) and $fork_timeout{$pid} = 60 or --$fork_timeout{$pid};
+			usleep( 0 );
 		} ## end of looping threads
 
-		# If all threads are inactive now, log the final progress
-		( 0 == $thr_active ) and show_progress( $thr_count, $thr_active, \%prgData, 1 ) and next;
+		# If all forks are inactive now, log the final progress
+		( $forks_active <= 0 ) and show_progress( $fork_count, $forks_active, \%prgData, 1 ) and next;
 
 		# Otherwise show the accumulated progress data
-		show_progress( $thr_count, $thr_active, \%prgData, 0 );
+		show_progress( $fork_count, $forks_active, \%prgData, 0 );
 
-		# If we are called to kill via signal, be mean to the threads and let them kill their forks (Not all at once, though)
+		# If we are called to kill via signal, be mean to the forks and kill them
 		if ( $death_note > 0 ) {
-			for ( my $i = 0; $i < $thr_count; ++$i ) {
-				( 1 == $death_note ) and defined( $workers[$i] ) and $workers[$i]->is_running()
-				and log_warning( "TERMing thread %d", $i ) and $workers[$i]->kill( 'TERM' );
+			foreach my $pid ( @{ $work_PIDS } ) {
+				( 1 == $death_note ) and ( $work_data->{$pid}{status} != $FF_REAPED )
+				and log_warning( "TERMing worker PID %d", $pid ) and terminator( $pid, 'TERM' );
 				# Note: 5 is after 2 seconds
-				( 5 == $death_note ) and defined( $workers[$i] ) and $workers[$i]->is_running()
-				and log_warning( "KILLing thread %d", $i ) and $workers[$i]->kill( 'KILL' );
+				( 5 == $death_note ) and ( $work_data->{$pid}{status} != $FF_REAPED )
+				and log_warning( "KILLing worker PID %d", $pid ) and terminator( $pid, 'KILL' );
 			}
 			++$death_note;
 		}
 
-		# if any thread has not returned 0 from load_progress() for 10 seconds, we consider it frozen
-		for ( my $i = 0; $i < $thr_count; ++$i ) {
+		# if any fork has not returned 0 from load_progress() for 30 seconds, we consider it frozen
+		my @splicers = ();
+		foreach my $pid ( @{ $work_PIDS } ) {
 			can_work() or last; ## Do not unfreeze while killing
-			( ( $thr_progress[$i] > 0 ) or ( $work_status[$i] != $THR_RUNNING ) ) and next;
+			( ( $fork_timeout{$pid} > 0 ) or ( $work_data->{$pid}{status} != $FF_RUNNING ) ) and next;
 
 			# Give the thread a strike
-			++$thr_strikes[$i];
+			++$fork_strikes{$pid};
 
 			# Now act according to strikes:
-			if ( 1 == $thr_strikes[$i] ) {
+			if ( 1 == $fork_strikes{$pid} ) {
 				# --- First strike after $thr_progress ran out (30 seconds) ---
 				# -------------------------------------------------------------
-				if ( defined( $workers[$i] ) && $workers[$i]->is_running() ) {
-					log_warning( "Sending SIGTERM to frozen thread %d", $i );
-					$workers[$i]->kill( 'TERM' );
+				if ( $work_data->{$pid}{status} == $FF_RUNNING ) {
+					log_warning( "Sending SIGTERM to frozen fork PID %d", $pid );
+					terminator( $pid, 'TERM' );
 				} else {
-					log_error( "Thread %d is gone! Will restart...", $i );
-					$thr_strikes[$i] = 13; # Thread is already gone, start a new one.
+					log_error( "Fork PID %d is gone! Will restart...", $pid );
+					$fork_strikes{$pid} = 13; # Thread is already gone, start a new one.
 				}
-			} elsif ( 7 == $thr_strikes[$i] ) {
+			} elsif ( 7 == $fork_strikes{$pid} ) {
 				# --- Second strike, 3 seconds after $thr_progress timeout  ---
 				# -------------------------------------------------------------
-				if ( defined( $workers[$i] ) && $workers[$i]->is_running() ) {
-					log_warning( "Sending SIGKILL to frozen thread %d", $i );
-					$workers[$i]->kill( 'KILL' );
+				if ( $work_data->{$pid}{status} == $FF_RUNNING ) {
+					log_warning( "Sending SIGKILL to fork PID %d", $pid );
+					terminator( $pid, 'KILL' );
 				} else {
-					log_error( "Thread %d is gone! Will restart...", $i );
-					$thr_strikes[$i] = 13; # Thread is already gone, start a new one.
+					log_error( "Fork PID %d is gone! Will restart...", $pid );
+					$fork_strikes{$pid} = 13; # Thread is already gone, start a new one.
 				}
-			} elsif ( 13 == $thr_strikes[$i] ) {
+			} elsif ( 13 == $fork_strikes{$pid} ) {
 				# --- Third strike, 6 seconds after $thr_progress timeout  ---
 				# -------------------------------------------------------------
-				if ( defined( $workers[$i] ) ) {
-					if ( $workers[$i]->is_joinable() ) {
-						log_warning( "Joining frozen thread %d", $i );
-						$workers[$i]->join();
-					} elsif ( !$workers[$i]->is_detached() ) {
-						log_warning( "DETACHING frozen thread %d", $i );
-						$workers[$i]->detach();
-					}
+				while ( $work_data->{$pid}{status} != $FF_REAPED ) {
+					reaper( "watcher" );
+					usleep( 50 );
 				}
-				undef( $workers[$i] );
-				undef( $data->{thr}[$i] );
-				$work_status[$i] = $THR_INACTIVE;
-				-f $prgLogs[$i] and unlink( $prgLogs[$i] );
-			} elsif ( 18 < $thr_strikes[$i] ) {
+				-f $work_data->{$pid}{'prgfile'} and unlink( $work_data->{$pid}{'prgfile'} );
+			} elsif ( $fork_strikes{$pid} > 17 ) {
 				# --- Last strike, 9 seconds after $thr_progress timeout  ---
 				# -------------------------------------------------------------
-				log_warning( "Re-starting frozen thread %d", $i );
-				$thr_progress[$i] = 60;
-				$thr_strikes[$i]  = 0;
-				$workers[$i]      = threads->create( \&worker, $i, @{ $ffargs[$i] } );
-				$data->{thr}[$i]  = $workers[$i];
+				log_warning( "Re-starting frozen Fork %d", $pid );
+
+				my $kid = start_work( 1, @{ $work_data->{$pid}{args} } );
+				defined( $kid ) and ( $kid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
+				$work_data->{$kid}{args}    = $work_data->{$pid}{args};
+				$work_data->{$kid}{prgfile} = $work_data->{$pid}{prgfile};
+				$work_data->{$kid}{source}  = $work_data->{$pid}{source};
+				$work_data->{$kid}{target}  = $work_data->{$pid}{target};
+				$fork_timeout{$kid}         = 60;
+				$fork_strikes{$kid}         = 0;
+				log_debug( "Worker PID %d substituted PID %d", $kid, $pid );
+
+				# Eventually splice the old PID from the global PID list
+				push( @splicers, $pid );
+				++$forks_active; ## This one is back!
 			}
 		} ## End of going through possible thread strikes
 
+		# splice all PIDS from the global list, that are gone now
+		foreach my $pid ( @splicers ) {
+			my $done = 1;
+			do {
+				while ( my ( $i, $kid ) = each( @{ $work_PIDS } ) ) {
+					if ( $pid == $kid ) {
+						splice( @{ $work_PIDS }, $i, 1 );
+						$done = 0;
+						last;
+					}
+				}
+			} while ( 0 == $done );
+			defined( $fork_timeout{$pid} ) and undef( $fork_timeout{$pid} );
+			defined( $fork_strikes{$pid} ) and undef( $fork_strikes{$pid} );
+			defined( $work_data->{$pid} ) and undef( $work_data->{$pid} );
+		} # End of toasting PID
+
 		# Sleep for half a second before going back to the loop start
 		usleep( 500000 );
-	} ## End of showing threads progress
+	} ## End of showing fork progress
 
-	# Reset active count, as we have to count them down again
-	$thr_active = $thr_count;
+	# Phase 2: Ensure that all Forks are gone
+	foreach my $pid ( @{ $work_PIDS } ) {
+		defined( $work_data->{$pid} ) or next;
 
-	# Phase 2: Join all Threads back and handle result values
-	while ( $thr_active > 0 ) {
-		for ( my $i = 0; $i < $thr_count; ++$i ) {
-			if ( !( defined( $workers[$i] ) && $workers[$i]->is_running() && ( $THR_RUNNING == $work_status[$i] ) ) ) {
-				my $res          = ( defined( $workers[$i] ) && $workers[$i]->is_joinable() ) ? $workers[$i]->join() : 0;
-				$work_status[$i] = $THR_JOINED;
-				defined( $workers[$i] ) and undef( $workers[$i] );
-				if ( $res != 0 ) {
-					log_error( "Thread %d failed [%d]", $i, $res );
-					$result = 0;
+		# Wait for PID
+		while ( $work_data->{$pid}{status} != $FF_REAPED ) {
+			reaper( "watcher" );
+			usleep( 50 );
+		}
 
-					# We do not need the target file any more, the thread failed! (if an fmt is set)
-					if ( 0 == $do_debug ) {
-						if ( 0 < length( $tgt_fmt ) ) {
-							my $f = sprintf( $tgt_fmt, $i );
-							log_debug( "Removing temp target file '%s' ...", $f );
-							-f $f and unlink( $f );
-						}
-					}
-				}
-				--$thr_active;
+		# Remove progress file, it is no klonger needed.
+		-f $work_data->{$pid}{'prgfile'} and unlink( $work_data->{$pid}{'prgfile'} );
 
-				# We do not need the source file any more (if an fmt is set)
-				if ( 0 == $do_debug ) {
-					if ( 0 < length( $src_fmt ) ) {
-						my $f = sprintf( $src_fmt, $i );
-						log_debug( "Removing temp source file '%s' ...", $f );
-						-f $f and unlink( $f );
-					}
+		if ( $work_data->{$pid}{'exit_code'} != 0 ) {
+			log_error( "Worker PID %d FAILED [%d] %s", $pid, $work_data->{$pid}{'exit_code'}, $work_data->{$pid}{'result'} );
+			# We do not need the target file any more, the thread failed! (if an fmt is set)
+			if ( 0 == $do_debug ) {
+				if ( 0 < length( $work_data->{$pid}{'target'} ) ) {
+					my $f = sprintf( $work_data->{$pid}{'target'}, $work_data->{$pid}{id} );
+					log_debug( "Removing temp target file '%s' ...", $f );
+					-f $f and unlink( $f );
 				}
 			}
-			threads::yield();
-		} # end of looping threads
-	}     ## End of joining worker threads
+			$result = 0; ## We _did_ fail!
+		} else {
+			# We do not need the source file any more (if an fmt is set)
+			if ( 0 == $do_debug ) {
+				if ( 0 < length( $work_data->{$pid}{'source'} ) ) {
+					my $f = sprintf( $work_data->{$pid}{'source'}, $work_data->{$pid}{id} );
+					log_debug( "Removing temp source file '%s' ...", $f );
+					-f $f and unlink( $f );
+				}
+			}
+			defined( $fork_timeout{$pid} ) and undef( $fork_timeout{$pid} );
+			defined( $fork_strikes{$pid} ) and undef( $fork_strikes{$pid} );
+			defined( $work_data->{$pid} ) and undef( $work_data->{$pid} );
+		}
+	} ## End of Clearing PIDs
 
-	# Eventually mark all threads as inactive / gone
-	for ( my $i = 0; $i < $thr_count; ++$i ) {
-		defined( $data->{thr}[$i] ) and undef( $data->{thr}[$i] );
-		$work_status[$i] = $THR_INACTIVE;
-	}
+	# Eventually empty the PID list, they are all gone, now.
+	@{ $work_PIDS } = ();
 
 	return $result;
 }
