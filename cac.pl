@@ -2,13 +2,14 @@
 use strict;
 use warnings FATAL => 'all';
 
+use PerlIO;
 use POSIX qw( floor :sys_wait_h );
 use IPC::Cmd qw( run_forked );
 use Data::Dumper;
 use File::Basename;
 use Filesys::Df;
 use Getopt::Long;
-use Pod::Usage;
+use Pod::Usage qw( pod2usage );
 use Readonly;
 use Time::HiRes qw( usleep );
 
@@ -167,6 +168,7 @@ BEGIN {
 # ---------------------------------------------------------
 # Argument handling
 # ---------------------------------------------------------
+my $podmsg = "\tcac ; HurryKane's [c]leanup [a]nd [c]onvert\n";
 my %program_options = (
 	'help|h'        => \$do_print_help,
 	'debug|D'       => \$do_debug,
@@ -177,15 +179,15 @@ my %program_options = (
 	'upgrade|u'     => \$force_upgrade,
 	'version|V'     => \$do_print_version
 );
-GetOptions( %program_options ) or pod2usage( 2 );
-$do_print_help > 0 and pod2usage( 0 );
+GetOptions( %program_options ) or pod2usage( { -message => $podmsg, -exitval => 2, -verbose => 0 } );
+$do_print_help > 0 and pod2usage( { -message => $podmsg, -exitval => 0, -verbose => 2, -noperldoc => 1 } );
 $do_print_version > 0 and print "EWX cac V$VERSION\n" and exit 0;
 
 
 # ---------------------------------------------------------
 # Check Arguments
 # ---------------------------------------------------------
-check_arguments() > 0 and pod2usage( 1 ); ## The sub has already logged
+check_arguments() > 0 and pod2usage( { -message => $podmsg, -exitval => 1, -verbose => 0 } ); ## The sub has already logged
 
 defined( $FF ) and ( 0 < length( $FF ) ) and -x $FF or log_error( "No ffmpeg available (FF: '%s')", $FF // "undef" ) and exit 3;
 defined( $FP ) and ( 0 < length( $FP ) ) and -x $FP or log_error( "No ffprobe available (FP: '%s')", $FP // "undef" ) and exit 3;
@@ -1383,38 +1385,82 @@ sub watch_my_forks {
 
 __END__
 
-=head1 cac
-
-[c]leanup [a]nd [c]onvert: Overhaul Clips shot by HurryKane for SedGaming channel
-
-The program uses ffmpeg to remove duplicate frames and to interpolate the video to twice the target
-FPS in a first step, then do another search for duplicate frames and interpolate down the the
-target FPS.
-
-If the source has at least 50 FPS in average, the target is set to 60 FPS. For sources with less
-than 50 FPS in average, the target is set to 30 FPS.
-You can use the -u/--upgrade option to force the target to be 60 FPS, no matter the source average.
 
 =head1 SYNOPSIS
 
-cac [options] <-i INPUT [-i INPUT2...]> <-o OUTPUT>
+cac [-h|OPTIONS] <-i INPUT [-i INPUT2...]> <-o OUTPUT>
 
- Parameters:
-	-i | --input        Path to the input file. Can appear more than once, resulting in the output
-	                      file to be the combination of the input files in their given order.
-	-o | --output       The file to write. Must not equal any input file. Must have .mkv ending.
 
- Options:
-	-h | --help         This help message
-	-t | --tempdir      Path to the directory where the temporary files are written. Defaults to the
-	                      directory of the input file(s). Ensure to have 50x the space of the input!
-	-s | --splitaudio  If set, split a second channel (if found) out into a separate .wav file.
-	                     That channel is normally live commentary, and will be discarded without
-	                     this option.
-	-u | --upgrade     Force a target of 60 FPS, even if the source is under 50 FPS.
-	-V | --version     Print version and exit.
+=head1 ARGUMENTS
 
- Debug Mode
-	-D | --debug       Displays extra information on all the steps of the way.
-	                     IMPORTANT: _ALL_ temporary files are kept! Use with caution!
+=over 8
+
+=item B<-i | --input>
+
+Path to the input file. Can appear more than once, resulting in the output file
+to be the combination of the input files in their given order.
+
+=item B<-o | --output>
+
+The file to write. Must not equal any input file. Must have .mkv ending.
+
+=back
+
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-h | --help>
+
+This help message
+
+=item B<-t | --tempdir>
+
+Path to the directory where the temporary files are written. Defaults to the
+directory of the input file(s). Ensure to have 50x the space of the input!
+
+=item B<-s | --splitaudio>
+
+If set, split a second channel (if found) out into a separate .wav file. That
+channel is normally live commentary, and will be discarded without this option.
+
+=item B<-u | --upgrade>
+
+Force a target of 60 FPS, even if the source is under 50 FPS.
+
+=item B<-V | --version>
+
+Print version and exit.
+
+=back
+
+
+=head2 DEBUG MODE
+
+=over 8
+
+=item B<-D | --debug>
+
+Displays extra information on all the steps of the way.
+IMPORTANT: _ALL_ temporary files are kept! Use with caution!
+
+=back
+
+
+=head1 DESCRIPTION
+
+[c]leanup [a]nd [c]onvert: HurryKane's tool for overhauling gaming clips.
+( See: @HurryKane76 yt channel )
+
+The program uses ffmpeg to remove duplicate frames and to interpolate the video
+to twice the target FPS in a first step, then do another search for duplicate
+frames and interpolate down the the target FPS.
+
+If the source has at least 50 FPS in average, the target is set to 60 FPS. For
+sources with less than 50 FPS in average, the target is set to 30 FPS.
+You can use the -u/--upgrade option to force the target to be 60 FPS, no matter
+the source average.
+
+
 =cut
