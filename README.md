@@ -37,7 +37,7 @@ this program. If not, see https://www.gnu.org/licenses/.
 
 ## Content
 
-*   backup_dir.sh 
+* backup_dir.sh 
   
     Backup directories using rsync with some extras.
 * cac[.pl]
@@ -48,6 +48,9 @@ this program. If not, see https://www.gnu.org/licenses/.
 * cac_all.sh
 
     Little helper script to run all videos in a folder through cac.
+* spacefader
+
+    Tool to overwrite free space on devices you can not just dd over.
 
 
 ### backup_dir.sh
@@ -185,6 +188,35 @@ DESCRIPTION
     FPS. For sources with less than 50 FPS in average, the target is set to
     30 FPS. You can use the -u/--upgrade option to force the target to be 60
     FPS, no matter the source average.
+````
+
+
+### spacefader
+
+This is a very simple tool that fills up free space on any mounted device until
+the device is full, and deletes those dummy files thereafter.
+
+If you have deleted a bunch of files from a device you can not just `dd` over
+via its blockdevice, `spacefader` ensures that those files are gone forever.
+
+````
+  Overwrite all remaining space 1.0.5
+------------------------------------------
+                   Jan 2010, EdenWorX, sed
+
+This program will fill up the target directory with files of 1 MiB
+size with zeros (from /dev/zero) until all the remaining space is
+filled up. After all space is wasted, the files are deleted and the
+space freed again.
+
+Usage: ./spacefader targetdir [random]
+
+Arguments:
+  targetdir - directory in which files are created
+              if the directory does not exist it will be created,
+              and deleted again after the work is done.
+Options:
+  random    - fill files from /dev/(u)random instead /dev/zero
 ````
 
 
