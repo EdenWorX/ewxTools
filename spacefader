@@ -1,0 +1,178 @@
+#!/bin/bash
+
+VERSION="1.0.5"
+
+#----------------------
+TGTDIR="$1"
+USERND="$2"
+
+if [[ "x" = "x${TGTDIR}" || "x-h" = "x${TGTDIR}" || "x--help" = "x${TGTDIR}" ]]; then
+    cat <<_USAGE
+  Overwrite all remaining space ${VERSION}
+------------------------------------------
+                   Jan 2010, EdenWorX, sed
+
+This program will fill up the target directory with files of 1 MiB
+size with zeros (from /dev/zero) until all the remaining space is
+filled up. After all space is wasted, the files are deleted and the
+space freed again.
+
+Usage: $0 targetdir [random]
+
+Arguments:
+  targetdir - directory in which files are created
+              if the directory does not exist it will be created,
+              and deleted again after the work is done.
+Options:
+  random    - fill files from /dev/(u)random instead /dev/zero
+
+_USAGE
+	exit 0;
+fi
+
+## Determine source device
+#--------------------------
+SRCDEV=/dev/zero
+if [[ -n "${USERND}" && "${USERND}" == "random" ]]; then
+	[ -r /dev/random ] && SRCDEV=/dev/random
+	[ -r /dev/urandom ] && SRCDEV=/dev/urandom
+fi
+
+## Be sure the output directory exists
+#--------------------------------------
+OWNDIR=0; # If the target directory has to be created, it is set to 1.
+if [[ ! -d ${TGTDIR} ]]; then
+	OWNDIR=1; ## We do it ourselves, we delete afterwards!
+	mkdir -p "${TGTDIR}"
+	if [[ ! -d "${TGTDIR}" ]]; then
+		[ -f "${TGTDIR}" ] && echo "${TGTDIR} is not a directory!"
+		[ -f "${TGTDIR}" ] || echo "${TGTDIR} can not be created!"
+		exit 1;
+	fi
+fi ## check target directory
+
+## Calculate space and the approx count of files to be created:
+#---------------------------------------------------------------
+echo -n "determining initial size..."
+SPACELEFT=$(df --sync -B 1 "${TGTDIR}" | grep '/' | tr -s ' ' | cut -d ' ' -f 4)
+FILESIZE=$((1024*1024));     # One MiB
+FILESLEFT=$((SPACELEFT/FILESIZE))
+FILESCURR=0;                 # We need to count what we are doing.
+RECALCCNT=$((FILESLEFT/4));  # Recount free space when this number of files have been created
+RECALCCUR=${RECALCCNT};      # The next re-calc mark
+DOTPRGCNT=$((RECALCCNT/24)); # So we can show some dots to show progress
+DDBSIZE=4096;                # The blocksize used by dd (adjust this if you think you can get more speed...)
+DDCOUNT=$((FILESIZE/DDBSIZE)); # So DDCOUNT * DDBSIZE = FILESIZE
+echo " done - ${SPACELEFT} bytes available"
+
+## Now print status and ask whether we should start:
+cat << _ENDSTATUS
+$0 will be started with the following parameters:
+  Target Directory .. : ${TGTDIR}
+  Source Device ..... : ${SRCDEV}
+  Files to be created : ${FILESLEFT}
+  Re-Checking every   : ${RECALCCNT} files
+_ENDSTATUS
+echo -n "Start execution ? (y/N)"
+read -r DOACT
+case ${DOACT} in
+	[yYjJ])
+		DOACT=1
+		;;
+	*)
+		DOACT=0
+		;;
+esac
+
+# If we are not allowed to act, leave peacefully
+[ ${DOACT} -eq 1 ] || exit 0
+
+echo -n "working "
+
+#==========================================
+## === MAIN LOOP PART ONE: Create files ===
+#==========================================
+while [[ ${FILESLEFT} -gt 0 ]]; do
+	FILESCURR=$((FILESCURR+1))
+
+	#=========================================
+	## === Step 1: Check for re-count mark ===
+	#=========================================
+
+	if [[ "$FILESCURR" == "$RECALCCUR" ]]; then
+		## Hit a re-count mark, re-calculate space:
+		echo -en "\nrecalculating ... "
+		SPACELEFT=$(df --sync -B 1 "${TGTDIR}" | grep '/' | tr -s ' ' | cut -d ' ' -f 4)
+		FILESLEFT=$((SPACELEFT/FILESIZE))
+		# Let's see whether there are files left:
+		if [[ ${FILESLEFT} -gt 0 ]]; then
+			# We have to adjust the recalccounter
+			[ ${RECALCCNT} -lt ${FILESLEFT} ] || RECALCCNT=${FILESLEFT}
+			RECALCCUR=$((RECALCCUR+RECALCCNT));
+			echo "${FILESLEFT} files left, re-checking at ${RECALCCUR}"
+			echo -n "working ... "
+		elif [[ ${SPACELEFT} -gt 0 ]]; then
+			# We have no full files, but some space left:
+			FILESIZE=${SPACELEFT}
+			FILESLEFT=1
+			DDBSIZE=${FILESIZE}
+			DDCOUNT=1
+			echo "${FILESIZE} bytes left for last file"
+		else
+			# We are done!
+			FILESLEFT=0
+			echo "everything filled up!"
+		fi ## end check free space
+	fi ## end check for re-count mark
+
+	#=========================================
+	## === Step 2: Check for progress mark ===
+	#=========================================
+
+	if [[ 0 -eq $((FILESCURR%DOTPRGCNT)) ]]; then
+		echo -n "."
+	fi
+
+	#===================================
+	## === Step 3: Create dummy file ===
+	#===================================
+	if [[ ${FILESLEFT} -gt 0 ]]; then
+		dd if="${SRCDEV}" bs="${DDBSIZE}" count="${DDCOUNT}" of="${TGTDIR}/dummy_${FILESCURR}.waste" 2>/dev/null
+		FILESLEFT=$((FILESLEFT-1))
+	fi
+done ## end main loop part one
+
+#================================================
+## === MAIN LOOP PART TWO: Swallow last bytes ===
+#================================================
+echo -en "\nrecalculating ... "
+SPACELEFT=$(df --sync -B 1 "${TGTDIR}" | grep '/' | tr -s ' ' | cut -d ' ' -f 4)
+if [[ ${SPACELEFT} -gt 0 ]]; then
+	echo -n "${SPACELEFT} bytes left for last file "
+	FILESCURR=$((FILESCURR+1))
+	dd if="${SRCDEV}" bs="${SPACELEFT}" count=1 of="${TGTDIR}/dummy_${FILESCURR}.waste" 2>/dev/null
+	echo "written"
+else
+	echo "no space left on device"
+fi
+echo "done"
+
+#============================================
+## === MAIN LOOP PART THREE: Delete files ===
+#============================================
+
+echo -n "deleting "
+DOTPRGCNT=$((FILESCURR/20))
+while [[ ${FILESCURR} -gt 0 ]]; do
+	rm -f "${TGTDIR}/dummy_${FILESCURR}.waste"
+	FILESCURR=$((FILESCURR-1))
+	if [[ 0 -eq $((FILESCURR%DOTPRGCNT)) ]]; then
+		echo -n "."
+	fi
+done
+echo "done"
+
+## Last one: Delete the directory if it is ours:
+[ ${OWNDIR} -eq 1 ] && rm -rf "${TGTDIR}"
+
+echo "program finished."
