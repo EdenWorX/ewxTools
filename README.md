@@ -1,7 +1,7 @@
 # EdenWorX Tools
 
-A completely unordered, ungrouped and inconveniently chaotic group of scripts
-and programs for many random things.
+A completely unordered, ungrouped and inconveniently chaotic set of scripts
+and programs for random things.
 
 
 ## Disclaimer
@@ -133,27 +133,58 @@ like my voice, so I take the liberty to "enhance" those recordings using the
 marvelous [Audacity](https://www.audacityteam.org/) software.
 
 ````
-Usage:
-    cac [options] <-i INPUT [-i INPUT2...]> <-o OUTPUT>
+        cac ; HurryKane's [c]leanup [a]nd [c]onvert
 
-     Parameters:
-            -i | --input        Path to the input file. Can appear more than once, resulting in the output
-                                  file to be the combination of the input files in their given order.
-            -o | --output       The file to write. Must not equal any input file. Must have .mkv ending.
+SYNOPSIS
+    cac [-h|OPTIONS] <-i INPUT [-i INPUT2...]> <-o OUTPUT>
 
-     Options:
-            -h | --help         This help message
-            -t | --tempdir      Path to the directory where the temporary files are written. Defaults to the
-                                  directory of the input file(s). Ensure to have 50x the space of the input!
-            -s | --splitaudio  If set, split a second channel (if found) out into a separate .wav file.
-                                 That channel is normally live commentary, and will be discarded without
-                                 this option.
-            -u | --upgrade     Force a target of 60 FPS, even if the source is under 50 FPS.
-            -V | --version     Print version and exit.
+ARGUMENTS
+    -i | --input
+            Path to the input file. Can appear more than once, resulting in
+            the output file to be the combination of the input files in
+            their given order.
 
-     Debug Mode
-            -D | --debug       Displays extra information on all the steps of the way.
-                                 IMPORTANT: _ALL_ temporary files are kept! Use with caution!
+    -o | --output
+            The file to write. Must not equal any input file. Must have .mkv
+            ending.
+
+OPTIONS
+    -h | --help
+            This help message
+
+    -t | --tempdir
+            Path to the directory where the temporary files are written.
+            Defaults to the directory of the input file(s). Ensure to have
+            50x the space of the input!
+
+    -s | --splitaudio
+            If set, split a second channel (if found) out into a separate
+            .wav file. That channel is normally live commentary, and will be
+            discarded without this option.
+
+    -u | --upgrade
+            Force a target of 60 FPS, even if the source is under 50 FPS.
+
+    -V | --version
+            Print version and exit.
+
+  DEBUG MODE
+    -D | --debug
+            Displays extra information on all the steps of the way.
+            IMPORTANT: _ALL_ temporary files are kept! Use with caution!
+
+DESCRIPTION
+    [c]leanup [a]nd [c]onvert: HurryKane's tool for overhauling gaming
+    clips. ( See: @HurryKane76 yt channel )
+
+    The program uses ffmpeg to remove duplicate frames and to interpolate
+    the video to twice the target FPS in a first step, then do another
+    search for duplicate frames and interpolate down the the target FPS.
+
+    If the source has at least 50 FPS in average, the target is set to 60
+    FPS. For sources with less than 50 FPS in average, the target is set to
+    30 FPS. You can use the -u/--upgrade option to force the target to be 60
+    FPS, no matter the source average.
 ````
 
 
