@@ -1,0 +1,17 @@
+# please alpha sort config items as you add them
+
+severity        = 1
+only            = 0
+force           = 0
+top             = 10
+theme           = bugs+certrec+certrule+complexity+core+maintenance+nits+pbp+performance+security+unicode
+criticism-fatal = 1
+color           = 0
+allow-unsafe    = 0
+
+[Variables::RequireLocalizedPunctuationVars]
+allow = %SIG $SIG $SIG{__WARN__} $SIG{__DIE__} $SIG{CHLD}
+
+# This one brings too many false positives
+[-ValuesAndExpressions::ProhibitAccessOfPrivateData]
+
