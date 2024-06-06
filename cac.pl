@@ -3,8 +3,8 @@ use strict;
 use warnings FATAL => 'all';
 
 use PerlIO;
-use POSIX qw( floor :sys_wait_h );
-use IPC::Cmd qw( run_forked );
+use POSIX qw( _exit floor :sys_wait_h );
+use IPC::Run3;
 use IPC::Shareable qw( :lock );
 use Data::Dumper;
 use File::Basename;
@@ -42,18 +42,31 @@ Readonly my $VERSION => "1.0.2";
 # ---------------------------------------------------------
 # Shared Variables
 # ---------------------------------------------------------
-our ( $death_note, $do_debug, $have_progress_msg, $logfile, $ret_global );
-our ( $FF_CREATED, $FF_RUNNING, $FF_FINISHED, $FF_REAPED );
+# signal handling
+my $death_note = 0;
+
+# Global return value, is set to 1 by log_error()
+my $ret_global = 0;
+
+our Readonly $FF_CREATED;
+our Readonly $FF_RUNNING;
+our Readonly $FF_FINISHED;
+our Readonly $FF_REAPED;
 
 #@type IPC::Shareable
-my $work_data_lock = tie my %work_data, 'IPC::Shareable', { key => "WORK_DATA", create => 1 };
-$work_data{cnt}    = 0;
-$work_data{PIDs}   = {};
+my $work_data      = {};
+my $work_lock      = tie $work_data, 'IPC::Shareable', { key => 'WORK_DATA', create => 1 };
+$work_data->{cnt}  = 0;
+$work_data->{PIDs} = {};
 
 
 # ---------------------------------------------------------
 # Logging facilities
 # ---------------------------------------------------------
+my $do_debug          = 0;
+my $have_progress_msg = 0;
+my $logfile           = "";
+
 our Readonly $LOG_DEBUG;
 our Readonly $LOG_STATUS;
 our Readonly $LOG_INFO;
@@ -69,13 +82,13 @@ local $SIG{QUIT} = \&sigHandler;
 local $SIG{TERM} = \&sigHandler;
 
 # Warnings should be logged, too:
-local $SIG{__WARN__} = \&warnHandler;
+$SIG{__WARN__} = \&warnHandler;
 
 # And fatal errors go to the log as well
-local $SIG{__DIE__} = \&dieHandler;
+$SIG{__DIE__} = \&dieHandler;
 
 # Global SIGCHLD handler
-local $SIG{CHLD} = \&reaper;
+$SIG{CHLD} = \&reaper;
 
 
 # ---------------------------------------------------------
@@ -149,17 +162,6 @@ BEGIN {
 	$FF_RUNNING  = 2;
 	$FF_FINISHED = 3;
 	$FF_REAPED   = 5;
-
-	# signal handling
-	$death_note = 0;
-
-	# logging
-	$do_debug          = 0;
-	$have_progress_msg = 0;
-	$logfile           = "";
-
-	# Global return value, is set to 1 by log_error()
-	$ret_global = 0;
 
 	# ffmpeg default values
 	chomp( $FF = `which ffmpeg` );
@@ -343,19 +345,20 @@ exit $ret_global;
 sub add_pid {
 	my ( $pid ) = @_;
 	defined( $pid ) and ( $pid =~ m/^\d+$/ ) or log_error( "add_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and die( "FATAL BUG!" );
-	defined( $work_data{PIDs}{$pid} ) and return 1;
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$work_data{PIDs}{$pid} = {
+	defined( $work_data->{PIDs}{$pid} ) and die( "add_pid($pid) called but work_data already defined!" );
+	$work_lock->lock;
+	$work_data->{PIDs}{$pid} = {
 		args      => [], ## Shall be added by the caller as a reference
 		exit_code => 0,
 		id        => 0,
 		prgfile   => "",
 		result    => "",
+		status    => 0,
 		source    => "",
 		target    => ""
 	};
-	$work_data{cnt}++;
-	$work_data_lock->unlock();
+	$work_data->{cnt}++;
+	$work_lock->unlock;
 	return 1;
 }
 
@@ -384,8 +387,7 @@ sub analyze_inputs {
 		my $stream_fields = "avg_frame_rate,duration";
 		my @fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", "-probesize", $source_info{$src}{probeSize}, $src );
 		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		my $fpout          = capture_cmd( @fpcmd );
-		my @fplines        = split( '\n', $fpout );
+		my @fplines        = split( '\n', capture_cmd( @fpcmd ));
 		my $avg_frame_rate = 0;
 		my $duration       = 0;
 		my $probeDura      = 0;
@@ -416,8 +418,7 @@ sub analyze_inputs {
 		$stream_fields = "avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration";
 		@fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", split( / /, $source_info{$src}{probeStrings} ), $src );
 		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		$fpout   = capture_cmd( @fpcmd );
-		@fplines = split( '\n', $fpout );
+		@fplines = split( '\n', capture_cmd( @fpcmd ));
 		foreach my $line ( @fplines ) {
 			chomp $line;
 			#log_debug("RAW[%s]", $line);
@@ -536,7 +537,7 @@ sub can_work {
 # ----------------------------------------------------------------
 sub capture_cmd {
 	my ( @cmd ) = @_;
-	my $kid     = fork();
+	my $kid     = fork;
 
 	defined( $kid ) or die( "Cannot fork()! $!\n" );
 
@@ -544,25 +545,29 @@ sub capture_cmd {
 	# =======================================
 	if ( 0 == $kid ) {
 		start_capture( @cmd );
-		exit;
+		POSIX::_exit( 0 ); ## Regular exit() would call main::END block
 	}
+
+	# === Do the bookkeeping before we wait
+	# =======================================
+	add_pid( $kid );
 
 	# Wait on the fork to finish
 	# =======================================
 	wait_for_capture( $kid );
 
 	# Handle result:
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	if ( 0 != $work_data{PIDs}{$kid}{exit_code} ) {
-		log_error( "Command '%s' FAILED [%d] : %s", join( ' ', @cmd ), $work_data{PIDs}{$kid}{exit_code}, $work_data{PIDs}{$kid}{result} );
-		$work_data_lock->unlock();
+	$work_lock->lock;
+	if ( 0 != $work_data->{PIDs}{$kid}{exit_code} ) {
+		log_error( "Command '%s' FAILED [%d] : %s", join( " ", @cmd ), $work_data->{PIDs}{$kid}{exit_code}, $work_data->{PIDs}{$kid}{result} );
+		$work_lock->unlock;
 		die( "capture_cmd() crashed" );
 	}
 
-	my $result = $work_data{PIDs}{$kid}{result};
-	$work_data_lock->unlock();
+	my $result = $work_data->{PIDs}{$kid}{result};
+	$work_lock->unlock;
 
-	remove_pid( $kid, 0 );
+	remove_pid( $kid, 1 );
 
 	return $result;
 }
@@ -737,13 +742,13 @@ sub create_target_file {
 	               @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled, "-fps_mode", "vfr", @FF_ARGS_FORMAT,
 	               @FF_ARGS_CODEC_h264, $path_target, @mapVoice );
 
-	log_debug( "Starting Worker 1 for:\n%s", join( ' ', @ffargs ));
+	log_debug( "Starting Worker 1 for:\n%s", join( " ", @ffargs ));
 	my $pid = start_work( 1, @ffargs );
 	defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$work_data{PIDs}{$pid}{args}    = \@ffargs;
-	$work_data{PIDs}{$pid}{prgfile} = $prgfile;
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	$work_data->{PIDs}{$pid}{args}    = \@ffargs;
+	$work_data->{PIDs}{$pid}{prgfile} = $prgfile;
+	$work_lock->unlock;
 
 	# Watch and join
 	return watch_my_forks();
@@ -852,16 +857,16 @@ sub interpolate_source_group {
 		                sprintf( $source_groups{$gid}{$tmp_to}, $i )
 		];
 
-		log_debug( "Starting Worker %d for:\n%s", $i + 1, join( ' ', @{ $ffargs[$i] } ));
+		log_debug( "Starting Worker %d for:\n%s", $i + 1, join( " ", @{ $ffargs[$i] } ));
 		my $pid = start_work( $i, @{ $ffargs[$i] } );
 		defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
-		$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-		$work_data{PIDs}{$pid}{args}    = \@ffargs;
-		$work_data{PIDs}{$pid}{id}      = $i;
-		$work_data{PIDs}{$pid}{prgfile} = $prgLogs[$i];
-		$work_data{PIDs}{$pid}{source}  = $source_groups{$gid}{$tmp_from};
-		$work_data{PIDs}{$pid}{target}  = $source_groups{$gid}{$tmp_to};
-		$work_data_lock->unlock();
+		$work_lock->lock;
+		$work_data->{PIDs}{$pid}{args}    = \@ffargs;
+		$work_data->{PIDs}{$pid}{id}      = $i;
+		$work_data->{PIDs}{$pid}{prgfile} = $prgLogs[$i];
+		$work_data->{PIDs}{$pid}{source}  = $source_groups{$gid}{$tmp_from};
+		$work_data->{PIDs}{$pid}{target}  = $source_groups{$gid}{$tmp_to};
+		$work_lock->unlock;
 	}
 
 	# Watch and join
@@ -893,8 +898,7 @@ sub load_progress {
 
 	# Suck up the last 20 lines (This *should* be enough to get 2 progress=xxx lines)
 	my @args     = ( "tail", "-n", "20", $prgLog );
-	my $tailout  = capture_cmd( @args );
-	my @lines    = reverse split( '\n', $tailout );
+	my @lines    = reverse split( '\n', capture_cmd( @args ));
 	my $line_cnt = scalar @lines;
 
 	# Go beyond first progress=xxx line found
@@ -936,10 +940,10 @@ sub logMsg {
 	my ( undef, undef, $lineno, $logger ) = caller( 1 );
 	$logger =~ m/^main::log_(info|warning|error|status|debug)$/ or die( "logMsg called from wrong sub $logger" );
 
-	my $subname                                                         = ( caller( 2 ) )[3];
-	defined( $subname ) and $subname =~ s/^.*::([^:]+)$/$1/ or $subname = "main";
-	defined( $lineno ) or $lineno                                       = -1;
-	my $location                                                        = ( $lineno > -1 ) ? sprintf( "%d:%s()", $lineno, $subname ) : sprintf( "%s", $subname );
+	my $subname = ( caller( 2 ) )[3] // "main";
+	$subname =~ s/^.*::([^:]+)$/$1/;
+	defined( $lineno ) or $lineno = -1;
+	my $location                  = ( $lineno > -1 ) ? sprintf( "%d:%s()", $lineno, $subname ) : sprintf( "%s", $subname );
 
 	my @tLocalTime = localtime();
 	my $stTime     =
@@ -999,19 +1003,19 @@ sub reap_pid {
 	my ( $pid ) = @_;
 
 	defined( $pid ) and ( $pid =~ m/^\d+$/ ) or log_error( "reap_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and die( "FATAL BUG!" );
-	defined( $work_data{PIDs}{$pid} ) or return 1;
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	my $status = $work_data{PIDs}{$pid}{status} // $FF_REAPED;
-	$work_data_lock->unlock();
+	defined( $work_data->{PIDs}{$pid} ) or return 1;
+	$work_lock->lock;
+	my $status = $work_data->{PIDs}{$pid}{status} // $FF_REAPED;
+	$work_lock->unlock;
 	( $FF_REAPED == $status ) and return 1;
 
 	( 0 == waitpid( $pid, POSIX::WNOHANG ) ) and return 0; ## PID is still busy!
 
 	log_debug( "(reap_pid) PID %d finished", $pid );
 
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$work_data{PIDs}{$pid}{status} = $FF_REAPED;
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	$work_data->{PIDs}{$pid}{status} = $FF_REAPED;
+	$work_lock->unlock;
 
 	return 1;
 }
@@ -1024,13 +1028,13 @@ sub reaper {
 	my @args = @_;
 
 	while ( ( my $pid = waitpid( -1, POSIX::WNOHANG ) ) > 0 ) {
-		log_debug( "(reaper) KID %d finished [%s]", $pid, join( ',', @args ));
-		$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-		$work_data{PIDs}{$pid}{status} = $FF_REAPED;
-		$work_data_lock->unlock();
+		log_debug( "(reaper) KID %d finished [%s]", $pid, join( ",", @args ));
+		$work_lock->lock;
+		$work_data->{PIDs}{$pid}{status} = $FF_REAPED;
+		$work_lock->unlock;
 	}
 
-	local $SIG{CHLD} = \&reaper;
+	$SIG{CHLD} = \&reaper;
 
 	return 1;
 }
@@ -1038,7 +1042,7 @@ sub reaper {
 sub remove_pid {
 	my ( $pid, $do_cleanup ) = @_;
 	defined( $pid ) and ( $pid =~ m/^\d+$/ ) or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and die( "FATAL BUG!" );
-	defined( $work_data{PIDs}{$pid} ) or return 1;
+	defined( $work_data->{PIDs}{$pid} ) or return 1;
 
 	my $result = 1;
 
@@ -1046,23 +1050,23 @@ sub remove_pid {
 		usleep( 50 );
 	}
 
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
+	$work_lock->lock;
 
 	# If we shall clean up source and maybe target files, do so now
 	if ( 1 == $do_cleanup ) {
-log_debug( "args      => %d", scalar @{ $work_data{PIDs}{$pid}{args} // [] } );
-log_debug( "exit_code => %d", $work_data{PIDs}{$pid}{exit_code} // -1 );
-log_debug( "id        => %d", $work_data{PIDs}{$pid}{id} // -1 );
-log_debug( "prgfile   => %s", $work_data{PIDs}{$pid}{prgfile} // "undef" );
-log_debug( "result    => %s", $work_data{PIDs}{$pid}{result} // "undef" );
-log_debug( "source    => %s", $work_data{PIDs}{$pid}{source} // "undef" );
-log_debug( "target    => %s", $work_data{PIDs}{$pid}{target} // "undef" );
-		if ( $work_data{PIDs}{$pid}{exit_code} != 0 ) {
-			log_error( "Worker PID %d FAILED [%d] %s", $pid, $work_data{PIDs}{$pid}{exit_code}, $work_data{PIDs}{$pid}{result} );
+		log_debug( "args      => %d", scalar @{ $work_data->{PIDs}{$pid}{args} // [] } );
+		log_debug( "exit_code => %d", $work_data->{PIDs}{$pid}{exit_code} // -1 );
+		log_debug( "id        => %d", $work_data->{PIDs}{$pid}{id} // -1 );
+		log_debug( "prgfile   => %s", $work_data->{PIDs}{$pid}{prgfile} // "undef" );
+		log_debug( "result    => %s", $work_data->{PIDs}{$pid}{result} // "undef" );
+		log_debug( "source    => %s", $work_data->{PIDs}{$pid}{source} // "undef" );
+		log_debug( "target    => %s", $work_data->{PIDs}{$pid}{target} // "undef" );
+		if ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) {
+			log_error( "Worker PID %d FAILED [%d] %s", $pid, $work_data->{PIDs}{$pid}{exit_code}, $work_data->{PIDs}{$pid}{result} );
 			# We do not need the target file any more, the thread failed! (if an fmt is set)
 			if ( 0 == $do_debug ) {
-				if ( 0 < length( $work_data{PIDs}{$pid}{target} ) ) {
-					my $f = sprintf( $work_data{PIDs}{$pid}{target}, $work_data{PIDs}{$pid}{id} );
+				if ( 0 < length( $work_data->{PIDs}{$pid}{target} ) ) {
+					my $f = sprintf( $work_data->{PIDs}{$pid}{target}, $work_data->{PIDs}{$pid}{id} );
 					log_debug( "Removing target file '%s' ...", $f );
 					-f $f and unlink( $f );
 				}
@@ -1071,9 +1075,9 @@ log_debug( "target    => %s", $work_data{PIDs}{$pid}{target} // "undef" );
 		}
 
 		# We do not need the source file any more (if an fmt is set)
-		if ( 0 == $do_debug ) {
-			if ( 0 < length( $work_data{PIDs}{$pid}{source} ) ) {
-				my $f = sprintf( $work_data{PIDs}{$pid}{source}, $work_data{PIDs}{$pid}{id} );
+		if ( defined( $work_data->{PIDs}{$pid}{source} ) && ( 0 == $do_debug ) ) {
+			if ( 0 < length( $work_data->{PIDs}{$pid}{source} ) ) {
+				my $f = sprintf( $work_data->{PIDs}{$pid}{source}, $work_data->{PIDs}{$pid}{id} );
 				log_debug( "Removing source file '%s' ...", $f );
 				-f $f and unlink( $f );
 			}
@@ -1082,13 +1086,13 @@ log_debug( "target    => %s", $work_data{PIDs}{$pid}{target} // "undef" );
 
 	# Progress files are already removed, because the only part where they are used
 	# will no longer pick them up once the PID was removed from %work_data (See watch_my_forks())
-	my $prgfile = $work_data{PIDs}{$pid}{prgfile} // ""; ## shortcut including defined check
-	( $prgfile ) and ( -f $prgfile ) and unlink( $prgfile );
+	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // ""; ## shortcut including defined check
+	( length( $prgfile ) > 0 ) and ( -f $prgfile ) and unlink( $prgfile );
 
-	delete( $work_data{PIDs}{$pid} );
-	--$work_data{cnt};
+	delete( $work_data->{PIDs}{$pid} );
+	--$work_data->{cnt};
 
-	$work_data_lock->unlock();
+	$work_lock->unlock;
 
 	return $result;
 }
@@ -1151,13 +1155,13 @@ sub segment_source_group {
 	               "-f", "segment", "-segment_time", "$seg_len",
 	               $source_groups{$gid}{tmp} );
 
-	log_debug( "Starting Worker %d for:\n%s", 1, join( ' ', @ffargs ));
+	log_debug( "Starting Worker %d for:\n%s", 1, join( " ", @ffargs ));
 	my $pid = start_work( 1, @ffargs );
 	defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$work_data{PIDs}{$pid}{args}    = \@ffargs;
-	$work_data{PIDs}{$pid}{prgfile} = $prgfile;
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	$work_data->{PIDs}{$pid}{args}    = \@ffargs;
+	$work_data->{PIDs}{$pid}{prgfile} = $prgfile;
+	$work_lock->unlock;
 
 	# Watch and join
 	my $result = watch_my_forks();
@@ -1218,34 +1222,23 @@ sub start_capture {
 
 	close_standard_io();
 
-	#@type IPC::Shareable
-	my $fork_data_lock = tie my %fork_data, 'IPC::Shareable', { key => "WORK_DATA", create => 0 };
+	my $fork_data = {};
+	my $fork_lock = tie $fork_data, 'IPC::Shareable', { key => 'WORK_DATA' };
 
-	$fork_data_lock->lock( IPC::Shareable::LOCK_EX );
-	defined( $fork_data{PIDs}{$pid}{status} ) or $fork_data{PIDs}{$pid}{status} = $FF_CREATED;
-
-	# Wait until we got started, poll each ms
-	while ( $FF_RUNNING != $fork_data{PIDs}{$pid}{status} ) {
-		$fork_data_lock->unlock();
-		usleep( 500 ); # poll each half millisecond
-		$fork_data_lock->lock( IPC::Shareable::LOCK_EX );
-	}
-	$fork_data_lock->unlock();
+	# Wait until we can really start
+	wait_for_startup( $pid, $fork_data, $fork_lock );
 
 	# Now we can run the command as desired
-	my $result = run_forked( \@cmd, {
-		discard_output                   => 0,
-		terminate_on_parent_sudden_death => 1
-	} );
+	my @stdout;
+	run3( \@cmd, \undef, \@stdout, \&log_error, { return_if_system_error => 1 } );
 
 	# We only have to "transport" the results:
-	$fork_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$fork_data{PIDs}{$pid}{result}    = $result->{merged} // "";
-	$fork_data{PIDs}{$pid}{exit_code} = $result->{exit_code} // 0;
-	$fork_data{PIDs}{$pid}{status}    = $FF_FINISHED;
-	$fork_data_lock->unlock();
-
-	IPC::Shareable->clean_up;
+	$fork_lock->lock;
+	chomp @stdout;
+	$fork_data->{PIDs}{$pid}{result}    = join( "\n", @stdout );
+	$fork_data->{PIDs}{$pid}{exit_code} = 0 + ( $? == -1 ? $! : $? );
+	$fork_data->{PIDs}{$pid}{status}    = $FF_FINISHED;
+	$fork_lock->unlock;
 
 	return 1;
 }
@@ -1256,37 +1249,23 @@ sub start_forked {
 
 	close_standard_io();
 
-	#@type IPC::Shareable
-	my $fork_data_lock = tie my %fork_data, 'IPC::Shareable', { key => "WORK_DATA", create => 1 };
+	my $fork_data = {};
+	my $fork_lock = tie $fork_data, 'IPC::Shareable', { key => 'WORK_DATA' };
 
-	$fork_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$fork_data{PIDs}{$pid}{status} = $FF_CREATED;
-
-	# Wait until we got started, poll each ms
-	while ( $FF_RUNNING != $fork_data{PIDs}{$pid}{status} ) {
-		$fork_data_lock->unlock();
-		usleep( 1000 ); # poll until the bookkeeping is initialized
-		$fork_data_lock->lock( IPC::Shareable::LOCK_EX );
-	}
-	$fork_data_lock->unlock();
+	# Wait until we can really start
+	wait_for_startup( $pid, $fork_data, $fork_lock );
 
 	# Now we can run the command as desired
-	my $result = run_forked( \@cmd, {
-		discard_output                   => 1,
-		stderr_handler                   => sub { log_error( "%s", join( '\n', @_ )); },
-		stdout_handler                   => sub { log_debug( "%s", join( '\n', @_ )); },
-		terminate_on_parent_sudden_death => 1,
-		wait_loop_callback               => sub { ( 1 == $death_note ) and kill( 'TERM', $$ ) or ( 4 < $death_note ) and kill( 'KILL', $$ ); }
-	} );
+	my @stderr;
+	run3( \@cmd, \undef, \undef, \@stderr, { return_if_system_error => 1 } );
 
 	# We only have to "transport" the results:
-	$fork_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$fork_data{PIDs}{$pid}{result}    = $result->{err_msg} // "";
-	$fork_data{PIDs}{$pid}{exit_code} = $result->{exit_code} // 0;
-	$fork_data{PIDs}{$pid}{status}    = $FF_FINISHED;
-	$fork_data_lock->unlock();
-
-	IPC::Shareable->clean_up;
+	$fork_lock->lock;
+	chomp @stderr;
+	$fork_data->{PIDs}{$pid}{result}    = join( "\n", @stderr );
+	$fork_data->{PIDs}{$pid}{exit_code} = 0 + ( $? == -1 ? $! : $? );
+	$fork_data->{PIDs}{$pid}{status}    = $FF_FINISHED;
+	$fork_lock->unlock;
 
 	return 1;
 }
@@ -1297,14 +1276,14 @@ sub start_forked {
 # ---------------------------------------------------------
 sub start_work {
 	my ( $tid, @cmd ) = @_;
-	my $kid           = fork();
+	my $kid           = fork;
 	defined( $kid ) or die( "Cannot fork()! $!\n" );
 
 	# Handle being the fork first
 	# =======================================
 	if ( 0 == $kid ) {
 		start_forked( @cmd );
-		exit;
+		POSIX::_exit( 0 ); ## Regular exit() would call main::END block
 	}
 
 	# === Do the bookkeeping before we return
@@ -1312,12 +1291,12 @@ sub start_work {
 	add_pid( $kid );
 
 	usleep( 0 ); ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$work_data{PIDs}{$kid}{status} = $FF_RUNNING;
-	log_info( "Worker %d forked out", $tid );
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	$work_data->{PIDs}{$kid}{status} = $FF_RUNNING;
+	log_info( "Worker %d forked out as PID %d", $tid, $kid );
+	$work_lock->unlock;
 
-	return 1;
+	return $kid;
 }
 
 
@@ -1325,15 +1304,15 @@ sub start_work {
 # -------------------------------------------------------------
 sub strike_fork_kill {
 	my ( $pid ) = @_;
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	if ( $work_data{PIDs}{$pid}{status} == $FF_RUNNING ) {
+	$work_lock->lock;
+	if ( $work_data->{PIDs}{$pid}{status} == $FF_RUNNING ) {
 		log_warning( "Sending SIGKILL to fork PID %d", $pid );
-		$work_data_lock->unlock();
+		$work_lock->unlock;
 		terminator( $pid, 'KILL' );
 		return 7;
 	}
 	log_error( "Fork PID %d is gone! Will restart...", $pid );
-	$work_data_lock->unlock();
+	$work_lock->unlock;
 	return 13; # Thread is already gone, start a new one.
 }
 
@@ -1357,18 +1336,18 @@ sub strike_fork_restart {
 	my ( $pid ) = @_;
 	log_warning( "Re-starting frozen Fork %d", $pid );
 
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	my @args = @{ $work_data{PIDs}{$pid}{args} };
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	my @args = @{ $work_data->{PIDs}{$pid}{args} };
+	$work_lock->unlock;
 
 	my $kid = start_work( 1, @args );
 	defined( $kid ) and ( $kid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$work_data{PIDs}{$kid}{args}    = $work_data{PIDs}{$pid}{args};
-	$work_data{PIDs}{$kid}{prgfile} = $work_data{PIDs}{$pid}{prgfile};
-	$work_data{PIDs}{$kid}{source}  = $work_data{PIDs}{$pid}{source};
-	$work_data{PIDs}{$kid}{target}  = $work_data{PIDs}{$pid}{target};
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	$work_data->{PIDs}{$kid}{args}    = $work_data->{PIDs}{$pid}{args};
+	$work_data->{PIDs}{$kid}{prgfile} = $work_data->{PIDs}{$pid}{prgfile};
+	$work_data->{PIDs}{$kid}{source}  = $work_data->{PIDs}{$pid}{source};
+	$work_data->{PIDs}{$kid}{target}  = $work_data->{PIDs}{$pid}{target};
+	$work_lock->unlock;
 
 	remove_pid( $pid, 0 ); ## No cleanup, the restarted process will overwrite and we don't want to interfere with the substitute
 
@@ -1380,15 +1359,15 @@ sub strike_fork_restart {
 # -------------------------------------------------------------
 sub strike_fork_term {
 	my ( $pid ) = @_;
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	if ( $work_data{PIDs}{$pid}{status} == $FF_RUNNING ) {
+	$work_lock->lock;
+	if ( $work_data->{PIDs}{$pid}{status} == $FF_RUNNING ) {
 		log_warning( "Sending SIGTERM to frozen fork PID %d", $pid );
-		$work_data_lock->unlock();
+		$work_lock->unlock;
 		terminator( $pid, 'TERM' );
 		return 1;
 	}
 	log_error( "Fork PID %d is gone! Will restart...", $pid );
-	$work_data_lock->unlock();
+	$work_lock->unlock;
 	return 13; # Thread is already gone, start a new one.
 }
 
@@ -1413,15 +1392,15 @@ sub terminator {
 			usleep( 100000 );
 			reap_pid( $kid );
 		} else {
-			$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-			$work_data{PIDs}{$kid}{status} = $FF_REAPED;
-			$work_data_lock->unlock();
+			$work_lock->lock;
+			$work_data->{PIDs}{$kid}{status} = $FF_REAPED;
+			$work_lock->unlock;
 		}
 	} else {
-		foreach my $pid ( keys %{ $work_data{PIDs} } ) {
-			$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-			my $status = $work_data{PIDs}{$pid}{status};
-			$work_data_lock->unlock();
+		foreach my $pid ( keys %{ $work_data->{PIDs} } ) {
+			$work_lock->lock;
+			my $status = $work_data->{PIDs}{$pid}{status};
+			$work_lock->unlock;
 			( $FF_REAPED == $status ) or terminator( $pid, $signal );
 		}
 	}
@@ -1439,11 +1418,9 @@ sub warnHandler {
 sub wait_for_capture {
 	my ( $kid ) = @_;
 
-	add_pid( $kid );
-
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	$work_data{PIDs}{$kid}{status} = $FF_RUNNING;
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	$work_data->{PIDs}{$kid}{status} = $FF_RUNNING;
+	$work_lock->unlock;
 	usleep( 0 ); ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
 
 	log_debug( "Process %d forked out", $kid );
@@ -1456,35 +1433,65 @@ sub wait_for_capture {
 	return 1;
 }
 
+sub wait_for_startup {
+	my ( $pid, $fork_data, $fork_lock ) = @_;
+
+	# Wait until the work data is initialized
+	$fork_lock->lock;
+	while ( !defined( $fork_data->{PIDs}{$pid} ) ) {
+		$fork_lock->unlock;
+		usleep( 500 ); # poll each half millisecond
+		$fork_lock->lock;
+	}
+	# Now we can tell the world that we are created
+	$fork_data->{PIDs}{$pid}{status} = $FF_CREATED;
+	$fork_lock->unlock;
+
+	# Wait until we got started, poll each ms
+	usleep( 1 ); ## A little "yield()" simulation
+	$fork_lock->lock;
+	while ( $FF_RUNNING != $fork_data->{PIDs}{$pid}{status} ) {
+		$fork_lock->unlock;
+		usleep( 500 ); # poll each half millisecond
+		$fork_lock->lock;
+	}
+	$fork_lock->unlock;
+
+	return 1;
+}
+
 
 # This is a watchdog function that displays progress and joins all threads nicely if needed
 sub watch_my_forks {
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
+	$work_lock->lock;
 	my $result       = 1;
-	my $forks_active = $work_data{cnt};
+	my $forks_active = $work_data->{cnt};
 	my %fork_timeout = (); # 60 intervals = 30 seconds
 	my %fork_strikes = ();
 
 	# The whole watching is done in two phases.
-	log_debug( "Forks : %s", join( ', ', keys %{ $work_data{PIDs} } ));
-	$work_data_lock->unlock();
+	log_debug( "Forks : %s", join( ", ", keys %{ $work_data->{PIDs} } ));
+	$work_lock->unlock;
 
 	# Phase 1: show logged progress as long as there are running forks left
 	while ( $forks_active > 0 ) {
-		$work_data_lock->lock( IPC::Shareable::LOCK_EX );
+		$work_lock->lock;
 		my %prgData  = ();
-		my @PIDs     = sort keys %{ $work_data{PIDs} };
-		my $fork_cnt = $work_data{cnt};
-		$work_data_lock->unlock();
-
+		my @PIDs     = ( sort keys %{ $work_data->{PIDs} } );
+		my $fork_cnt = $work_data->{cnt};
+		$work_lock->unlock;
 		$forks_active = 0;
 		can_work() or last; ## Go out early
 
 		# Load the current progress data
 		foreach my $pid ( @PIDs ) {
-			$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-			my $prgfile = $work_data{PIDs}{$pid}{prgfile};
-			$work_data_lock->unlock();
+			$work_lock->lock;
+			defined( $work_data->{PIDs}{$pid} ) or $work_lock->unlock and next; ## The PID is gone already
+			defined( $work_data->{PIDs}{$pid}{status} ) or $work_lock->unlock and die( "FATAL: PID $pid HAS NO CONTENT!" );
+			my $prgfile = $work_data->{PIDs}{$pid}{prgfile};
+			# In case the fork got delayed, it might not have been started when it should
+			( $FF_CREATED == $work_data->{PIDs}{$pid}{status} ) and $work_data->{PIDs}{$pid}{status} = $FF_RUNNING;
+			$work_lock->unlock;
 			defined( $fork_timeout{$pid} ) or $fork_timeout{$pid} = 60;
 			defined( $fork_strikes{$pid} ) or $fork_strikes{$pid} = 0;
 
@@ -1503,35 +1510,36 @@ sub watch_my_forks {
 
 		# If we are called to kill via signal, be mean to the forks and kill them
 		if ( $death_note > 0 ) {
-			$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-			foreach my $pid ( keys %{ $work_data{PIDs} } ) {
-				if ( ( 1 == $death_note ) && ( $work_data{PIDs}{$pid}{status} != $FF_REAPED ) ) {
+			$work_lock->lock;
+			foreach my $pid ( keys %{ $work_data->{PIDs} } ) {
+				if ( ( 1 == $death_note ) && ( $work_data->{PIDs}{$pid}{status} != $FF_REAPED ) ) {
 					log_warning( "TERMing worker PID %d", $pid );
-					$work_data_lock->unlock();
+					$work_lock->unlock;
 					terminator( $pid, 'TERM' );
-					$work_data_lock->lock( IPC::Shareable::LOCK_EX );
+					$work_lock->lock;
 				}
 				# Note: 5 is after 2 seconds
-				elsif ( ( 5 == $death_note ) && ( $work_data{PIDs}{$pid}{status} != $FF_REAPED ) ) {
+				elsif ( ( 5 == $death_note ) && ( $work_data->{PIDs}{$pid}{status} != $FF_REAPED ) ) {
 					log_warning( "KILLing worker PID %d", $pid );
-					$work_data_lock->unlock();
+					$work_lock->unlock;
 					terminator( $pid, 'KILL' );
-					$work_data_lock->lock( IPC::Shareable::LOCK_EX );
+					$work_lock->lock;
 				}
 			}
 			++$death_note;
-			$work_data_lock->unlock();
+			$work_lock->unlock;
 		}
 
 		# if any fork has not returned 0 from load_progress() for 30 seconds, we consider it frozen
-		$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-		@PIDs = sort keys %{ $work_data{PIDs} };
-		$work_data_lock->unlock();
+		$work_lock->lock;
+		@PIDs = ( sort keys %{ $work_data->{PIDs} } );
+		$work_lock->unlock;
 		foreach my $pid ( @PIDs ) {
 			can_work() or last; ## Do not unfreeze while killing
-			$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-			my $status = $work_data{PIDs}{$pid}{status};
-			$work_data_lock->unlock();
+			$work_lock->lock;
+			defined( $work_data->{PIDs}{$pid} ) or $work_lock->unlock and next; ## The PID is gone already
+			my $status = $work_data->{PIDs}{$pid}{"status"};
+			$work_lock->unlock;
 			defined( $fork_timeout{$pid} ) or $fork_timeout{$pid} = 60;
 			defined( $fork_strikes{$pid} ) or $fork_strikes{$pid} = 0;
 			( $fork_timeout{$pid} <= 0 ) and ( $FF_RUNNING == $status ) or next;
@@ -1556,9 +1564,9 @@ sub watch_my_forks {
 	} ## End of showing fork progress
 
 	# Phase 2: Ensure that all Forks are gone
-	$work_data_lock->lock( IPC::Shareable::LOCK_EX );
-	my @PIDs = sort keys %{ $work_data{PIDs} };
-	$work_data_lock->unlock();
+	$work_lock->lock;
+	my @PIDs = ( sort keys %{ $work_data->{PIDs} } );
+	$work_lock->unlock;
 	foreach my $pid ( @PIDs ) {
 
 		# Wait for PID

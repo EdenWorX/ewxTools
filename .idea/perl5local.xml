@@ -13,6 +13,7 @@
     <option name="perlInterpreter" value="Local, System: Perl 5.38.2" />
   </component>
   <component name="Perl5XSubsState">
+    <option name="isActual" value="false" />
     <option name="myFilesMap">
       <map>
         <entry key="/usr/lib64/perl5/5.38/x86_64-linux-quadmath-thread-multi/auto/B/B.so" value="1717138215458" />
