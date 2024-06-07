@@ -127,6 +127,9 @@ my $do_print_version   = 0;
 my $do_split_audio     = 0;
 my $force_upgrade      = 0;
 my $max_fps            = 0;
+my $maxProbeSize       = 256 * 1024 * 1024; # Max out probe size at 256 MB, all relevant stream info should be available from that size
+my $maxProbeDura       = 30 * 1000 * 1000;  # Max out analyze duration at 30 seconds. This should be long enough for everything
+my $maxProbeFPS        = 8 * 120;           # FPS probing is maxed at 8 seconds for 120 FPS recordings.
 my $target_fps         = 0;
 my @path_source        = ();
 my $path_target        = "";
@@ -208,7 +211,7 @@ log_info( "Processing %s start", $path_target );
 # --- 1) we need information about each source file
 # ---
 if ( can_work() ) {
-	analyze_inputs() or exit 6;
+	analyze_all_inputs() or exit 6;
 }
 
 
@@ -362,115 +365,157 @@ sub add_pid {
 	return 1;
 }
 
-sub analyze_inputs {
-	my $MaxProbeSize = 256 * 1024 * 1024; # Max out probe size at 256 MB, all relevant stream info should be available from that size
-	my $MaxProbeDura = 30 * 1000 * 1000;  # Max out analyze duration at 30 seconds. This should be long enough for everything
-	my $MaxProbeFPS  = 8 * 120;           # FPS probing is maxed at 8 seconds for 120 FPS recordings.
-	my $pathID       = 0;
+sub get_info_from_ffprobe {
+	my ( $src, $stream_fields ) = @_;
+	my $avg_frame_rate_stream   = -1;
+	my @fpcmd                   = ( $FP,
+	                                @FP_ARGS,
+	                                "stream=$stream_fields",
+	                                split( / /, $source_info{$src}{probeStrings} ),
+	                                $src );
+
+	log_debug( "Calling: %s", join( " ", @fpcmd ));
+
+	my @fplines = split( '\n', capture_cmd( @fpcmd ));
+
+	foreach my $line ( @fplines ) {
+		chomp $line;
+		#log_debug("RAW[%s]", $line);
+		if ( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/ ) {
+			$source_info{$src}{streams}[$1]{$2} = "$3";
+			( "avg_frame_rate" eq $2 ) and
+			( "0" ne "$3" ) and ( "0/0" ne "$3" ) and
+			( $avg_frame_rate_stream < 0 ) and $avg_frame_rate_stream = $1;
+			next;
+		}
+		( $line =~ m/format_([^=]+)="?([^"]+)"?/ ) and $source_info{$src}{$1} = "$2";
+	}
+
+	return $avg_frame_rate_stream;
+}
+
+sub analyze_all_inputs {
+
+	my $pathID = 0; ## Counter for the source id hash
 
 	foreach my $src ( @path_source ) {
 		can_work() or last;
 
-		my $have_video = 0;
-		my $have_audio = 0;
-		my $have_voice = 0;
-		my $inSize     = -s $src;
+		my $inSize = -s $src;
 
 		$source_info{$src} = {
-			dir       => dirname( $src ),
-			id        => ++$pathID,
-			probeSize => $inSize > $MaxProbeSize ? $MaxProbeSize : $inSize
+			avg_frame_rate => 0,
+			dir            => dirname( $src ),
+			duration       => 0,
+			id             => ++$pathID,
+			probeSize      => $inSize > $maxProbeSize ? $maxProbeSize : $inSize,
+			probeStrings   => sprintf( "-probesize %d", $inSize > $maxProbeSize ? $maxProbeSize : $inSize )
 		};
 		$source_ids{$pathID} = $src;
 
-		# Get basic duration
-		my $stream_fields = "avg_frame_rate,duration";
-		my @fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", "-probesize", $source_info{$src}{probeSize}, $src );
-		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		my @fplines        = split( '\n', capture_cmd( @fpcmd ));
-		my $avg_frame_rate = 0;
-		my $duration       = 0;
-		my $probeDura      = 0;
-		my $probeFPS       = 0;
-		foreach my $line ( @fplines ) {
-			chomp $line;
-			( $line =~ m/format_duration="(\d+\.\d+)"/ )
-			and $duration = floor( 1. + ( 1. * $1 ));
-			( $line =~ m/streams_stream_\d_avg_frame_rate="(\d+)\/(\d+)"/ ) and ( 1. * $1 > 0. ) and ( 1. * $2 > 0. )
-			and log_debug( "avg_frame_rate: '%s' => %d / %d", $line, $1, $2 )
-			and $avg_frame_rate = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ));
+		analyze_input( $src ) or return 0;
+	}
+
+	return 1;
+}
+
+sub analyze_input {
+	my ( $src ) = @_;
+
+	my $formats = $source_info{$src};  ## Shortcut
+	my $streams = $formats->{streams}; ## shortcut, too
+
+	# Get basic duration
+	my $stream_fields = "avg_frame_rate,duration";
+	my $frstream_no   = get_info_from_ffprobe( $src, $stream_fields );
+	( $frstream_no >= 0 ) or return 0;       ## Something went wrong
+	my $frstream = $streams->[$frstream_no]; ## shortcut, three
+
+	( $formats->{duration} > 0 ) or log_error( "Unable to determine duration of '%s'", $src ) and return 0;
+	( $frstream->{avg_frame_rate} > 0 ) or log_error( "Unable to determine average frame rate of '%s'", $src ) and return 0;
+
+	log_debug( "Duration   : %d", $formats->{duration} );
+	log_debug( "Average FPS: %d", $frstream->{avg_frame_rate} );
+
+	$formats->{probedDuration}                                                    = $formats->{duration} * 1000 * 1000; ## Probe Duration is set up in microseconds.
+	$formats->{probeFPS}                                                          = $frstream->{avg_frame_rate} * 8;
+	( $formats->{probedDuration} > $maxProbeDura ) and $formats->{probedDuration} = $maxProbeDura;
+	( $formats->{probeFPS} > $maxProbeFPS ) and $formats->{probeFPS}              = $maxProbeFPS;
+
+	$formats->{sourceFPS}    = $frstream->{avg_frame_rate};
+	$formats->{probeStrings} = sprintf( "-probesize %d -analyzeduration %d -fpsprobesize %d",
+	                                    $formats->{probeSize},
+	                                    $formats->{probedDuration},
+	                                    $formats->{probeFPS} );
+
+	# Now that we have good (and sane) values for probing sizes and durations, lets query ffprobe again to get the final value we need.
+	can_work() or return 0;
+	$stream_fields = "avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration";
+	$frstream      = get_info_from_ffprobe( $src, $stream_fields );
+	( $frstream_no >= 0 ) or return 0;    ## Something went wrong this time
+	$frstream = $streams->[$frstream_no]; ## shortcut, four...
+
+	# Maybe we have to fix the duration values we currently have
+	$formats->{duration} =~ m/(\d+\.\d+)/ and
+	$formats->{duration} = floor( 1. + ( 1. * $1 ));
+
+	# Now we can go through the read stream information and determine video and audio stream details
+	analyze_stream_info( $src, $streams ) or return 0;
+
+	# If the second analysis somehow came up with a different average framerate, we have to adapt:
+	if ( ( $formats->{duration} > 0 ) && ( $frstream->{avg_frame_rate} > 0 ) &&
+	     ( $formats->{sourceFPS} != $formats->{avg_frame_rate} ) ) {
+		$formats->{probedDuration} = $formats->{duration} * 1000 * 1000; ## Probe Duration is set up in microseconds.
+		$formats->{probeFPS}       = $frstream->{avg_frame_rate} * 8;
+
+		log_debug( "(fixed) Duration   : %d", $formats->{duration} );
+		log_debug( "(fixed) Average FPS: %d", $frstream->{avg_frame_rate} );
+
+		( $formats->{probedDuration} > $maxProbeDura ) and $formats->{probedDuration} = $maxProbeDura;
+		( $formats->{probeFPS} > $maxProbeFPS ) and $formats->{probeFPS}              = $maxProbeFPS;
+
+		$formats->{sourceFPS} = $frstream->{avg_frame_rate};
+	}
+
+	return 1;
+}
+
+sub analyze_stream_info {
+	my ( $src, $streams ) = @_;
+
+	my $have_video = 0;
+	my $have_audio = 0;
+	my $have_voice = 0;
+
+	for ( my $i = 0; $i < $source_info{$src}{nb_streams}; ++$i ) {
+		if ( $streams->[$i]{codec_type} eq "video" ) {
+			$have_video   = 1;
+			$video_stream = $i;
+			$streams->[$i]{avg_frame_rate} =~ m/(\d+)\/(\d+)/ and ( 1. * $1 > 0. ) and ( 1. * $2 > 0. )
+			and $streams->[$i]{avg_frame_rate} = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ));
 		}
-		( $duration > 0 ) or log_error( "Unable to determine duration of '%s'", $src ) and return 0;
-		( $avg_frame_rate > 0 ) or log_error( "Unable to determine average frame rate of '%s'", $src ) and return 0;
-		$probeDura = $duration * 1000 * 1000; ## Probe Duration is set up in microseconds.
-		$probeFPS  = $avg_frame_rate * 8;
-		log_debug( "Duration   : %d", $duration );
-		log_debug( "Average FPS: %d", $avg_frame_rate );
-		$source_info{$src}{sourceFPS}      = $avg_frame_rate;
-		$source_info{$src}{probedDuration} = $probeDura > $MaxProbeDura ? $MaxProbeDura : $probeDura;
-		$source_info{$src}{duration}       = $duration;
-		$source_info{$src}{probeFPS}       = $probeFPS > $MaxProbeFPS ? $MaxProbeFPS : $probeFPS;
-		$source_info{$src}{probeStrings}   = sprintf( "-probesize %d -analyzeduration %d -fpsprobesize %d",
-		                                              $source_info{$src}{probeSize}, $source_info{$src}{probedDuration}, $source_info{$src}{probeFPS} );
-
-		# Now that we have good (and sane) values for probing sizes and durations, lets query ffprobe again to get the final value we need.
-		can_work() or last;
-		$stream_fields = "avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration";
-		@fpcmd         = ( $FP, @FP_ARGS, "stream=$stream_fields", split( / /, $source_info{$src}{probeStrings} ), $src );
-		log_debug( "Calling: %s", join( " ", @fpcmd ));
-		@fplines = split( '\n', capture_cmd( @fpcmd ));
-		foreach my $line ( @fplines ) {
-			chomp $line;
-			#log_debug("RAW[%s]", $line);
-			( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/ ) and $source_info{$src}{streams}[$1]{$2} = "$3" and next;
-			( $line =~ m/format_([^=]+)="?([^"]+)"?/ ) and $source_info{$src}{$1}                           = "$2";
-		}
-
-		# Maybe we have to fix the duration values we currently have
-		$avg_frame_rate                                             = 0;
-		$duration                                                   = 0;
-		$source_info{$src}{duration} =~ m/(\d+\.\d+)/ and $duration = floor( 1. + ( 1. * $1 ));
-
-		for ( my $i = 0; $i < $source_info{$src}{nb_streams}; ++$i ) {
-			if ( $source_info{$src}{streams}[$i]{codec_type} eq "video" ) {
-				$have_video   = 1;
-				$video_stream = $i;
-				$source_info{$src}{streams}[$i]{avg_frame_rate} =~ m/(\d+)\/(\d+)/ and ( 1. * $1 > 0. ) and ( 1. * $2 > 0. )
-				and $avg_frame_rate = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ));
-			}
-			if ( $source_info{$src}{streams}[$i]{codec_type} eq "audio" ) {
-				if ( 0 == $have_audio ) {
-					$have_audio   = 1;
-					$audio_stream = $i;
-					if ( $source_info{$src}{streams}[$i]{channels} > $audio_channels ) {
-						$audio_channels = $source_info{$src}{streams}[$i]{channels};
-						$audio_layout   = channels_to_layout( $audio_channels );
-					}
-				} elsif ( 0 == $have_voice ) {
-					$have_voice   = 1;
-					$voice_stream = $i;
-					if ( $source_info{$src}{streams}[$i]{channels} > $voice_channels ) {
-						$voice_channels = $source_info{$src}{streams}[$i]{channels};
-						$voice_layout   = channels_to_layout( $voice_channels );
-					}
-				} else {
-					log_error( "Found third audio channel in '%s' - no idea what to do with it!", $src );
-					return 0;
+		if ( $streams->[$i]{codec_type} eq "audio" ) {
+			if ( 0 == $have_audio ) {
+				$have_audio   = 1;
+				$audio_stream = $i;
+				if ( $streams->[$i]{channels} > $audio_channels ) {
+					$audio_channels = $streams->[$i]{channels};
+					$audio_layout   = channels_to_layout( $audio_channels );
 				}
+			} elsif ( 0 == $have_voice ) {
+				$have_voice   = 1;
+				$voice_stream = $i;
+				if ( $streams->[$i]{channels} > $voice_channels ) {
+					$voice_channels = $streams->[$i]{channels};
+					$voice_layout   = channels_to_layout( $voice_channels );
+				}
+			} else {
+				log_error( "Found third audio channel in '%s' - no idea what to do with it!", $src );
+				return 0;
 			}
 		}
-		( 0 == $have_video ) and log_error( "Source file '%s' has no video stream!", $src ) and return 0;
-		if ( ( $duration > 0 ) && ( $avg_frame_rate > 0 ) &&
-		     ( ( $source_info{$src}{duration} != $duration ) || ( $source_info{$src}{sourceFPS} != $avg_frame_rate ) ) ) {
-			$probeDura                         = $duration * 1000 * 1000;
-			$probeFPS                          = $avg_frame_rate * 8;
-			$source_info{$src}{probedDuration} = $probeDura > $MaxProbeDura ? $MaxProbeDura : $probeDura;
-			$source_info{$src}{probeFPS}       = $probeFPS > $MaxProbeFPS ? $MaxProbeFPS : $probeFPS;
-			$source_info{$src}{probeStrings}   = sprintf( "-probesize %d -analyzeduration %d -fpsprobesize %d",
-			                                              $source_info{$src}{probeSize}, $source_info{$src}{probedDuration},
-			                                              $source_info{$src}{probeFPS} );
-		}
-	} ## End of analyzing input files
+	}
+	( 0 == $have_video ) and log_error( "Source file '%s' has no video stream!", $src ) and return 0;
 
 	return 1;
 }
@@ -757,7 +802,7 @@ sub create_target_file {
 sub commify {
 	my ( $text ) = @_;
 	$text        = reverse $text;
-	$text =~ s/(\d\d\d)(?=\d)(?!\d*\.)/$1,/g;
+	$text =~ s/(\d\d\d)(?=\d)(?!\d*\.)/$1,/xg;
 	return scalar reverse $text;
 }
 
@@ -805,6 +850,37 @@ sub format_out_time {
 	return sprintf( "%02d:%02d:%02d.%06d", $hr, $min % 60, $sec % 60, $ms % 1000000 );
 }
 
+sub get_location {
+	my ( $caller, undef, undef, $lineno, $logger ) = @_;
+
+	defined( $logger ) and $logger =~ m/^main::log_(info|warning|error|status|debug)$/x
+	or die( "get_location(): logMsg() called from wrong sub $logger" );
+
+	my $subname = $caller // "main";
+	$subname =~ s/^.*::([^:]+)$/$1/;
+	defined( $lineno ) or $lineno = -1;
+
+	return ( $lineno > -1 ) ? sprintf( "%d:%s()", $lineno, $subname ) : sprintf( "%s", $subname );
+}
+
+sub get_log_level {
+	my ( $level ) = @_;
+
+	( $LOG_INFO == $level ) and return ( "Info   " ) or
+	( $LOG_WARNING == $level ) and return ( "Warning" ) or
+	( $LOG_ERROR == $level ) and return ( "ERROR  " ) or
+	( $LOG_STATUS == $level ) and return ( "" );
+
+	return ( "=DEBUG=" );
+}
+
+sub get_time_now {
+	my @tLocalTime = localtime();
+	return sprintf( "%04d-%02d-%02d %02d:%02d:%02d",
+	                $tLocalTime[5] + 1900, $tLocalTime[4] + 1, $tLocalTime[3],
+	                $tLocalTime[2], $tLocalTime[1], $tLocalTime[0] );
+}
+
 sub human_readable_size {
 	my ( $number_string ) = @_;
 	my $int               = floor( $number_string );
@@ -821,18 +897,16 @@ sub human_readable_size {
 
 sub interpolate_source_group {
 	my ( $gid, $tmp_from, $tmp_to, $dec_max, $dec_frac, $tgt_fps, $filter_extra ) = @_;
-	defined( $filter_extra ) or $filter_extra                                     = "";
-	defined( $source_groups{$gid} ) or log_error( "Source Group ID %d does not exist!", $gid ) and return 0;
+
+	unless ( defined( $source_groups{$gid} ) ) {
+		log_error( "Source Group ID %d does not exist!", $gid );
+		return 0;
+	}
+
+	defined( $filter_extra ) or $filter_extra = "";
 	can_work() or return 1;
 
-	# We do not need any fancy loops here, because there will always be 4 segments, and thus 4 threads. No exceptions.
-	my @prgLogs = (
-		sprintf( $source_groups{$gid}{prg}, 0 ),
-		sprintf( $source_groups{$gid}{prg}, 1 ),
-		sprintf( $source_groups{$gid}{prg}, 2 ),
-		sprintf( $source_groups{$gid}{prg}, 3 )
-	);
-
+	# Prepare filter components
 	my $F_in_scale    = "${filter_extra}scale='in_range=full:out_range=full'";
 	my $F_scale_FPS   = "fps=${tgt_fps}:round=near";
 	my $F_mpdecimate  = "mpdecimate='max=${dec_max}:frac=${dec_frac}'";
@@ -840,38 +914,20 @@ sub interpolate_source_group {
 	my $F_interpolate = "libplacebo='extra_opts=preset=high_quality:frame_mixer=" .
 	                    ( ( "iup" eq $tmp_to ) ? "mitchell_clamp" : "oversample" ) .
 	                    ":fps=${tgt_fps}'";
-	#my $F_assembled   = "${B_in}${F_in_scale}${B_FPS}${F_scale_FPS}${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}${B_out}";
 	my $F_assembled = "${B_in}${F_in_scale}" .
 	                  ( ( "iup" eq $tmp_to ) ? "${B_FPS}${F_scale_FPS}" : "" ) .
 	                  "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}${B_out}";
 
 	# Building the four worker threads is quite trivial
 	can_work() or return 1;
-	my @ffargs  = ( [], [], [], [] );
 	for ( my $i = 0; $i < 4; ++$i ) {
-		# Let's build the command line arguments:
-		$ffargs[$i] = [ $FF, @FF_ARGS_START, "-progress", $prgLogs[$i],
-		                ( ( "guess" ne $audio_layout ) ? ( "-guess_layout_max", "0" ) : () ),
-		                @FF_ARGS_INPUT_VULK, sprintf( $source_groups{$gid}{$tmp_from}, $i ),
-		                @FF_ARGS_ACOPY_FIL, $F_assembled, "-fps_mode", "cfr", @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV,
-		                sprintf( $source_groups{$gid}{$tmp_to}, $i )
-		];
-
-		log_debug( "Starting Worker %d for:\n%s", $i + 1, join( " ", @{ $ffargs[$i] } ));
-		my $pid = start_work( $i, @{ $ffargs[$i] } );
-		defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
-		$work_lock->lock;
-		$work_data->{PIDs}{$pid}{args}    = \@ffargs;
-		$work_data->{PIDs}{$pid}{id}      = $i;
-		$work_data->{PIDs}{$pid}{prgfile} = $prgLogs[$i];
-		$work_data->{PIDs}{$pid}{source}  = $source_groups{$gid}{$tmp_from};
-		$work_data->{PIDs}{$pid}{target}  = $source_groups{$gid}{$tmp_to};
-		$work_lock->unlock;
+		start_worker_fork( $gid, $i, $tmp_from, $tmp_to, $F_assembled ) or return 0;
 	}
 
 	# Watch and join
 	return watch_my_forks();
 }
+
 
 # Load data from between the last two "progress=<state>" lines in the given log file, and store it in the given hash
 # If the hash has values, progress data is added.
@@ -914,13 +970,13 @@ sub load_progress {
 		chomp $lines[$line_num];
 		#log_debug( "Progress Line %d: '%s'", $line_num + 1, $lines[$line_num] );
 
-		$lines[$line_num] =~ m/^bitrate=(\d+\.?\d*)\D\S+\s*$/ and $prgData->{bitrate} += ( 1. * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^drop_frames=(\S+)\s*$/ and $prgData->{drop_frames}    += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^dup_frames=(\S+)\s*$/ and $prgData->{dup_frames}      += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^fps=(\S+)\s*$/ and $prgData->{fps}                    += ( 1. * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^frame=(\S+)\s*$/ and $prgData->{frames}               += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^out_time_ms=(\d+)\s*$/ and $prgData->{out_time}       += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^total_size=(\d+)\s*$/ and $prgData->{total_size}      += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^bitrate=(\d+\.?\d*)\D\S+\s*$/x and $prgData->{bitrate} += ( 1. * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^drop_frames=(\S+)\s*$/x and $prgData->{drop_frames}    += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^dup_frames=(\S+)\s*$/x and $prgData->{dup_frames}      += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^fps=(\S+)\s*$/x and $prgData->{fps}                    += ( 1. * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^frame=(\S+)\s*$/x and $prgData->{frames}               += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^out_time_ms=(\d+)\s*$/x and $prgData->{out_time}       += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^total_size=(\d+)\s*$/x and $prgData->{total_size}      += ( 1 * $1 ) and ++$line_num and next;
 
 		$lines[$line_num] =~ m/^progress=/ and ++$progress_no;
 
@@ -937,39 +993,17 @@ sub logMsg {
 
 	( $LOG_DEBUG == $lvl ) and ( 0 == $do_debug ) and return 1;
 
-	my ( undef, undef, $lineno, $logger ) = caller( 1 );
-	$logger =~ m/^main::log_(info|warning|error|status|debug)$/ or die( "logMsg called from wrong sub $logger" );
+	my $stTime  = get_time_now();
+	my $stLevel = get_log_level( $lvl );
+	my $stLoc   = get_location( ( caller( 2 ) )[3], caller( 1 ));
+	my $stMsg   = sprintf( "%s|%s|%s|$fmt", $stTime, $stLevel, $stLoc, @args );
 
-	my $subname = ( caller( 2 ) )[3] // "main";
-	$subname =~ s/^.*::([^:]+)$/$1/;
-	defined( $lineno ) or $lineno = -1;
-	my $location                  = ( $lineno > -1 ) ? sprintf( "%d:%s()", $lineno, $subname ) : sprintf( "%s", $subname );
-
-	my @tLocalTime = localtime();
-	my $stTime     =
-		sprintf( "%04d-%02d-%02d %02d:%02d:%02d", $tLocalTime[5] + 1900, $tLocalTime[4] + 1, $tLocalTime[3], $tLocalTime[2], $tLocalTime[1], $tLocalTime[0] );
-
-	my $stLevel = "=DEBUG=";
-	$stLevel    = "Info   " if ( $lvl == $LOG_INFO );
-	$stLevel    = "Warning" if ( $lvl == $LOG_WARNING );
-	$stLevel    = "ERROR  " if ( $lvl == $LOG_ERROR );
-	$stLevel    = "" if ( $lvl == $LOG_STATUS );
-
-	my $stMsg = sprintf( "%s|%s|%s|$fmt", $stTime, $stLevel, $location, @args );
-	if ( ( 0 < length( $logfile ) ) && open( my $fLog, ">>", $logfile ) ) {
-		print $fLog ( "${stMsg}\n" ) and close( $fLog );
-	}
-
-	if ( $have_progress_msg > 0 ) {
-		print "\n";
-		$have_progress_msg = 0;
-	}
-
-	local $| = 1;
-	print "${stMsg}\n";
+	( 0 < length( $logfile ) ) and write_to_log( $stMsg );
+	( $LOG_DEBUG != $lvl ) and write_to_console( $stMsg );
 
 	return 1;
 } ## end sub logMsg
+
 
 sub log_info {
 	my ( $fmt, @args ) = @_;
@@ -1299,6 +1333,30 @@ sub start_work {
 	return $kid;
 }
 
+sub start_worker_fork {
+	my ( $gid, $i, $tmp_from, $tmp_to, $F_assembled ) = @_;
+	my $prgLog                                        = sprintf( $source_groups{$gid}{prg}, $i );
+	my $ffargs                                        = [ $FF, @FF_ARGS_START, "-progress", $prgLog,
+	                                                      ( ( "guess" ne $audio_layout ) ? ( "-guess_layout_max", "0" ) : () ),
+	                                                      @FF_ARGS_INPUT_VULK, sprintf( $source_groups{$gid}{$tmp_from}, $i ),
+	                                                      @FF_ARGS_ACOPY_FIL, $F_assembled, "-fps_mode", "cfr", @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV,
+	                                                      sprintf( $source_groups{$gid}{$tmp_to}, $i )
+	];
+
+	log_debug( "Starting Worker %d for:\n%s", $i + 1, join( " ", @{ $ffargs } ));
+	my $pid = start_work( $i, @{ $ffargs } );
+	defined( $pid ) and ( $pid > 0 ) or die( "BUG! start_work() returned invalid PID!" );
+	$work_lock->lock;
+	$work_data->{PIDs}{$pid}{args}    = $ffargs;
+	$work_data->{PIDs}{$pid}{id}      = $i;
+	$work_data->{PIDs}{$pid}{prgfile} = $prgLog;
+	$work_data->{PIDs}{$pid}{source}  = $source_groups{$gid}{$tmp_from};
+	$work_data->{PIDs}{$pid}{target}  = $source_groups{$gid}{$tmp_to};
+	$work_lock->unlock;
+
+	return 1;
+}
+
 
 # --- Second strike, 3 seconds after $thr_progress timeout  ---
 # -------------------------------------------------------------
@@ -1579,6 +1637,29 @@ sub watch_my_forks {
 	} ## End of Clearing PIDs
 
 	return $result;
+}
+
+sub write_to_console {
+	my ( $msg ) = @_;
+
+	if ( $have_progress_msg > 0 ) {
+		print "\n";
+		$have_progress_msg = 0;
+	}
+
+	local $| = 1;
+	return print "${msg}\n";
+}
+
+sub write_to_log {
+	my ( $msg ) = @_;
+
+	if ( open( my $fLog, ">>", $logfile ) ) {
+		print $fLog ( "${msg}\n" );
+		close( $fLog );
+	}
+
+	return 1;
 }
 
 

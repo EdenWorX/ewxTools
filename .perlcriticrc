@@ -9,6 +9,9 @@ criticism-fatal = 1
 color           = 0
 allow-unsafe    = 0
 
+[RegularExpressions::RequireExtendedFormatting]
+minimum_regex_length_to_complain_about = 16
+
 [Variables::RequireLocalizedPunctuationVars]
 allow = %SIG $SIG $SIG{__WARN__} $SIG{__DIE__} $SIG{CHLD}
 

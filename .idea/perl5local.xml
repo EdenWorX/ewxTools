@@ -13,7 +13,6 @@
     <option name="perlInterpreter" value="Local, System: Perl 5.38.2" />
   </component>
   <component name="Perl5XSubsState">
-    <option name="isActual" value="false" />
     <option name="myFilesMap">
       <map>
         <entry key="/usr/lib64/perl5/5.38/x86_64-linux-quadmath-thread-multi/auto/B/B.so" value="1717138215458" />
@@ -127,6 +126,7 @@
         <entry key="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi/auto/Ref/Util/XS/XS.so" value="1717139504282" />
         <entry key="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi/auto/Socket6/Socket6.so" value="1717138717253" />
         <entry key="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi/auto/Sort/Key/Key.so" value="1717139340216" />
+        <entry key="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi/auto/String/CRC32/CRC32.so" value="1717496468701" />
         <entry key="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi/auto/Sub/Identify/Identify.so" value="1717139373641" />
         <entry key="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi/auto/Sub/Name/Name.so" value="1717138904682" />
         <entry key="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi/auto/Syntax/Keyword/Try/Try.so" value="1717141134030" />
