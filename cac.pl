@@ -26,7 +26,7 @@ use Time::HiRes qw( usleep );
 # 1.0.2    2024-05-30  sed, EdenWorX  Rewrote the workers to be true forks instead of using iThreads.
 #
 # Please keep this current:
-Readonly my $VERSION => '1.0.2';
+our $VERSION => '1.0.2';
 
 
 # =======================================================================================
@@ -283,41 +283,7 @@ if ( can_work() ) {
 # ---
 if ( can_work() ) {
 	log_info( 'Creating %s ...', $path_target );
-
-	my $lstfile = sprintf '%s/temp_%d_src.lst', dirname( $path_target ), $tmp_pid;
-	my $prgfile = sprintf '%s/temp_%d_prg.log', dirname( $path_target ), $tmp_pid;
-	my $mapfile = $path_target;
-	$mapfile =~ s/[.]mkv$/.wav/ms;
-
-	if ( open my $fOut, '>', $lstfile ) {
-		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
-			for my $i ( 0 .. 3 ) {
-				printf { $fOut } "file '%s'\n", ( sprintf $source_groups{$groupID}{idn}, $i );
-			}
-		}
-		close $fOut or croak( "Closing listfile '$lstfile' FAILED!" );
-	} else {
-		log_error( "Unable to write into '%s': %s", $lstfile, $! );
-		exit 11;
-	}
-
-	# Having a list file we can go and create our output:
-	if ( can_work() ) {
-		create_target_file( $lstfile, $prgfile, $mapfile ) or exit 11;
-	}
-
-	# When everything is good, we no longer need the list file, progress file and the temp files
-	if ( 0 == $do_debug ) {
-		-f $lstfile and unlink $lstfile;
-		-f $prgfile and unlink $prgfile;
-		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
-			for my $i ( 0 .. 3 ) {
-				my $tmpfile = sprintf $source_groups{$groupID}{idn}, $i;
-				log_debug( 'Removing %s...', $tmpfile );
-				-f $tmpfile and unlink $tmpfile;
-			}
-		}
-	}
+	assemble_output() or exit 12;
 }
 
 
@@ -508,6 +474,45 @@ sub analyze_stream_info {
 	return 1;
 }
 
+sub assemble_output {
+	my $lstfile = sprintf '%s/temp_%d_src.lst', dirname( $path_target ), $tmp_pid;
+	my $prgfile = sprintf '%s/temp_%d_prg.log', dirname( $path_target ), $tmp_pid;
+	my $mapfile = $path_target;
+	$mapfile =~ s/[.]mkv$/.wav/ms;
+
+	if ( open my $fOut, '>', $lstfile ) {
+		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
+			for my $i ( 0 .. 3 ) {
+				printf { $fOut } "file '%s'\n", ( sprintf $source_groups{$groupID}{idn}, $i );
+			}
+		}
+		close $fOut or croak( "Closing listfile '$lstfile' FAILED!" );
+	} else {
+		log_error( "Unable to write into '%s': %s", $lstfile, $! );
+		exit 11;
+	}
+
+	# Having a list file we can go and create our output:
+	if ( can_work() ) {
+		create_target_file( $lstfile, $prgfile, $mapfile ) or return 0;
+	}
+
+	# When everything is good, we no longer need the list file, progress file and the temp files
+	if ( 0 == $do_debug ) {
+		-f $lstfile and unlink $lstfile;
+		-f $prgfile and unlink $prgfile;
+		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
+			for my $i ( 0 .. 3 ) {
+				my $tmpfile = sprintf $source_groups{$groupID}{idn}, $i;
+				log_debug( 'Removing %s...', $tmpfile );
+				-f $tmpfile and unlink $tmpfile;
+			}
+		}
+	}
+
+	return 1;
+}
+
 sub build_source_groups {
 	my $group_id    = 0;
 	my $last_dir    = ( 0 == ( length $path_temp ) ) ? 'n/a' : $path_temp;
@@ -566,6 +571,7 @@ sub can_work {
 	return 0 == $death_note;
 }
 
+
 # ----------------------------------------------------------------
 # Simple Wrapper around IPC::Cmd to capture simple command outputs
 # ----------------------------------------------------------------
@@ -620,112 +626,143 @@ sub channels_to_layout {
 }
 
 sub check_arguments {
-	my $errcnt     = 0;
-	my $total_size = 0;
+	my $errCount    = 0;
+	my $have_source = 0;
+	my $have_target = 0;
+	my $total_size  = 0;
 
-	# === Pre Test: input and output must be set! ===
-	# -----------------------------------------------
-	my $have_source = scalar @path_source;
-	my $have_target = length $path_target;
-	$have_source > 0 or log_error( 'No Input given!' ) and ++$errcnt;
-	$have_target > 0 or log_error( 'No Output given!' ) and ++$errcnt;
+	check_source_and_target( \$errCount, \$have_source, \$have_target );
+	$have_source and check_input_files( \$errCount, \$total_size );
+	$have_target and check_output_existence( \$errCount ) and $have_source and check_temp_dir( \$errCount, $total_size );
 
-	# Set the logfile according to whether we have a target or not
-	if ( $have_target > 0 ) {
-		$logfile = $path_target;
-		$logfile =~ s/[.][^.]+$/.log/ms;
+	return $errCount;
+}
+
+sub check_input_files {
+	my ( $errCount, $total_size ) = @_;
+	foreach my $src ( @path_source ) {
+		validate_input_file( $src, $total_size ) or ${ $errCount }++;
+	}
+	return 1;
+}
+
+sub check_output_existence {
+	my ( $errCount ) = @_;
+
+	-f $path_target and log_error( 'Output file already exists!', $path_target ) and ++${ $errCount };
+	foreach my $src ( @path_source ) {
+		$src eq $path_target and log_error( 'Input file equals output file!', $src ) and ++${ $errCount };
+		$path_target =~ m/[.]mkv$/ms or log_error( 'Output file does not have mkv ending!' ) and ++${ $errCount };
 	}
 
-	# === Test 1: The input file(s) must exist! ===
-	# ---------------------------------------------
-	if ( $have_source > 0 ) {
-		foreach my $src ( @path_source ) {
-			if ( -f $src ) {
-				my $in_size = -s $src;
-				$in_size > 0 or log_error( "Input file '%s' is empty!", $src ) and ++$errcnt;
-				$total_size += $in_size / 1024 / 1024; # We count 1M blocks
-				++$source_count;
-			} else {
-				log_error( "Input file '%s' does not exist!", $src ) and ++$errcnt;
+	return 1;
+}
+
+sub check_source_and_target {
+	my ( $errCount, $have_source, $have_target ) = @_;
+
+	${ $have_source } = scalar @path_source;
+	${ $have_target } = length $path_target;
+
+	${ $have_target } and set_log_file() and ${ $have_source } and return 1;
+
+	${ $have_source } or log_error( 'No Input given!' ) and ++${ $errCount };
+	${ $have_target } or log_error( 'No Output given!' ) and ++${ $errCount };
+
+	return 0;
+}
+
+sub check_multi_temp_dir {
+	my ( $errCount ) = @_;
+
+	foreach my $src ( @path_source ) {
+		if ( -f $src ) {
+			my $dir                     = dirname( $src );
+			( length $dir ) > 0 or $dir = q{.};
+			if ( !defined $dir_stats{$dir} ) {
+				$dir_stats{$dir} = { has_space => 0, need_space => 0, srcs => [] };
 			}
-		}
-	}
-
-	# === 2: The output must not exist and must not equal any input ===
-	# -----------------------------------------------------------------
-	if ( $have_target > 0 ) {
-		-f $path_target and log_error( q{Output file '%s' already exists!}, $path_target ) and ++$errcnt;
-		foreach my $src ( @path_source ) {
-			$src eq $path_target and log_error( q{Input file '%s' equals output file!}, $src ) and ++$errcnt;
-		}
-		$path_target =~ m/[.]mkv$/ms or log_error( 'Output file does not have mkv ending!' ) and ++$errcnt;
-	}
-
-	# === 3: The temp directory exist and must have enough space ===
-	# --------------------------------------------------------------
-	if ( ( $have_target > 0 ) && ( $have_source > 0 ) ) {
-		if ( length( $path_temp ) > 0 ) {
-			# =) Single Temp Dir provided by User
-			if ( -d $path_temp ) {
-				# =) Temp Dir exists
-				my $ref                = df( $path_temp );
-				$dir_stats{$path_temp} = { has_space => 0, need_space => 0, srcs => [] };
-				foreach my $src ( @path_source ) {
-					push @{ $dir_stats{$path_temp}{srcs} }, $src;
-				}
-				if ( defined $ref ) {
-					# The temporary UT Video files will need roughly 42-47 times the input
-					# Plus a probably 3 times bigger output than input and we end at x50.
-					my $needed_space = $total_size * 50;
-					my $have_space   = $ref->{bavail} / 1024; # df returns 1K blocks, but we calculate in M.
-					if ( $have_space < $needed_space ) {
-						log_error( "Not enough space! '%s' has only %s / %s M free!",
-						           $path_temp,
-						           cleanint( $have_space ),
-						           cleanint( $needed_space )) and ++$errcnt;
-					}
-				} else {
-					# =) df() failed? WTH?
-					log_error( "df'ing directory '%s' FAILED!", $path_temp ) and ++$errcnt;
-				}
+			push @{ $dir_stats{$dir}{srcs} }, $src;
+			my $ref = df( $dir );
+			if ( defined $ref ) {
+				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;     ## again count in M not K
+				$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024; ## also in M now.
 			} else {
-				# =) Temp Dir does NOT exist
-				log_error( "Temp directory '%s' does not exist!", $path_temp ) and ++$errcnt;
+				# =) df() failed? WTF?
+				log_error( "df'ing directory '%s' FAILED!", $dir ) and ++${ $errCount };
+			}
+		} # No else, that error has already been recorded under Test 1
+	}
+	## Now check the stats...
+	foreach my $dir ( sort keys %dir_stats ) {
+		$dir_stats{$dir}{need_space} > $dir_stats{$dir}{has_space}
+		and log_error( "Not enough space! '%s' has only %s / %s M free!",
+		               $dir,
+		               cleanint( $dir_stats{$dir}{has_space} ),
+		               cleanint( $dir_stats{$dir}{need_space} ))
+		and ++${ $errCount };
+	}
+
+	return 1;
+}
+
+sub check_single_temp_dir {
+	my ( $errCount, $total_size ) = @_;
+
+	if ( -d $path_temp ) {
+		# =) Temp Dir exists
+		my $ref                = df( $path_temp );
+		$dir_stats{$path_temp} = { has_space => 0, need_space => 0, srcs => [] };
+		foreach my $src ( @path_source ) {
+			push @{ $dir_stats{$path_temp}{srcs} }, $src;
+		}
+		if ( defined $ref ) {
+			# The temporary UT Video files will need roughly 42-47 times the input
+			# Plus a probably 3 times bigger output than input and we end at x50.
+			my $needed_space = $total_size * 50;
+			my $have_space   = $ref->{bavail} / 1024; # df returns 1K blocks, but we calculate in M.
+			if ( $have_space < $needed_space ) {
+				log_error( "Not enough space! '%s' has only %s / %s M free!",
+				           $path_temp,
+				           cleanint( $have_space ),
+				           cleanint( $needed_space )) and ++${ $errCount };
 			}
 		} else {
-			# Default behaviour - aka no user provided temp dir
-			# In this case we have to go through the input file(s) directory(ies) and calculate each individual needs.
-			foreach my $src ( @path_source ) {
-				if ( -f $src ) {
-					my $dir                     = dirname( $src );
-					( length $dir ) > 0 or $dir = q{.};
-					if ( !defined $dir_stats{$dir} ) {
-						$dir_stats{$dir} = { has_space => 0, need_space => 0, srcs => [] };
-					}
-					push @{ $dir_stats{$dir}{srcs} }, $src;
-					my $ref = df( $dir );
-					if ( defined $ref ) {
-						$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;     ## again count in M not K
-						$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024; ## also in M now.
-					} else {
-						# =) df() failed? WTF?
-						log_error( "df'ing directory '%s' FAILED!", $dir ) and ++$errcnt;
-					}
-				} # No else, that error has already been recorded under Test 1
-			}
-			## Now check the stats...
-			foreach my $dir ( sort keys %dir_stats ) {
-				$dir_stats{$dir}{need_space} > $dir_stats{$dir}{has_space}
-				and log_error( "Not enough space! '%s' has only %s / %s M free!",
-				               $dir,
-				               cleanint( $dir_stats{$dir}{has_space} ),
-				               cleanint( $dir_stats{$dir}{need_space} ))
-				and ++$errcnt;
-			}
+			# =) df() failed? WTH?
+			log_error( "df'ing directory '%s' FAILED!", $path_temp ) and ++${ $errCount };
 		}
+	} else {
+		# =) Temp Dir does NOT exist
+		log_error( "Temp directory '%s' does not exist!", $path_temp ) and ++${ $errCount };
 	}
 
-	return $errcnt;
+	return 1;
+}
+
+sub check_temp_dir {
+	my ( $errCount, $total_size ) = @_;
+
+	return ( ( length $path_temp ) > 0 ) ? check_single_temp_dir( $errCount, $total_size ) : check_multi_temp_dir( $errCount );
+}
+
+sub set_log_file {
+	$logfile = $path_target;
+	$logfile =~ s/[.][^.]+$/.log/ms;
+	return 1;
+}
+
+sub validate_input_file {
+	my ( $src, $total_size ) = @_;
+	if ( -f $src ) {
+		my $in_size = -s $src;
+		( $in_size > 0 ) or log_error( "Input file '%s' is empty!", $src ) and return 0;
+		${ $total_size } += $in_size / 1024 / 1024; # We count 1M blocks
+		++$source_count;
+	} else {
+		log_error( "Input file '%s' does not exist!", $src );
+		return 0;
+	}
+	return 1;
 }
 
 sub cleanint {
@@ -1082,6 +1119,7 @@ sub log_debug {
 	return logMsg( $LOG_DEBUG, $fmt, @args );
 } ## end sub log_debug
 
+
 sub make_filter_string {
 	my ( $tmp_to, $dec_max, $dec_frac, $tgt_fps ) = @_;
 
@@ -1419,12 +1457,15 @@ sub start_work {
 
 sub start_worker_fork {
 	my ( $gid, $i, $tmp_from, $tmp_to, $F_assembled ) = @_;
-	my $prgLog                                        = sprintf $source_groups{$gid}{prg}, $i;
-	my $ffargs                                        = [ $FF, @FF_ARGS_START, '-progress', $prgLog,
-	                                                      ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-	                                                      @FF_ARGS_INPUT_VULK, ( sprintf $source_groups{$gid}{$tmp_from}, $i ),
-	                                                      @FF_ARGS_ACOPY_FIL, $F_assembled, '-fps_mode', 'cfr', @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV,
-	                                                      ( sprintf $source_groups{$gid}{$tmp_to}, $i )
+
+	my $prgLog    = sprintf $source_groups{$gid}{prg}, $i;
+	my $file_from = sprintf $source_groups{$gid}{$tmp_from}, $i;
+	my $file_to   = sprintf $source_groups{$gid}{$tmp_to}, $i;
+	my $ffargs    = [ $FF, @FF_ARGS_START, '-progress', $prgLog,
+	                  ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+	                  @FF_ARGS_INPUT_VULK, $file_from,
+	                  @FF_ARGS_ACOPY_FIL, $F_assembled, '-fps_mode', 'cfr', @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV,
+	                  $file_to
 	];
 
 	log_debug( "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @{ $ffargs } ));
@@ -1733,6 +1774,8 @@ This help message
 Path to the directory where the temporary files are written. Defaults to the
 directory of the input file(s). Ensure to have 50x the space of the input!
 
+=for stopwords splitaudio
+
 =item B<-s | --splitaudio>
 
 If set, split a second channel (if found) out into a separate .wav file. That
@@ -1751,7 +1794,7 @@ Print version and exit.
 
 =head1 DESCRIPTION
 
-[c]leanup [a]nd [c]onvert: HurryKane's tool for overhauling gaming clips.
+Cleanup And Convert: HurryKane's tool for overhauling gaming clips.
 ( See: @HurryKane76 yt channel )
 
 The program uses ffmpeg to remove duplicate frames and to interpolate the video
@@ -1774,7 +1817,7 @@ do anything useful. Every other possible argument is optional.
 
 The tools returns 0 on success and 1 on error.
 If you kill the program with any signal that can be caught and handled, it will
-do its best to end gracefully, and wxit wit exit code 42.
+do its best to end gracefully, and exit with exit code 42.
 
 
 =head1 CONFIGURATION
@@ -1789,7 +1832,7 @@ You will need a recent version of ffmpeg to make use of this tool.
 
 =head1 DIAGNOSTICS
 
-To find issues on odd prgram behavior, the -D/--debug command line argument can
+To find issues on odd program behavior, the -D/--debug command line argument can
 be used. Please be warned, though, that the program becomes **very** chatty!
 
 =head2 DEBUG MODE
