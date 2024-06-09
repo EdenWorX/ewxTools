@@ -193,7 +193,7 @@ my %program_options = (
 	'version|V'     => \$do_print_version
 );
 GetOptions( %program_options ) or pod2usage( { -message => $podmsg, -exitval => 2, -verbose => 0 } );
-$do_print_help > 0 and pod2usage( { -message => $podmsg, -exitval => 0, -verbose => 2, -noperldoc => 1 } );
+$do_print_help > 0 and pod2usage( { -exitval => 0, -verbose => 2, -noperldoc => 1 } );
 $do_print_version > 0 and print "EWX cac V$VERSION\n" and exit 0;
 
 
@@ -283,7 +283,7 @@ if ( can_work() ) {
 	my $lstfile = sprintf( "%s/temp_%d_src.lst", dirname( $path_target ), $tmp_pid );
 	my $prgfile = sprintf( "%s/temp_%d_prg.log", dirname( $path_target ), $tmp_pid );
 	my $mapfile = $path_target;
-	$mapfile =~ s/\.mkv$/.wav/m;
+	$mapfile =~ s/\.mkv$/.wav/ms;
 
 	if ( open( my $fOut, ">", $lstfile ) ) {
 		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
@@ -291,7 +291,7 @@ if ( can_work() ) {
 				printf( $fOut "file '%s'\n", sprintf( $source_groups{$groupID}{idn}, $i ));
 			}
 		}
-		close( $fOut );
+		close( $fOut ) or croak("Closing listfile '$lstfile' FAILED!");
 	} else {
 		log_error( "Unable to write into '%s': %s", $lstfile, $! );
 		exit 11;
@@ -355,7 +355,7 @@ exit $ret_global;
 
 sub add_pid {
 	my ( $pid ) = @_;
-	defined( $pid ) and ( $pid =~ m/^\d+$/ ) or log_error( "add_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and confess( "FATAL BUG!" );
+	defined( $pid ) and ( $pid =~ m/^\d+$/ms ) or log_error( "add_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and confess( "FATAL BUG!" );
 	defined( $work_data->{PIDs}{$pid} ) and confess( "add_pid($pid) called but work_data already defined!" );
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid} = {
@@ -371,37 +371,6 @@ sub add_pid {
 	$work_data->{cnt}++;
 	$work_lock->unlock;
 	return 1;
-}
-
-sub get_info_from_ffprobe {
-	my ( $src, $stream_fields ) = @_;
-	my $avg_frame_rate_stream   = -1;
-	my @fpcmd                   = ( $FP,
-	                                @FP_ARGS,
-	                                "stream=$stream_fields",
-	                                split( / /, $source_info{$src}{probeStrings} ),
-	                                $src );
-
-	log_debug( "Calling: %s", join( q{ }, @fpcmd ));
-
-	my @fplines = split( '\n', capture_cmd( @fpcmd ));
-
-	foreach my $line ( @fplines ) {
-		chomp $line;
-		#log_debug("RAW[%s]", $line);
-		if ( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/x ) {
-			$source_info{$src}{streams}[$1]{$2} = "$3";
-			( "avg_frame_rate" eq $2 ) and
-			( "0" ne "$3" ) and ( "0/0" ne "$3" ) and
-			( $avg_frame_rate_stream < 0 ) and $avg_frame_rate_stream = $1;
-			next;
-		}
-		if ( $line =~ m/format_([^=]+)="?([^"]+)"?/x ) {
-			$source_info{$src}{$1} = "$2";
-		}
-	}
-
-	return $avg_frame_rate_stream;
 }
 
 sub analyze_all_inputs {
@@ -466,7 +435,7 @@ sub analyze_input {
 	$frstream = $streams->[$frstream_no]; ## shortcut, four...
 
 	# Maybe we have to fix the duration values we currently have
-	$formats->{duration} =~ m/(\d+\.\d+)/ and
+	$formats->{duration} =~ m/(\d+\.\d+)/ms and
 	$formats->{duration} = floor( 1. + ( 1. * $1 ));
 
 	# Now we can go through the read stream information and determine video and audio stream details
@@ -501,7 +470,7 @@ sub analyze_stream_info {
 		if ( $streams->[$i]{codec_type} eq "video" ) {
 			$have_video   = 1;
 			$video_stream = $i;
-			$streams->[$i]{avg_frame_rate} =~ m/(\d+)\/(\d+)/ and ( 1. * $1 > 0. ) and ( 1. * $2 > 0. )
+			$streams->[$i]{avg_frame_rate} =~ m/(\d+)\/(\d+)/ms and ( 1. * $1 > 0. ) and ( 1. * $2 > 0. )
 			and $streams->[$i]{avg_frame_rate} = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ));
 		}
 		if ( $streams->[$i]{codec_type} eq "audio" ) {
@@ -614,7 +583,7 @@ sub capture_cmd {
 	# Handle result:
 	$work_lock->lock;
 	if ( 0 != $work_data->{PIDs}{$kid}{exit_code} ) {
-		log_error( "Command '%s' FAILED [%d] : %s", join( / /, @cmd ), $work_data->{PIDs}{$kid}{exit_code}, $work_data->{PIDs}{$kid}{result} );
+		log_error( "Command '%s' FAILED [%d] : %s", join( q{ }, @cmd ), $work_data->{PIDs}{$kid}{exit_code}, $work_data->{PIDs}{$kid}{result} );
 		$work_lock->unlock;
 		croak( "capture_cmd() crashed" );
 	}
@@ -679,7 +648,7 @@ sub check_arguments {
 		foreach my $src ( @path_source ) {
 			$src eq $path_target and log_error( "Input file '%s' equals output file!", $src ) and ++$errcnt;
 		}
-		$path_target =~ m/\.mkv$/ or log_error( "Output file does not have mkv ending!" ) and ++$errcnt;
+		$path_target =~ m/\.mkv$/ms or log_error( "Output file does not have mkv ending!" ) and ++$errcnt;
 	}
 
 	# === 3: The temp directory exist and must have enough space ===
@@ -757,6 +726,7 @@ sub cleanint {
 
 sub close_standard_io {
 	my $devnull = "/dev/null";
+	## no critic (RequireCheckedClose)
 	close( STDIN ) and open( STDIN, '<', $devnull );
 	close( STDOUT ) and open( STDOUT, '>', $devnull );
 	close( STDERR ) and open( STDERR, '>', $devnull );
@@ -797,7 +767,7 @@ sub create_target_file {
 	               @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled, "-fps_mode", "vfr", @FF_ARGS_FORMAT,
 	               @FF_ARGS_CODEC_h264, $path_target, @mapVoice );
 
-	log_debug( "Starting Worker 1 for:\n%s", join( / /, @ffargs ));
+	log_debug( "Starting Worker 1 for:\n%s", join( q{ }, @ffargs ));
 	my $pid = start_work( 1, @ffargs );
 	defined( $pid ) and ( $pid > 0 ) or confess( "BUG! start_work() returned invalid PID!" );
 	$work_lock->lock;
@@ -860,10 +830,41 @@ sub format_out_time {
 	return sprintf( "%02d:%02d:%02d.%06d", $hr, $min % 60, $sec % 60, $ms % 1_000_000 );
 }
 
+sub get_info_from_ffprobe {
+	my ( $src, $stream_fields ) = @_;
+	my $avg_frame_rate_stream   = -1;
+	my @fpcmd                   = ( $FP,
+	                                @FP_ARGS,
+	                                "stream=$stream_fields",
+	                                split( q{ }, $source_info{$src}{probeStrings} ),
+	                                $src );
+
+	log_debug( "Calling: %s", join( q{ }, @fpcmd ));
+
+	my @fplines = split( '\n', capture_cmd( @fpcmd ));
+
+	foreach my $line ( @fplines ) {
+		chomp $line;
+		#log_debug("RAW[%s]", $line);
+		if ( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/xms ) {
+			$source_info{$src}{streams}[$1]{$2} = "$3";
+			( "avg_frame_rate" eq $2 ) and
+			( "0" ne "$3" ) and ( "0/0" ne "$3" ) and
+			( $avg_frame_rate_stream < 0 ) and $avg_frame_rate_stream = $1;
+			next;
+		}
+		if ( $line =~ m/format_([^=]+)="?([^"]+)"?/xms ) {
+			$source_info{$src}{$1} = "$2";
+		}
+	}
+
+	return $avg_frame_rate_stream;
+}
+
 sub get_location {
 	my ( $caller, undef, undef, $lineno, $logger ) = @_;
 
-	defined( $logger ) and $logger =~ m/^main::log_(info|warning|error|status|debug)$/x
+	defined( $logger ) and $logger =~ m/^main::log_(info|warning|error|status|debug)$/xm
 	or confess( "get_location(): logMsg() called from wrong sub $logger" );
 
 	my $subname = $caller // "main";
@@ -991,7 +992,8 @@ sub load_progress {
 	defined( $prgLog ) and ( length( $prgLog ) > 0 ) and ( -f $prgLog ) and open( my $fIn, "<", $prgLog ) or return 1;
 	# Note: We return 1 here, because it is not a problem if ffmpeg neads a while to start up, especially
 	#       on very large video files which may hang during analysis phase.
-	close( $fIn ); # We do not read it like that, it was just for testing if the file cvan be opened.
+	close( $fIn ) or confess("Closing listfile '$prgLog' FAILED!");
+	# We do not read it like that, it was just for testing if the file can be opened.
 
 	my $line_num    = 0;
 	my $progress_no = 0;
@@ -1005,7 +1007,7 @@ sub load_progress {
 	while ( ( $progress_no < 1 ) && ( $line_num < $line_cnt ) ) {
 		chomp $lines[$line_num];
 		#log_debug( "Progress Line %d: '%s'", $line_num + 1, $lines[$line_num] );
-		$lines[$line_num] =~ m/^progress=/ and ++$progress_no;
+		$lines[$line_num] =~ m/^progress=/ms and ++$progress_no;
 		++$line_num;
 	}
 
@@ -1014,15 +1016,15 @@ sub load_progress {
 		chomp $lines[$line_num];
 		#log_debug( "Progress Line %d: '%s'", $line_num + 1, $lines[$line_num] );
 
-		$lines[$line_num] =~ m/^bitrate=(\d+\.?\d*)\D\S+\s*$/xm and $prgData->{bitrate} += ( 1. * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^drop_frames=(\S+)\s*$/xm and $prgData->{drop_frames}    += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^dup_frames=(\S+)\s*$/xm and $prgData->{dup_frames}      += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^fps=(\S+)\s*$/xm and $prgData->{fps}                    += ( 1. * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^frame=(\S+)\s*$/xm and $prgData->{frames}               += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^out_time_ms=(\d+)\s*$/xm and $prgData->{out_time}       += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^total_size=(\d+)\s*$/xm and $prgData->{total_size}      += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^bitrate=(\d+\.?\d*)\D\S+\s*$/xms and $prgData->{bitrate} += ( 1. * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^drop_frames=(\S+)\s*$/xms and $prgData->{drop_frames}    += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^dup_frames=(\S+)\s*$/xms and $prgData->{dup_frames}      += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^fps=(\S+)\s*$/xms and $prgData->{fps}                    += ( 1. * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^frame=(\S+)\s*$/xms and $prgData->{frames}               += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^out_time_ms=(\d+)\s*$/xms and $prgData->{out_time}       += ( 1 * $1 ) and ++$line_num and next;
+		$lines[$line_num] =~ m/^total_size=(\d+)\s*$/xms and $prgData->{total_size}      += ( 1 * $1 ) and ++$line_num and next;
 
-		$lines[$line_num] =~ m/^progress=/xm and ++$progress_no;
+		$lines[$line_num] =~ m/^progress=/xms and ++$progress_no;
 
 		++$line_num;
 	}
@@ -1103,7 +1105,7 @@ sub pid_exists {
 sub reap_pid {
 	my ( $pid ) = @_;
 
-	defined( $pid ) and ( $pid =~ m/^\d+$/m ) or log_error( "reap_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and confess( "FATAL BUG!" );
+	defined( $pid ) and ( $pid =~ m/^\d+$/ms ) or log_error( "reap_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and confess( "FATAL BUG!" );
 	defined( $work_data->{PIDs}{$pid} ) or return 1;
 	$work_lock->lock;
 	my $status = $work_data->{PIDs}{$pid}{status} // $FF_REAPED;
@@ -1142,7 +1144,7 @@ sub reaper {
 
 sub remove_pid {
 	my ( $pid, $do_cleanup ) = @_;
-	defined( $pid ) and ( $pid =~ m/^\d+$/m ) or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and confess( "FATAL BUG!" );
+	defined( $pid ) and ( $pid =~ m/^\d+$/ms ) or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // "undef" ) and confess( "FATAL BUG!" );
 	defined( $work_data->{PIDs}{$pid} ) or return 1;
 
 	my $result = 1;
@@ -1230,7 +1232,7 @@ sub segment_source_group {
 		foreach my $fid ( sort { $a <=> $b } @{ $source_groups{$gid}{ids} } ) {
 			printf( $fOut "file '%s'\n", $source_ids{$fid} );
 		}
-		close( $fOut );
+		close( $fOut ) or confess("Closing listfile '$source_groups{$gid}{lst}' FAILED!");
 	} else {
 		log_error( "Cannot write list file '%s': %s", $source_groups{$gid}{lst}, $! );
 		return 0;
@@ -1319,6 +1321,8 @@ sub start_capture {
 	close_standard_io();
 
 	my $fork_data = {};
+	## no critic (ProhibitTies)
+	#@type IPC::Shareable
 	my $fork_lock = tie $fork_data, 'IPC::Shareable', { key => 'WORK_DATA' };
 
 	# Wait until we can really start
@@ -1346,6 +1350,8 @@ sub start_forked {
 	close_standard_io();
 
 	my $fork_data = {};
+	## no critic (ProhibitTies)
+	#@type IPC::Shareable
 	my $fork_lock = tie $fork_data, 'IPC::Shareable', { key => 'WORK_DATA' };
 
 	# Wait until we can really start
@@ -1662,7 +1668,7 @@ sub write_to_log {
 
 	if ( open( my $fLog, ">>", $logfile ) ) {
 		print $fLog ( "${msg}\n" );
-		close( $fLog );
+		close( $fLog ) or confess("Closing logfile '$logfile' FAILED!");
 	}
 
 	return 1;
@@ -1672,7 +1678,12 @@ sub write_to_log {
 __END__
 
 
-=head1 SYNOPSIS
+=head1 NAME
+
+Cleanup And Convert - cac
+
+
+=head1 USAGE
 
 cac [-h|OPTIONS] <-i INPUT [-i INPUT2...]> <-o OUTPUT>
 
@@ -1722,18 +1733,6 @@ Print version and exit.
 =back
 
 
-=head2 DEBUG MODE
-
-=over 8
-
-=item B<-D | --debug>
-
-Displays extra information on all the steps of the way.
-IMPORTANT: _ALL_ temporary files are kept! Use with caution!
-
-=back
-
-
 =head1 DESCRIPTION
 
 [c]leanup [a]nd [c]onvert: HurryKane's tool for overhauling gaming clips.
@@ -1747,6 +1746,81 @@ If the source has at least 50 FPS in average, the target is set to 60 FPS. For
 sources with less than 50 FPS in average, the target is set to 30 FPS.
 You can use the -u/--upgrade option to force the target to be 60 FPS, no matter
 the source average.
+
+
+=head1 REQUIRED ARGUMENTS
+
+You have to provide at least one input file and one output file for the tool to
+do anything useful. Every other possible argument is optional.
+
+
+=head1 EXIT STATUS
+
+The tools returns 0 on success and 1 on error.
+If you kill the program with any signal that can be caught and handled, it will
+do its best to end gracefully, and wxit wit exit code 42.
+
+
+=head1 CONFIGURATION
+
+Currently the only supported configuration are the command line arguments.
+
+
+=head1 DEPENDENCIES
+
+You will need a recent version of ffmpeg to make use of this tool.
+
+
+=head1 DIAGNOSTICS
+
+To find issues on odd prgram behavior, the -D/--debug command line argument can
+be used. Please be warned, though, that the program becomes **very** chatty!
+
+=head2 DEBUG MODE
+
+=over 8
+
+=item B<-D | --debug>
+
+Displays extra information on all the steps of the way.
+IMPORTANT: _ALL_ temporary files are kept! Use with caution!
+
+=back
+
+
+=head1 INCOMPATIBILITIES
+
+I am pretty sure that this will not work on Windows. Sorry.
+
+
+=head1 BUGS AND LIMITATIONS
+
+Currently none known.
+
+Please report bugs and/or errors at:
+https://github.com/EdenWorX/ewxTools/issues
+
+
+=head1 AUTHOR
+
+Sven Eden <sven@eden-worx.com>
+
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2024 Sven Eden, EdenWorX
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see https://www.gnu.org/licenses/.
 
 
 =cut
