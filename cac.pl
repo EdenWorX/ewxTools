@@ -827,6 +827,11 @@ sub dieHandler {
 	return log_error( '%s', $err );
 }
 
+sub file_exists {
+	my ( $file ) = @_;
+	return defined $file && ( ( length $file ) > 0 ) && ( -f $file );
+}
+
 sub format_bitrate {
 	my ( $float ) = @_;
 	return lc( human_readable_size( $float )) . 'bits/s';
@@ -920,6 +925,15 @@ sub handle_fork_progress {
 
 	reap_pid( $pid ) and $result = 0; # the PID will give no progress any more
 
+	# Check/Initialize the progress hash
+	defined( $prgData->{bitrate} ) or $prgData->{bitrate}         = 0.0; ## "0.0kbits/s" in the file
+	defined( $prgData->{drop_frames} ) or $prgData->{drop_frames} = 0;
+	defined( $prgData->{dup_frames} ) or $prgData->{dup_frames}   = 0;
+	defined( $prgData->{fps} ) or $prgData->{fps}                 = 0.0;
+	defined( $prgData->{frames} ) or $prgData->{frames}           = 0;
+	defined( $prgData->{out_time} ) or $prgData->{out_time}       = 0; ## "00:00:00.000000" in the file, but we read out_time_ms
+	defined( $prgData->{total_size} ) or $prgData->{total_size}   = 0;
+
 	load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS or --$fork_timeout->{$pid};
 
 	return $result
@@ -984,63 +998,42 @@ sub interpolate_source_group {
 	return watch_my_forks();
 }
 
+sub is_progress_line {
+	my ( $line ) = @_;
+	return $line =~ m/^progress=/xms;
+}
+
 
 # Load data from between the last two "progress=<state>" lines in the given log file, and store it in the given hash
 # If the hash has values, progress data is added.
 sub load_progress {
-	my ( $prgLog, $prgData ) = @_;
+	my ( $progress_log, $progress_data ) = @_;
 
-	# Check/Initialize the progress hash
-	defined( $prgData->{bitrate} ) or $prgData->{bitrate}         = 0.0; ## "0.0kbits/s" in the file
-	defined( $prgData->{drop_frames} ) or $prgData->{drop_frames} = 0;
-	defined( $prgData->{dup_frames} ) or $prgData->{dup_frames}   = 0;
-	defined( $prgData->{fps} ) or $prgData->{fps}                 = 0.0;
-	defined( $prgData->{frames} ) or $prgData->{frames}           = 0;
-	defined( $prgData->{out_time} ) or $prgData->{out_time}       = 0; ## "00:00:00.000000" in the file, but we read out_time_ms
-	defined( $prgData->{total_size} ) or $prgData->{total_size}   = 0;
+	file_exists( $progress_log ) or croak( "Log file $progress_log does not exist!" );
 
-	# Leave early if the log file is not there (yet)
-	defined $prgLog and ( ( length $prgLog ) > 0 ) and ( -f $prgLog ) and open my $fIn, '<', $prgLog or return 1;
-	# Note: We return 1 here, because it is not a problem if ffmpeg neads a while to start up, especially
-	#       on very large video files which may hang during analysis phase.
-	close $fIn or confess( "Closing listfile '$prgLog' FAILED!" );
-	# We do not read it like that, it was just for testing if the file can be opened.
+	my @args          = ( 'tail', '-n', '20', $progress_log );
+	my @last_20_lines = reverse split /\n/ms, capture_cmd( @args );
+	my $lines_count   = scalar @last_20_lines;
 
-	my $line_num    = 0;
-	my $progress_no = 0;
-
-	# Suck up the last 20 lines (This *should* be enough to get 2 progress=xxx lines)
-	my @args     = ( 'tail', '-n', '20', $prgLog );
-	my @lines    = reverse split /\n/ms, capture_cmd( @args );
-	my $line_cnt = scalar @lines;
-
-	# Go beyond first progress=xxx line found
-	while ( ( $progress_no < 1 ) && ( $line_num < $line_cnt ) ) {
-		chomp $lines[$line_num];
-		#log_debug( "Progress Line %d: '%s'", $line_num + 1, $lines[$line_num] );
-		$lines[$line_num] =~ m/^progress=/ms and ++$progress_no;
-		++$line_num;
+	my $progress_count = 0;
+	my $i              = 0;
+	while ( ( $progress_count < 1 ) && ( $i < $lines_count ) ) {
+		is_progress_line( $last_20_lines[$i] ) and $progress_count++;
+		$i++;
 	}
 
-	# Now load everything until a second progress=xxx line is found
-	while ( ( $progress_no < 2 ) && ( $line_num < $line_cnt ) ) {
-		chomp $lines[$line_num];
-		#log_debug( "Progress Line %d: '%s'", $line_num + 1, $lines[$line_num] );
-
-		$lines[$line_num] =~ m/^bitrate=(\d+[.]?\d*)\D\S+\s*$/xms and $prgData->{bitrate} += ( 1. * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^drop_frames=(\S+)\s*$/xms and $prgData->{drop_frames}     += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^dup_frames=(\S+)\s*$/xms and $prgData->{dup_frames}       += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^fps=(\S+)\s*$/xms and $prgData->{fps}                     += ( 1. * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^frame=(\S+)\s*$/xms and $prgData->{frames}                += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^out_time_ms=(\d+)\s*$/xms and $prgData->{out_time}        += ( 1 * $1 ) and ++$line_num and next;
-		$lines[$line_num] =~ m/^total_size=(\d+)\s*$/xms and $prgData->{total_size}       += ( 1 * $1 ) and ++$line_num and next;
-
-		$lines[$line_num] =~ m/^progress=/xms and ++$progress_no;
-
-		++$line_num;
+	my @progress_field_names = qw( bitrate drop_frames dup_frames fps frame out_time_ms total_size );
+	while ( ( $progress_count < 2 ) && ( $i < $lines_count ) ) {
+		if ( is_progress_line( $last_20_lines[$i] ) ) {
+			$progress_count++;
+		} else {
+			foreach ( @progress_field_names ) {
+				parse_progress_data( $last_20_lines[$i], $_, $progress_data ) && $i++;
+			}
+		}
+		$i++;
 	}
-
-	return ( 2 == $progress_no ) ? 1 : 0; ## If the progress line count is 0 or 1, the process is not (really) started (, yet)
+	return $progress_count == 2 ? 1 : 0;
 }
 
 sub logMsg {
@@ -1103,6 +1096,16 @@ sub make_filter_string {
 	return "${B_in}${F_in_scale}" .
 	       ( ( 'iup' eq $tmp_to ) ? "${B_FPS}${F_scale_FPS}" : $EMPTY ) .
 	       "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}${B_out}";
+}
+
+sub parse_progress_data {
+	my ( $line, $property_name, $data ) = @_;
+	if ( $line =~ m/^${property_name}=(\S+)\s*$/xms ) {
+		# Assuming all metadata are numeric values
+		$data->{$property_name} += ( 1 * $1 );
+		return 1;
+	}
+	return 0;
 }
 
 sub pid_exists {
