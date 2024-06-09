@@ -291,7 +291,7 @@ if ( can_work() ) {
 				printf( $fOut "file '%s'\n", sprintf( $source_groups{$groupID}{idn}, $i ));
 			}
 		}
-		close( $fOut ) or croak("Closing listfile '$lstfile' FAILED!");
+		close( $fOut ) or croak( "Closing listfile '$lstfile' FAILED!" );
 	} else {
 		log_error( "Unable to write into '%s': %s", $lstfile, $! );
 		exit 11;
@@ -466,7 +466,8 @@ sub analyze_stream_info {
 	my $have_audio = 0;
 	my $have_voice = 0;
 
-	for ( my $i = 0; $i < $source_info{$src}{nb_streams}; ++$i ) {
+	for ( 0 .. ( $source_info{$src}{nb_streams} - 1 ) ) {
+		my $i = $_; ## save the magic bullet
 		if ( $streams->[$i]{codec_type} eq "video" ) {
 			$have_video   = 1;
 			$video_stream = $i;
@@ -517,10 +518,10 @@ sub build_source_groups {
 		my $codec_changed = 0;
 
 		# Codecs must be looked at in a loop, as we do not know how many there are.
-		for ( my $i = 0; $i < $data->{nb_streams}; ++$i ) {
-			( ( !defined( $last_codec{$i} ) ) or ( $last_codec{$i} ne $data->{streams}[$i]{codec_name} ) )
+		for ( 0 .. ( $data->{nb_streams} - 1 ) ) {
+			( ( !defined( $last_codec{$_} ) ) or ( $last_codec{$_} ne $data->{streams}[$_]{codec_name} ) )
 			and $codec_changed = 1;
-			$last_codec{$i}    = $data->{streams}[$i]{codec_name};
+			$last_codec{$_}    = $data->{streams}[$_]{codec_name};
 		}
 		$last_dir    = ( 0 == length( $path_temp ) ) ? $data->{dir} : $path_temp;
 		$last_ch_cnt = $data->{nb_streams};
@@ -623,7 +624,7 @@ sub check_arguments {
 	# Set the logfile according to whether we have a target or not
 	if ( $have_target > 0 ) {
 		$logfile = $path_target;
-		$logfile =~ s/\.[^.]+$/.log/m;
+		$logfile =~ s/\.[^.]+$/.log/ms;
 	}
 
 	# === Test 1: The input file(s) must exist! ===
@@ -782,7 +783,7 @@ sub create_target_file {
 sub commify {
 	my ( $text ) = @_;
 	$text        = reverse $text;
-	$text =~ s/(\d\d\d)(?=\d)(?!\d*\.)/$1,/xgm;
+	$text =~ s/(\d\d\d)(?=\d)(?!\d*\.)/$1,/gxms;
 	return scalar reverse $text;
 }
 
@@ -864,11 +865,11 @@ sub get_info_from_ffprobe {
 sub get_location {
 	my ( $caller, undef, undef, $lineno, $logger ) = @_;
 
-	defined( $logger ) and $logger =~ m/^main::log_(info|warning|error|status|debug)$/xm
+	defined( $logger ) and $logger =~ m/^main::log_(info|warning|error|status|debug)$/xms
 	or confess( "get_location(): logMsg() called from wrong sub $logger" );
 
 	my $subname = $caller // "main";
-	$subname =~ s/^.*::([^:]+)$/$1/xm;
+	$subname =~ s/^.*::([^:]+)$/$1/xms;
 	defined( $lineno ) or $lineno = -1;
 
 	return ( $lineno > -1 ) ? sprintf( "%d:%s()", $lineno, $subname ) : sprintf( "%s", $subname );
@@ -955,7 +956,7 @@ sub human_readable_size {
 sub interpolate_source_group {
 	my ( $gid, $tmp_from, $tmp_to, $filter_string ) = @_;
 
-	unless ( defined( $source_groups{$gid} ) ) {
+	if ( !defined( $source_groups{$gid} ) ) {
 		log_error( "Source Group ID %d does not exist!", $gid );
 		return 0;
 	}
@@ -965,8 +966,8 @@ sub interpolate_source_group {
 
 	# Building the four worker threads is quite trivial
 	can_work() or return 1;
-	for ( my $i = 0; $i < 4; ++$i ) {
-		start_worker_fork( $gid, $i, $tmp_from, $tmp_to, $filter_string ) or return 0;
+	for ( 0 .. 3 ) {
+		start_worker_fork( $gid, $_, $tmp_from, $tmp_to, $filter_string ) or return 0;
 	}
 
 	# Watch and join
@@ -992,7 +993,7 @@ sub load_progress {
 	defined( $prgLog ) and ( length( $prgLog ) > 0 ) and ( -f $prgLog ) and open( my $fIn, "<", $prgLog ) or return 1;
 	# Note: We return 1 here, because it is not a problem if ffmpeg neads a while to start up, especially
 	#       on very large video files which may hang during analysis phase.
-	close( $fIn ) or confess("Closing listfile '$prgLog' FAILED!");
+	close( $fIn ) or confess( "Closing listfile '$prgLog' FAILED!" );
 	# We do not read it like that, it was just for testing if the file can be opened.
 
 	my $line_num    = 0;
@@ -1232,7 +1233,7 @@ sub segment_source_group {
 		foreach my $fid ( sort { $a <=> $b } @{ $source_groups{$gid}{ids} } ) {
 			printf( $fOut "file '%s'\n", $source_ids{$fid} );
 		}
-		close( $fOut ) or confess("Closing listfile '$source_groups{$gid}{lst}' FAILED!");
+		close( $fOut ) or confess( "Closing listfile '$source_groups{$gid}{lst}' FAILED!" );
 	} else {
 		log_error( "Cannot write list file '%s': %s", $source_groups{$gid}{lst}, $! );
 		return 0;
@@ -1668,7 +1669,7 @@ sub write_to_log {
 
 	if ( open( my $fLog, ">>", $logfile ) ) {
 		print $fLog ( "${msg}\n" );
-		close( $fLog ) or confess("Closing logfile '$logfile' FAILED!");
+		close( $fLog ) or confess( "Closing logfile '$logfile' FAILED!" );
 	}
 
 	return 1;
