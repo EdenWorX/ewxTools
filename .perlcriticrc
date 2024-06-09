@@ -21,6 +21,9 @@ allow = $@ $! $? $$ $|
 [Variables::RequireLocalizedPunctuationVars]
 allow = %SIG $SIG $SIG{__WARN__} $SIG{__DIE__} $SIG{CHLD}
 
+[ValuesAndExpressions::ProhibitInterpolationOfLiterals]
+allow_if_string_contains_single_quote = 1
+
 # This one brings too many false positives
 [-ValuesAndExpressions::ProhibitAccessOfPrivateData]
 
