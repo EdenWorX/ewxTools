@@ -1055,7 +1055,9 @@ sub logMsg {
 
 	my $stTime  = get_time_now();
 	my $stLevel = get_log_level($lvl);
-	my $stLoc   = get_location( ( caller 2 )[3], caller 1 );
+	my $caller  = ( caller 2 )[3];
+	my @loginfo = caller 1;
+	my $stLoc   = get_location( $caller, @loginfo );
 	my $stMsg   = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, $stLoc, @args;
 
 	( 0 < ( length $logfile ) ) and write_to_log($stMsg);
