@@ -25,10 +25,10 @@ my $work_done = 0;
 # 1.0.0    2024-05-23  sed, EdenWorX  First fully working version of the per variant. The Bash variant is dead now.
 # 1.0.1    2024-05-29  sed, EdenWorX  Use IPC::Cmd::run_forked instead of using system()
 # 1.0.2    2024-05-30  sed, EdenWorX  Rewrote the workers to be true forks instead of using iThreads.
+# 1.0.3    2024-06-10  sed, EdenWorX  Greatly reduced complexity by untangling all the spaghetti code areas
 #
 # Please keep this current:
-our $VERSION = '1.0.2';
-
+our $VERSION = '1.0.3';
 
 # =======================================================================================
 # Workflow:
@@ -40,7 +40,6 @@ our $VERSION = '1.0.2';
 # Cleanup: segments and temporaries are to be deleted.
 # =======================================================================================
 
-
 # ---------------------------------------------------------
 # Shared Variables
 # ---------------------------------------------------------
@@ -50,21 +49,21 @@ my $death_note = 0;
 # Global return value, is set to 1 by log_error()
 my $ret_global = 0;
 
-Readonly my $FF_CREATED => 1;
-Readonly my $FF_RUNNING => 2;
+Readonly my $FF_CREATED  => 1;
+Readonly my $FF_RUNNING  => 2;
 Readonly my $FF_FINISHED => 3;
-Readonly my $FF_REAPED => 5;
+Readonly my $FF_REAPED   => 5;
 
 #@type IPC::Shareable
 my $work_data = IPC::Shareable->new( key => 'WORK_DATA', create => 1 );
+
 #@type IPC::Shareable
-my $work_lock      = tied %{ $work_data };
+my $work_lock = tied %{$work_data};
 $work_data->{cnt}  = 0;
 $work_data->{PIDs} = {};
 
 Readonly my $EMPTY => q{};
 Readonly my $SPACE => q{ };
-
 
 # ---------------------------------------------------------
 # Logging facilities
@@ -73,28 +72,27 @@ my $do_debug          = 0;
 my $have_progress_msg = 0;
 my $logfile           = $EMPTY;
 
-Readonly my $LOG_DEBUG => 1;
-Readonly my $LOG_STATUS => 2;
-Readonly my $LOG_INFO => 3;
+Readonly my $LOG_DEBUG   => 1;
+Readonly my $LOG_STATUS  => 2;
+Readonly my $LOG_INFO    => 3;
 Readonly my $LOG_WARNING => 4;
-Readonly my $LOG_ERROR => 5;
-
+Readonly my $LOG_ERROR   => 5;
 
 # ---------------------------------------------------------
 # Signal Handlers
 # ---------------------------------------------------------
 my %signalHandlers = (
-	'INT'  => sub {
+	'INT' => sub {
 		$death_note = 1;
-		log_warning( 'Caught Interrupt Signal - Ending Tasks...' );
+		log_warning('Caught Interrupt Signal - Ending Tasks...');
 	},
 	'QUIT' => sub {
 		$death_note = 1;
-		log_warning( 'Caught Quit Signal - Ending Tasks...' );
+		log_warning('Caught Quit Signal - Ending Tasks...');
 	},
 	'TERM' => sub {
 		$death_note = 1;
-		log_warning( 'Caught Terminate Signal - Ending Tasks...' );
+		log_warning('Caught Terminate Signal - Ending Tasks...');
 	}
 );
 local $SIG{INT}  = \&sigHandler;
@@ -110,21 +108,19 @@ $SIG{__DIE__} = \&dieHandler;
 # Global SIGCHLD handler
 $SIG{CHLD} = \&reaper;
 
-
 # ---------------------------------------------------------
 # Global Constants
 # ---------------------------------------------------------
-Readonly my $B_FPS => '[fps];[fps]';
-Readonly my $B_decimate => '[decim];[decim]';
-Readonly my $B_in => '[in]';
-Readonly my $B_interp => '[interp];[interp]';
-Readonly my $B_middle => '[middle];[middle]';
-Readonly my $B_out => '[out]';
-Readonly my $defaultProbeSize => 256 * 1_024 * 1_024; # Max out probe size at 256 MB, all relevant stream info should be available from that size
-Readonly my $defaultProbeDura => 30 * 1_000 * 1_000;  # Max out analyze duration at 30 seconds. This should be long enough for everything
-Readonly my $defaultProbeFPS => 8 * 120;              # FPS probing is maxed at 8 seconds for 120 FPS recordings.
-Readonly my $TIMEOUT_INTERVALS => 60;                 # Timeout for forks to start working (60 interval = 30 seconds)
-
+Readonly my $B_FPS             => '[fps];[fps]';
+Readonly my $B_decimate        => '[decim];[decim]';
+Readonly my $B_in              => '[in]';
+Readonly my $B_interp          => '[interp];[interp]';
+Readonly my $B_middle          => '[middle];[middle]';
+Readonly my $B_out             => '[out]';
+Readonly my $defaultProbeSize  => 256 * 1_024 * 1_024;  # Max out probe size at 256 MB, all relevant stream info should be available from that size
+Readonly my $defaultProbeDura  => 30 * 1_000 * 1_000;   # Max out analyze duration at 30 seconds. This should be long enough for everything
+Readonly my $defaultProbeFPS   => 8 * 120;              # FPS probing is maxed at 8 seconds for 120 FPS recordings.
+Readonly my $TIMEOUT_INTERVALS => 60;                   # Timeout for forks to start working (60 interval = 30 seconds)
 
 # ---------------------------------------------------------
 # Global variables
@@ -132,10 +128,11 @@ Readonly my $TIMEOUT_INTERVALS => 60;                 # Timeout for forks to sta
 our $FF;
 our $FP;
 my @FF_ARGS_ACOPY_FIL  = qw( -map 0 -codec:a copy -vf );
-my @FF_ARGS_CODEC_h264 = qw( -codec:v     h264_nvenc -preset:v p7     -tune:v     hq -profile:v   high444p -level:v   5.2
-                             -rc:v        vbr        -rgb_mode yuv444 -cq         4  -qmin        1        -qmax      16
-                             -temporal_aq 1          -b_adapt  0      -b_ref_mode 0  -zerolatency 1        -multipass 2
-                             -forced-idr  1 );
+my @FF_ARGS_CODEC_h264 = qw(
+  -codec:v     h264_nvenc -preset:v p7     -tune:v     hq -profile:v   high444p -level:v   5.2
+  -rc:v        vbr        -rgb_mode yuv444 -cq         4  -qmin        1        -qmax      16
+  -temporal_aq 1          -b_adapt  0      -b_ref_mode 0  -zerolatency 1        -multipass 2
+  -forced-idr  1 );
 my @FF_ARGS_CODEC_UTV  = qw( -codec:v utvideo -pred median );
 my @FF_ARGS_FILTER     = qw( -ignore_unknown -vf );
 my @FF_ARGS_FORMAT     = qw( -colorspace bt709 -color_range pc -pix_fmt yuv444p -f matroska -write_crc32 0 );
@@ -145,32 +142,32 @@ my @FF_ARGS_START      = qw( -hide_banner -loglevel level+info -y );
 my @FF_CONCAT_BEGIN    = qw( -loglevel level+warning -nostats -f concat -safe 0 -i );
 my @FF_CONCAT_END      = qw( -map 0 -c copy );
 my @FP_ARGS            = qw( -hide_banner -loglevel error -v quiet -show_format -of flat=s=_ -show_entries );
-my %dir_stats          = (); ## <dir> => { has_space => <what df says>, need_space => wll inputs in there x 50, srcs => @src }
-my $do_print_help      = 0;
-my $do_print_version   = 0;
-my $do_split_audio     = 0;
-my $force_upgrade      = 0;
-my $max_fps            = 0;
-my $maxProbeSize       = $defaultProbeSize;
-my $maxProbeDura       = $defaultProbeDura;
-my $maxProbeFPS        = $defaultProbeFPS;
-my $target_fps         = 0;
-my @path_source        = ();
-my $path_target        = $EMPTY;
-my $path_temp          = $EMPTY;
-my $source_count       = 0;
-my %source_groups      = ();
-my %source_ids         = ();
-my %source_info        = ();
-my $tmp_pid            = $$;
-my $video_stream       = 0;
-my $audio_stream       = 0;
-my $voice_stream       = -1;
-my $audio_channels     = 0;
-my $audio_layout       = 'guess';
-my $voice_channels     = 0;
-my $voice_layout       = 'guess';
 
+my %dir_stats        = ();                ## <dir> => { has_space => <what df says>, need_space => wll inputs in there x 50, srcs => @src }
+my $do_print_help    = 0;
+my $do_print_version = 0;
+my $do_split_audio   = 0;
+my $force_upgrade    = 0;
+my $max_fps          = 0;
+my $maxProbeSize     = $defaultProbeSize;
+my $maxProbeDura     = $defaultProbeDura;
+my $maxProbeFPS      = $defaultProbeFPS;
+my $target_fps       = 0;
+my @path_source      = ();
+my $path_target      = $EMPTY;
+my $path_temp        = $EMPTY;
+my $source_count     = 0;
+my %source_groups    = ();
+my %source_ids       = ();
+my %source_info      = ();
+my $tmp_pid          = $$;
+my $video_stream     = 0;
+my $audio_stream     = 0;
+my $voice_stream     = -1;
+my $audio_channels   = 0;
+my $audio_layout     = 'guess';
+my $voice_channels   = 0;
+my $voice_layout     = 'guess';
 
 # ---------------------------------------------------------
 # BEGIN Handler
@@ -179,8 +176,7 @@ BEGIN {
 	# ffmpeg default values
 	chomp( $FF = qx{which ffmpeg} );
 	chomp( $FP = qx{which ffprobe} );
-} ## End BEGIN
-
+}  ## End BEGIN
 
 # ---------------------------------------------------------
 # Argument handling
@@ -196,32 +192,28 @@ my %program_options = (
 	'upgrade|u'     => \$force_upgrade,
 	'version|V'     => \$do_print_version
 );
-GetOptions( %program_options ) or pod2usage( { -message => $podmsg, -exitval => 2, -verbose => 0 } );
+GetOptions(%program_options) or pod2usage( { -message => $podmsg, -exitval => 2, -verbose => 0 } );
 $do_print_help > 0 and pod2usage( { -exitval => 0, -verbose => 2, -noperldoc => 1 } );
 $do_print_version > 0 and print "EWX cac V$VERSION\n" and exit 0;
-
 
 # ---------------------------------------------------------
 # Check Arguments
 # ---------------------------------------------------------
-check_arguments() > 0 and pod2usage( { -message => $podmsg, -exitval => 1, -verbose => 0 } ); ## The sub has already logged
+check_arguments() > 0 and pod2usage( { -message => $podmsg, -exitval => 1, -verbose => 0 } );  ## The sub has already logged
 
-defined $FF and ( 0 < ( length $FF ) ) and -x $FF or log_error( q{No ffmpeg available (FF: '%s')}, $FF // 'undef' ) and exit 3;
+defined $FF and ( 0 < ( length $FF ) ) and -x $FF or log_error( q{No ffmpeg available (FF: '%s')},  $FF // 'undef' ) and exit 3;
 defined $FP and ( 0 < ( length $FP ) ) and -x $FP or log_error( q{No ffprobe available (FP: '%s')}, $FP // 'undef' ) and exit 3;
-
 
 # ---------------------------------------------------------
 # ================	  MAIN  PROGRAM	  ================
 # ---------------------------------------------------------
-$work_done = 1; # From now on we consider this program as at work
+$work_done = 1;  # From now on we consider this program as at work
 log_info( 'Processing %s start', $path_target );
-
 
 # ---
 # --- 1) we need information about each source file
 # ---
 analyze_all_inputs();
-
 
 # ---
 # --- 2) All input files per temp directory have to be grouped. Each group is then segmented
@@ -230,7 +222,6 @@ analyze_all_inputs();
 build_source_groups() or declare_single_source() or exit 7;
 segment_all_groups();
 check_target_fps();
-
 
 # ---
 # --- 3) Now each groups segments can be decimated and interpolated up to max fps (round 1)
@@ -242,7 +233,6 @@ foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	interpolate_source_group( $groupID, 'tmp', 'iup', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 9;
 }
 
-
 # ---
 # --- 4) Then all groups segments have to be decimated and interpolated down to target fps (round 2)
 # ---
@@ -253,13 +243,11 @@ foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	interpolate_source_group( $groupID, 'iup', 'idn', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 10;
 }
 
-
 # ---
 # --- 5) And finally we can put all the latest temp files together and create the target vid
 # ---
 can_work() and log_info( 'Creating %s ...', $path_target );
 assemble_output();
-
 
 # ---------------------------------------------------------
 # END Handler
@@ -272,41 +260,40 @@ END {
 			if ( -f $source_groups{$gid}{lst} ) {
 				( $do_debug > 0 ) and log_debug( 'See: %s', $source_groups{$gid}{lst} ) or unlink $source_groups{$gid}{lst};
 			}
-			for my $area ( qw( tmp idn iup prg ) ) {
+			for my $area (qw( tmp idn iup prg )) {
 				for my $i ( 0 .. 3 ) {
 					my $f = sprintf $source_groups{$gid}{$area}, $i;
 					if ( -f $f ) {
 						( $do_debug > 0 ) and log_debug( 'See: %s', $f ) or unlink $f;
 					}
-				}
-			}
-		}
+				} ## end for my $i ( 0 .. 3 )
+			} ## end for my $area (qw( tmp idn iup prg ))
+		} ## end foreach my $gid ( sort { $a...})
 
 		( $ret_global > 0 ) and log_error( 'Processing %s FAILED!', $path_target ) or log_info( 'Processing %s finished', $path_target );
 
 		( ( 0 < ( length $logfile ) ) && ( -f $logfile ) )
-		and ( ( $ret_global > 0 ) || ( 1 == $do_debug ) )
-		and printf "\nSee %s for details\n", $logfile;
-	}
+		  and ( ( $ret_global > 0 ) || ( 1 == $do_debug ) )
+		  and printf "\nSee %s for details\n", $logfile;
+	} ## end if ( $work_done > 0 )
 	IPC::Shareable->clean_up;
-} ## End END
-
+}  ## End END
 
 exit $ret_global;
-
 
 # ---------------------------------------------------------
 # ================ FUNCTION IMPLEMENTATION ================
 # ---------------------------------------------------------
 
 sub add_pid {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 	defined $pid and ( $pid =~ m/^\d+$/ms )
-	or log_error( "add_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' ) and confess( 'FATAL BUG!' );
-	defined( $work_data->{PIDs}{$pid} ) and confess( "add_pid($pid) called but work_data already defined!" );
+	  or log_error( "add_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
+	  and confess('FATAL BUG!');
+	defined( $work_data->{PIDs}{$pid} ) and confess("add_pid($pid) called but work_data already defined!");
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid} = {
-		args      => [], ## Shall be added by the caller as a reference
+		args      => [],     ## Shall be added by the caller as a reference
 		exit_code => 0,
 		id        => 0,
 		prgfile   => $EMPTY,
@@ -318,13 +305,13 @@ sub add_pid {
 	$work_data->{cnt}++;
 	$work_lock->unlock;
 	return 1;
-}
+} ## end sub add_pid
 
 sub analyze_all_inputs {
 	can_work() or return 1;
-	my $pathID = 0; ## Counter for the source id hash
+	my $pathID = 0;  ## Counter for the source id hash
 
-	foreach my $src ( @path_source ) {
+	foreach my $src (@path_source) {
 		can_work() or last;
 
 		my $inSize = -s $src;
@@ -332,7 +319,7 @@ sub analyze_all_inputs {
 		## no critic (ProhibitParensWithBuiltins)
 		$source_info{$src} = {
 			avg_frame_rate => 0,
-			dir            => dirname( $src ),
+			dir            => dirname($src),
 			duration       => 0,
 			id             => ++$pathID,
 			probeSize      => $inSize > $maxProbeSize ? $maxProbeSize : $inSize,
@@ -340,72 +327,71 @@ sub analyze_all_inputs {
 		};
 		$source_ids{$pathID} = $src;
 
-		analyze_input( $src ) or exit 6;
-	}
+		analyze_input($src) or exit 6;
+	} ## end foreach my $src (@path_source)
 
 	return 1;
-}
+} ## end sub analyze_all_inputs
 
 sub analyze_input {
-	my ( $src ) = @_;
+	my ($src) = @_;
 
-	my $formats = $source_info{$src};  ## Shortcut
-	my $streams = $formats->{streams}; ## shortcut, too
+	my $formats = $source_info{$src};   ## Shortcut
+	my $streams = $formats->{streams};  ## shortcut, too
 
 	# Get basic duration
 	my $stream_fields = 'avg_frame_rate,duration';
 	my $frstream_no   = get_info_from_ffprobe( $src, $stream_fields );
-	( $frstream_no >= 0 ) or return 0;       ## Something went wrong
-	my $frstream = $streams->[$frstream_no]; ## shortcut, three
+	( $frstream_no >= 0 ) or return 0;        ## Something went wrong
+	my $frstream = $streams->[$frstream_no];  ## shortcut, three
 
-	( $formats->{duration} > 0 ) or log_error( "Unable to determine duration of '%s'", $src ) and return 0;
+	( $formats->{duration} > 0 )        or log_error( "Unable to determine duration of '%s'",           $src ) and return 0;
 	( $frstream->{avg_frame_rate} > 0 ) or log_error( "Unable to determine average frame rate of '%s'", $src ) and return 0;
 
 	log_debug( 'Duration   : %d', $formats->{duration} );
 	log_debug( 'Average FPS: %d', $frstream->{avg_frame_rate} );
 
-	$formats->{probedDuration}                                                    = $formats->{duration} * 1000 * 1000; ## Probe Duration is set up in microseconds.
-	$formats->{probeFPS}                                                          = $frstream->{avg_frame_rate} * 8;
+	$formats->{probedDuration} = $formats->{duration} * 1000 * 1000;  ## Probe Duration is set up in microseconds.
+	$formats->{probeFPS}       = $frstream->{avg_frame_rate} * 8;
 	( $formats->{probedDuration} > $maxProbeDura ) and $formats->{probedDuration} = $maxProbeDura;
-	( $formats->{probeFPS} > $maxProbeFPS ) and $formats->{probeFPS}              = $maxProbeFPS;
+	( $formats->{probeFPS} > $maxProbeFPS )        and $formats->{probeFPS}       = $maxProbeFPS;
 
 	$formats->{sourceFPS}    = $frstream->{avg_frame_rate};
-	$formats->{probeStrings} = sprintf '-probesize %d -analyzeduration %d -fpsprobesize %d',
-	                                   $formats->{probeSize},
-	                                   $formats->{probedDuration},
-	                                   $formats->{probeFPS};
+	$formats->{probeStrings} = sprintf '-probesize %d -analyzeduration %d -fpsprobesize %d', $formats->{probeSize}, $formats->{probedDuration}, $formats->{probeFPS};
 
 	# Now that we have good (and sane) values for probing sizes and durations, lets query ffprobe again to get the final value we need.
 	can_work() or return 0;
 	$stream_fields = 'avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration';
 	$frstream      = get_info_from_ffprobe( $src, $stream_fields );
-	( $frstream_no >= 0 ) or return 0;    ## Something went wrong this time
-	$frstream = $streams->[$frstream_no]; ## shortcut, four...
+	( $frstream_no >= 0 ) or return 0;                                ## Something went wrong this time
+	$frstream = $streams->[$frstream_no];                             ## shortcut, four...
 
 	# Maybe we have to fix the duration values we currently have
-	$formats->{duration} =~ m/(\d+[.]\d+)/ms and
-	$formats->{duration} = floor( 1. + ( 1. * $1 ));
+	$formats->{duration} =~ m/(\d+[.]\d+)/ms
+	  and $formats->{duration} = floor( 1. + ( 1. * $1 ) );
 
 	# Now we can go through the read stream information and determine video and audio stream details
 	analyze_stream_info( $src, $streams ) or return 0;
 
 	# If the second analysis somehow came up with a different average framerate, we have to adapt:
-	if ( ( $formats->{duration} > 0 ) && ( $frstream->{avg_frame_rate} > 0 ) &&
-	     ( $formats->{sourceFPS} != $formats->{avg_frame_rate} ) ) {
-		$formats->{probedDuration} = $formats->{duration} * 1000 * 1000; ## Probe Duration is set up in microseconds.
+	if (   ( $formats->{duration} > 0 )
+		&& ( $frstream->{avg_frame_rate} > 0 )
+		&& ( $formats->{sourceFPS} != $formats->{avg_frame_rate} ) )
+	{
+		$formats->{probedDuration} = $formats->{duration} * 1000 * 1000;  ## Probe Duration is set up in microseconds.
 		$formats->{probeFPS}       = $frstream->{avg_frame_rate} * 8;
 
 		log_debug( '(fixed) Duration   : %d', $formats->{duration} );
 		log_debug( '(fixed) Average FPS: %d', $frstream->{avg_frame_rate} );
 
 		( $formats->{probedDuration} > $maxProbeDura ) and $formats->{probedDuration} = $maxProbeDura;
-		( $formats->{probeFPS} > $maxProbeFPS ) and $formats->{probeFPS}              = $maxProbeFPS;
+		( $formats->{probeFPS} > $maxProbeFPS )        and $formats->{probeFPS}       = $maxProbeFPS;
 
 		$formats->{sourceFPS} = $frstream->{avg_frame_rate};
-	}
+	} ## end if ( ( $formats->{duration...}))
 
 	return 1;
-}
+} ## end sub analyze_input
 
 sub analyze_stream_info {
 	my ( $src, $streams ) = @_;
@@ -415,53 +401,55 @@ sub analyze_stream_info {
 	my $have_voice = 0;
 
 	for ( 0 .. ( $source_info{$src}{nb_streams} - 1 ) ) {
-		my $i = $_; ## save the magic bullet
+		my $i = $_;  ## save the magic bullet
 		if ( $streams->[$i]{codec_type} eq 'video' ) {
 			$have_video   = 1;
 			$video_stream = $i;
-			$streams->[$i]{avg_frame_rate} =~ m/(\d+)\/(\d+)/ms and ( 1. * $1 > 0. ) and ( 1. * $2 > 0. )
-			and $streams->[$i]{avg_frame_rate} = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ));
-		}
+			$streams->[$i]{avg_frame_rate} =~ m/(\d+)\/(\d+)/ms
+			  and ( 1. * $1 > 0. )
+			  and ( 1. * $2 > 0. )
+			  and $streams->[$i]{avg_frame_rate} = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ) );
+		} ## end if ( $streams->[$i]{codec_type...})
 		if ( $streams->[$i]{codec_type} eq 'audio' ) {
 			if ( 0 == $have_audio ) {
 				$have_audio   = 1;
 				$audio_stream = $i;
 				if ( $streams->[$i]{channels} > $audio_channels ) {
 					$audio_channels = $streams->[$i]{channels};
-					$audio_layout   = channels_to_layout( $audio_channels );
+					$audio_layout   = channels_to_layout($audio_channels);
 				}
 			} elsif ( 0 == $have_voice ) {
 				$have_voice   = 1;
 				$voice_stream = $i;
 				if ( $streams->[$i]{channels} > $voice_channels ) {
 					$voice_channels = $streams->[$i]{channels};
-					$voice_layout   = channels_to_layout( $voice_channels );
+					$voice_layout   = channels_to_layout($voice_channels);
 				}
 			} else {
 				log_error( "Found third audio channel in '%s' - no idea what to do with it!", $src );
 				return 0;
 			}
-		}
-	}
+		} ## end if ( $streams->[$i]{codec_type...})
+	} ## end for ( 0 .. ( $source_info...))
 	( 0 == $have_video ) and log_error( "Source file '%s' has no video stream!", $src ) and return 0;
 
 	return 1;
-}
+} ## end sub analyze_stream_info
 
 sub assemble_output {
 	can_work() or return 1;
-	my $lstfile = sprintf '%s/temp_%d_src.lst', dirname( $path_target ), $tmp_pid;
-	my $prgfile = sprintf '%s/temp_%d_prg.log', dirname( $path_target ), $tmp_pid;
+	my $lstfile = sprintf '%s/temp_%d_src.lst', dirname($path_target), $tmp_pid;
+	my $prgfile = sprintf '%s/temp_%d_prg.log', dirname($path_target), $tmp_pid;
 	my $mapfile = $path_target;
 	$mapfile =~ s/[.]mkv$/.wav/ms;
 
 	if ( open my $fOut, '>', $lstfile ) {
 		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 			for my $i ( 0 .. 3 ) {
-				printf { $fOut } "file '%s'\n", ( sprintf $source_groups{$groupID}{idn}, $i );
+				printf {$fOut} "file '%s'\n", ( sprintf $source_groups{$groupID}{idn}, $i );
 			}
 		}
-		close $fOut or croak( "Closing listfile '$lstfile' FAILED!" );
+		close $fOut or croak("Closing listfile '$lstfile' FAILED!");
 	} else {
 		log_error( "Unable to write into '%s': %s", $lstfile, $! );
 		exit 11;
@@ -482,14 +470,14 @@ sub assemble_output {
 				log_debug( 'Removing %s...', $tmpfile );
 				-f $tmpfile and unlink $tmpfile;
 			}
-		}
-	}
+		} ## end foreach my $groupID ( sort ...)
+	} ## end if ( 0 == $do_debug )
 
 	return 1;
-}
+} ## end sub assemble_output
 
 sub build_source_groups {
-	can_work() or return 1;
+	can_work()            or return 1;
 	( $source_count > 1 ) or return 0;
 	my $group_id    = 0;
 	my $last_dir    = ( 0 == ( length $path_temp ) ) ? 'n/a' : $path_temp;
@@ -500,7 +488,7 @@ sub build_source_groups {
 	foreach my $fileID ( sort { $a <=> $b } keys %source_ids ) {
 		can_work() or last;
 		my $src  = $source_ids{$fileID};
-		my $data = $source_info{$src}; ## shortcut
+		my $data = $source_info{$src};   ## shortcut
 
 		# The next group is needed, if channel count, any codec or the directory changes.
 		my $dir_changed   = ( 0 == ( length $path_temp ) ) && ( $data->{dir} ne $last_dir );
@@ -510,8 +498,8 @@ sub build_source_groups {
 		# Codecs must be looked at in a loop, as we do not know how many there are.
 		for ( 0 .. ( $data->{nb_streams} - 1 ) ) {
 			( ( !defined $last_codec{$_} ) or ( $last_codec{$_} ne $data->{streams}[$_]{codec_name} ) )
-			and $codec_changed = 1;
-			$last_codec{$_}    = $data->{streams}[$_]{codec_name};
+			  and $codec_changed = 1;
+			$last_codec{$_} = $data->{streams}[$_]{codec_name};
 		}
 		$last_dir    = ( 0 == ( length $path_temp ) ) ? $data->{dir} : $path_temp;
 		$last_ch_cnt = $data->{nb_streams};
@@ -531,54 +519,53 @@ sub build_source_groups {
 				srcs => [],
 				tmp  => sprintf( '%s/temp_%d_segments_%d_%%d.mkv', $last_dir, $tmp_pid, ++$tmp_count )
 			};
-		}
+		} ## end if ( ( $dir_changed + ...))
 
 		# Now add the file
 		$source_groups{$group_id}{dur} += $data->{duration};
 		$data->{sourceFPS} > $source_groups{$group_id}{fps}
-		and $source_groups{$group_id}{fps} = $data->{sourceFPS};
-		push @{ $source_groups{$group_id}{ids} }, $fileID;
+		  and $source_groups{$group_id}{fps} = $data->{sourceFPS};
+		push @{ $source_groups{$group_id}{ids} },  $fileID;
 		push @{ $source_groups{$group_id}{srcs} }, $src;
-	} ## End of grouping input files
+	}  ## End of grouping input files
 
 	return 1;
-}
+} ## end sub build_source_groups
 
 sub can_work {
 	return 0 == $death_note;
 }
 
-
 # ----------------------------------------------------------------
 # Simple Wrapper around IPC::Cmd to capture simple command outputs
 # ----------------------------------------------------------------
 sub capture_cmd {
-	my ( @cmd ) = @_;
-	my $kid     = fork;
+	my (@cmd) = @_;
+	my $kid = fork;
 
-	defined $kid or croak( "Cannot fork()! $!\n" );
+	defined $kid or croak("Cannot fork()! $!\n");
 
 	# Handle being the fork first
 	# =======================================
 	if ( 0 == $kid ) {
-		start_capture( @cmd );
-		POSIX::_exit( 0 ); ## Regular exit() would call main::END block
+		start_capture(@cmd);
+		POSIX::_exit(0);  ## Regular exit() would call main::END block
 	}
 
 	# === Do the bookkeeping before we wait
 	# =======================================
-	add_pid( $kid );
+	add_pid($kid);
 
 	# Wait on the fork to finish
 	# =======================================
-	wait_for_capture( $kid );
+	wait_for_capture($kid);
 
 	# Handle result:
 	$work_lock->lock;
 	if ( 0 != $work_data->{PIDs}{$kid}{exit_code} ) {
 		log_error( q{Command '%s' FAILED [%d] : %s}, join( $SPACE, @cmd ), $work_data->{PIDs}{$kid}{exit_code}, $work_data->{PIDs}{$kid}{result} );
 		$work_lock->unlock;
-		croak( 'capture_cmd() crashed' );
+		croak('capture_cmd() crashed');
 	}
 
 	my $result = $work_data->{PIDs}{$kid}{result};
@@ -587,10 +574,10 @@ sub capture_cmd {
 	remove_pid( $kid, 1 );
 
 	return $result;
-}
+} ## end sub capture_cmd
 
 sub channels_to_layout {
-	my ( $channels ) = @_;
+	my ($channels) = @_;
 	( 1 == $channels ) and return 'mono';
 	( 2 == $channels ) and return 'stereo';
 	( 3 == $channels ) and return '2.1';
@@ -600,7 +587,7 @@ sub channels_to_layout {
 	( 7 == $channels ) and return '6.1';
 	( 8 == $channels ) and return '7.1';
 	return 'guess';
-}
+} ## end sub channels_to_layout
 
 sub check_arguments {
 	my $errCount    = 0;
@@ -613,108 +600,107 @@ sub check_arguments {
 	$have_target and check_output_existence( \$errCount ) and $have_source and check_temp_dir( \$errCount, $total_size );
 
 	return $errCount;
-}
+} ## end sub check_arguments
 
 sub check_input_files {
 	my ( $errCount, $total_size ) = @_;
-	foreach my $src ( @path_source ) {
-		validate_input_file( $src, $total_size ) or ${ $errCount }++;
+	foreach my $src (@path_source) {
+		validate_input_file( $src, $total_size ) or ${$errCount}++;
 	}
 	return 1;
-}
+} ## end sub check_input_files
 
 sub check_output_existence {
-	my ( $errCount ) = @_;
+	my ($errCount) = @_;
 
-	-f $path_target and log_error( 'Output file already exists!', $path_target ) and ++${ $errCount };
-	foreach my $src ( @path_source ) {
-		$src eq $path_target and log_error( 'Input file equals output file!', $src ) and ++${ $errCount };
-		$path_target =~ m/[.]mkv$/ms or log_error( 'Output file does not have mkv ending!' ) and ++${ $errCount };
+	-f $path_target and log_error( 'Output file already exists!', $path_target ) and ++${$errCount};
+	foreach my $src (@path_source) {
+		$src eq $path_target and log_error( 'Input file equals output file!', $src ) and ++${$errCount};
+		$path_target =~ m/[.]mkv$/ms or log_error('Output file does not have mkv ending!') and ++${$errCount};
 	}
 
 	return 1;
-}
+} ## end sub check_output_existence
 
 sub check_source_and_target {
 	my ( $errCount, $have_source, $have_target ) = @_;
 
-	${ $have_source } = scalar @path_source;
-	${ $have_target } = length $path_target;
+	${$have_source} = scalar @path_source;
+	${$have_target} = length $path_target;
 
-	${ $have_target } and set_log_file() and ${ $have_source } and return 1;
+	${$have_target} and set_log_file() and ${$have_source} and return 1;
 
-	${ $have_source } or log_error( 'No Input given!' ) and ++${ $errCount };
-	${ $have_target } or log_error( 'No Output given!' ) and ++${ $errCount };
+	${$have_source} or log_error('No Input given!')  and ++${$errCount};
+	${$have_target} or log_error('No Output given!') and ++${$errCount};
 
 	return 0;
-}
+} ## end sub check_source_and_target
 
 sub check_multi_temp_dir {
-	my ( $errCount ) = @_;
+	my ($errCount) = @_;
 
-	foreach my $src ( @path_source ) {
+	foreach my $src (@path_source) {
 		if ( -f $src ) {
-			my $dir                     = dirname( $src );
+			my $dir = dirname($src);
 			( length $dir ) > 0 or $dir = q{.};
 			if ( !defined $dir_stats{$dir} ) {
 				$dir_stats{$dir} = { has_space => 0, need_space => 0, srcs => [] };
 			}
 			push @{ $dir_stats{$dir}{srcs} }, $src;
-			my $ref = df( $dir );
+			my $ref = df($dir);
 			if ( defined $ref ) {
-				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;     ## again count in M not K
-				$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024; ## also in M now.
+				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;      ## again count in M not K
+				$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024;  ## also in M now.
 			} else {
+
 				# =) df() failed? WTF?
-				log_error( "df'ing directory '%s' FAILED!", $dir ) and ++${ $errCount };
+				log_error( "df'ing directory '%s' FAILED!", $dir ) and ++${$errCount};
 			}
-		} # No else, that error has already been recorded under Test 1
-	}
+		}  # No else, that error has already been recorded under Test 1
+	} ## end foreach my $src (@path_source)
 	## Now check the stats...
 	foreach my $dir ( sort keys %dir_stats ) {
 		$dir_stats{$dir}{need_space} > $dir_stats{$dir}{has_space}
-		and log_error( "Not enough space! '%s' has only %s / %s M free!",
-		               $dir,
-		               cleanint( $dir_stats{$dir}{has_space} ),
-		               cleanint( $dir_stats{$dir}{need_space} ))
-		and ++${ $errCount };
+		  and log_error( "Not enough space! '%s' has only %s / %s M free!", $dir, cleanint( $dir_stats{$dir}{has_space} ), cleanint( $dir_stats{$dir}{need_space} ) )
+		  and ++${$errCount};
 	}
 
 	return 1;
-}
+} ## end sub check_multi_temp_dir
 
 sub check_single_temp_dir {
 	my ( $errCount, $total_size ) = @_;
 
 	if ( -d $path_temp ) {
+
 		# =) Temp Dir exists
-		my $ref                = df( $path_temp );
+		my $ref = df($path_temp);
 		$dir_stats{$path_temp} = { has_space => 0, need_space => 0, srcs => [] };
-		foreach my $src ( @path_source ) {
+		foreach my $src (@path_source) {
 			push @{ $dir_stats{$path_temp}{srcs} }, $src;
 		}
 		if ( defined $ref ) {
+
 			# The temporary UT Video files will need roughly 42-47 times the input
 			# Plus a probably 3 times bigger output than input and we end at x50.
 			my $needed_space = $total_size * 50;
-			my $have_space   = $ref->{bavail} / 1024; # df returns 1K blocks, but we calculate in M.
+			my $have_space   = $ref->{bavail} / 1024;  # df returns 1K blocks, but we calculate in M.
 			if ( $have_space < $needed_space ) {
-				log_error( "Not enough space! '%s' has only %s / %s M free!",
-				           $path_temp,
-				           cleanint( $have_space ),
-				           cleanint( $needed_space )) and ++${ $errCount };
+				log_error( "Not enough space! '%s' has only %s / %s M free!", $path_temp, cleanint($have_space), cleanint($needed_space) ) and ++${$errCount};
 			}
 		} else {
+
 			# =) df() failed? WTH?
-			log_error( "df'ing directory '%s' FAILED!", $path_temp ) and ++${ $errCount };
+			log_error( "df'ing directory '%s' FAILED!", $path_temp ) and ++${$errCount};
 		}
 	} else {
+
 		# =) Temp Dir does NOT exist
-		log_error( "Temp directory '%s' does not exist!", $path_temp ) and ++${ $errCount };
+		log_error( "Temp directory '%s' does not exist!", $path_temp ) and ++${$errCount};
 	}
 
 	return 1;
-}
+} ## end sub check_single_temp_dir
 
 # Make sure we have a sane target FPS. max_fps is reused as upper fps
 sub check_target_fps {
@@ -724,12 +710,12 @@ sub check_target_fps {
 	log_info( 'Decimate and interpolate up to %d FPS', $max_fps );
 	log_info( 'Then interpolate to the target %d FPS', $target_fps );
 	return 1;
-}
+} ## end sub check_target_fps
 
 sub check_temp_dir {
 	my ( $errCount, $total_size ) = @_;
 
-	return ( ( length $path_temp ) > 0 ) ? check_single_temp_dir( $errCount, $total_size ) : check_multi_temp_dir( $errCount );
+	return ( ( length $path_temp ) > 0 ) ? check_single_temp_dir( $errCount, $total_size ) : check_multi_temp_dir($errCount);
 }
 
 sub set_log_file {
@@ -743,29 +729,29 @@ sub validate_input_file {
 	if ( -f $src ) {
 		my $in_size = -s $src;
 		( $in_size > 0 ) or log_error( "Input file '%s' is empty!", $src ) and return 0;
-		${ $total_size } += $in_size / 1024 / 1024; # We count 1M blocks
+		${$total_size} += $in_size / 1024 / 1024;  # We count 1M blocks
 		++$source_count;
 	} else {
 		log_error( "Input file '%s' does not exist!", $src );
 		return 0;
 	}
 	return 1;
-}
+} ## end sub validate_input_file
 
 sub cleanint {
-	my ( $float ) = @_;
-	my $int       = floor( $float );
-	return commify( $int );
+	my ($float) = @_;
+	my $int = floor($float);
+	return commify($int);
 }
 
 sub close_standard_io {
 	my $devnull = '/dev/null';
 	## no critic (RequireCheckedClose, RequireCheckedSyscalls)
-	close STDIN and open STDIN, '<', $devnull;
+	close STDIN  and open STDIN,  '<', $devnull;
 	close STDOUT and open STDOUT, '>', $devnull;
 	close STDERR and open STDERR, '>', $devnull;
 	return 1;
-}
+} ## end sub close_standard_io
 
 sub create_target_file {
 	my ( $lstfile, $prgfile, $mapfile ) = @_;
@@ -795,15 +781,15 @@ sub create_target_file {
 
 	# Building the four worker threads is quite trivial
 	can_work() or return 1;
-	my @ffargs = ( $FF, @FF_ARGS_START, '-progress', $prgfile,
-	               ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-	               @FF_ARGS_INPUT_CUDA, $lstfile,
-	               @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled, '-fps_mode', 'vfr', @FF_ARGS_FORMAT,
-	               @FF_ARGS_CODEC_h264, $path_target, @mapVoice );
+	my @ffargs = (
+		$FF,                 @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_ARGS_INPUT_CUDA, $lstfile,       @mapAudio,   @metaAudio, @FF_ARGS_FILTER, $F_assembled, '-fps_mode', 'vfr', @FF_ARGS_FORMAT,
+		@FF_ARGS_CODEC_h264, $path_target,   @mapVoice
+	);
 
-	log_debug( "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ));
+	log_debug( "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ) );
 	my $pid = start_work( 1, @ffargs );
-	defined $pid and ( $pid > 0 ) or confess( 'BUG! start_work() returned invalid PID!' );
+	defined $pid and ( $pid > 0 ) or confess('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid}{args}    = \@ffargs;
 	$work_data->{PIDs}{$pid}{prgfile} = $prgfile;
@@ -811,189 +797,187 @@ sub create_target_file {
 
 	# Watch and join
 	return watch_my_forks();
-}
+} ## end sub create_target_file
 
 sub commify {
-	my ( $text ) = @_;
-	$text        = reverse $text;
+	my ($text) = @_;
+	$text = reverse $text;
 	$text =~ s/(\d\d\d)(?=\d)(?!\d*[.])/$1,/gxms;
 	return scalar reverse $text;
-}
+} ## end sub commify
 
 sub declare_single_source {
-	can_work() or return 1;
+	can_work()             or return 1;
 	( 1 == $source_count ) or return 0;
 	my $src      = $path_source[0];
-	my $data     = $source_info{$src}; ## shortcut
+	my $data     = $source_info{$src};                                         ## shortcut
 	my $fileID   = $data->{id};
 	my $last_dir = ( 0 == ( length $path_temp ) ) ? $data->{dir} : $path_temp;
 
 	## no critic (ProhibitParensWithBuiltins)
-	$source_groups{ 0 } = {
+	$source_groups{0} = {
 		dir  => $last_dir,
 		dur  => $data->{duration},
 		fps  => $data->{sourceFPS},
 		idn  => sprintf( '%s/temp_%d_inter_dn_%d_%%d.mkv', $last_dir, $tmp_pid, 1 ),
-		ids  => [ $fileID ],
+		ids  => [$fileID],
 		iup  => sprintf( '%s/temp_%d_inter_up_%d_%%d.mkv', $last_dir, $tmp_pid, 2 ),
 		lst  => sprintf( '%s/temp_%d_segments_%d_src.lst', $last_dir, $tmp_pid, 3 ),
 		prg  => sprintf( '%s/temp_%d_progress_%d_%%d.prg', $last_dir, $tmp_pid, 4 ),
-		srcs => [ $src ],
+		srcs => [$src],
 		tmp  => sprintf( '%s/temp_%d_segments_%d_%%d.mkv', $last_dir, $tmp_pid, 5 )
 	};
 
 	return 1;
-}
-
+} ## end sub declare_single_source
 
 # A die handler that lets perl death notes be printed via log
 sub dieHandler {
-	my ( $err ) = @_;
+	my ($err) = @_;
 	$ret_global = 42;
 	return log_error( '%s', $err );
 }
 
 sub file_exists {
-	my ( $file ) = @_;
+	my ($file) = @_;
 	return defined $file && ( ( length $file ) > 0 ) && ( -f $file );
 }
 
 sub format_bitrate {
-	my ( $float ) = @_;
-	return lc( human_readable_size( $float )) . 'bits/s';
+	my ($float) = @_;
+	return lc( human_readable_size($float) ) . 'bits/s';
 }
 
 sub format_out_time {
-	my ( $ms ) = @_;
-	my $sec    = floor( $ms / 1_000_000 );
-	my $min    = floor( $sec / 60 );
-	my $hr     = floor( $min / 60 );
+	my ($ms) = @_;
+	my $sec  = floor( $ms / 1_000_000 );
+	my $min  = floor( $sec / 60 );
+	my $hr   = floor( $min / 60 );
 
 	return sprintf '%02d:%02d:%02d.%06d', $hr, $min % 60, $sec % 60, $ms % 1_000_000;
-}
+} ## end sub format_out_time
 
 sub get_info_from_ffprobe {
 	my ( $src, $stream_fields ) = @_;
-	my $avg_frame_rate_stream   = -1;
-	my @fpcmd                   = ( $FP,
-	                                @FP_ARGS,
-	                                "stream=$stream_fields",
-	                                split( $SPACE, $source_info{$src}{probeStrings} ),
-	                                $src );
+	my $avg_frame_rate_stream = -1;
+	my @fpcmd                 = ( $FP, @FP_ARGS, "stream=$stream_fields", split( $SPACE, $source_info{$src}{probeStrings} ), $src );
 
-	log_debug( 'Calling: %s', ( join $SPACE, @fpcmd ));
+	log_debug( 'Calling: %s', ( join $SPACE, @fpcmd ) );
 
-	my @fplines = split /\n/ms, capture_cmd( @fpcmd );
+	my @fplines = split /\n/ms, capture_cmd(@fpcmd);
 
-	foreach my $line ( @fplines ) {
+	foreach my $line (@fplines) {
 		chomp $line;
+
 		#log_debug("RAW[%s]", $line);
 		if ( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/xms ) {
 			$source_info{$src}{streams}[$1]{$2} = "$3";
-			( 'avg_frame_rate' eq $2 ) and
-			( '0' ne "$3" ) and ( '0/0' ne "$3" ) and
-			( $avg_frame_rate_stream < 0 ) and $avg_frame_rate_stream = $1;
+			      ( 'avg_frame_rate' eq $2 )
+			  and ( '0' ne "$3" )
+			  and ( '0/0' ne "$3" )
+			  and ( $avg_frame_rate_stream < 0 )
+			  and $avg_frame_rate_stream = $1;
 			next;
-		}
+		} ## end if ( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/xms)
 		if ( $line =~ m/format_([^=]+)="?([^"]+)"?/xms ) {
 			$source_info{$src}{$1} = "$2";
 		}
-	}
+	} ## end foreach my $line (@fplines)
 
 	return $avg_frame_rate_stream;
-}
+} ## end sub get_info_from_ffprobe
 
 sub get_location {
 	my ( $caller, undef, undef, $lineno, $logger ) = @_;
 
 	defined $logger and $logger =~ m/^main::log_(info|warning|error|status|debug)$/xms
-	or confess( "get_location(): logMsg() called from wrong sub $logger" );
+	  or confess("get_location(): logMsg() called from wrong sub $logger");
 
 	my $subname = $caller // 'main';
 	$subname =~ s/^.*::([^:]+)$/$1/xms;
 	defined $lineno or $lineno = -1;
 
 	return ( $lineno > -1 ) ? ( sprintf '%d:%s()', $lineno, $subname ) : ( sprintf '%s', $subname );
-}
+} ## end sub get_location
 
 sub get_log_level {
-	my ( $level ) = @_;
+	my ($level) = @_;
 
-	( $LOG_INFO == $level ) and return ( 'Info   ' ) or
-	( $LOG_WARNING == $level ) and return ( 'Warning' ) or
-	( $LOG_ERROR == $level ) and return ( 'ERROR  ' ) or
-	( $LOG_STATUS == $level ) and return ( $EMPTY );
+	     ( $LOG_INFO == $level )    and return ('Info   ')
+	  or ( $LOG_WARNING == $level ) and return ('Warning')
+	  or ( $LOG_ERROR == $level )   and return ('ERROR  ')
+	  or ( $LOG_STATUS == $level )
+	  and return ($EMPTY);
 
-	return ( '=DEBUG=' );
-}
+	return ('=DEBUG=');
+} ## end sub get_log_level
 
 sub get_pid_status {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 	$work_lock->lock;
 	my $status = $work_data->{PIDs}{$pid}{status};
 	$work_lock->unlock;
 	return $status;
-}
+} ## end sub get_pid_status
 
 sub get_time_now {
 	my @tLocalTime = localtime;
-	return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
-	               $tLocalTime[5] + 1900, $tLocalTime[4] + 1, $tLocalTime[3],
-	               $tLocalTime[2], $tLocalTime[1], $tLocalTime[0];
+	return sprintf '%04d-%02d-%02d %02d:%02d:%02d', $tLocalTime[5] + 1900, $tLocalTime[4] + 1, $tLocalTime[3], $tLocalTime[2], $tLocalTime[1], $tLocalTime[0];
 }
 
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout, $fork_strikes ) = @_;
-	my $result                                          = 1;
+	my $result = 1;
 
 	defined( $fork_timeout->{$pid} ) or $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
 	defined( $fork_strikes->{$pid} ) or $fork_strikes->{$pid} = 0;
 
-	reap_pid( $pid ) and $result = 0; # the PID will give no progress any more
+	reap_pid($pid) and $result = 0;  # the PID will give no progress any more
 
 	# Check/Initialize the progress hash
-	defined( $prgData->{bitrate} ) or $prgData->{bitrate}         = 0.0; ## "0.0kbits/s" in the file
+	defined( $prgData->{bitrate} )     or $prgData->{bitrate}     = 0.0;  ## "0.0kbits/s" in the file
 	defined( $prgData->{drop_frames} ) or $prgData->{drop_frames} = 0;
-	defined( $prgData->{dup_frames} ) or $prgData->{dup_frames}   = 0;
-	defined( $prgData->{fps} ) or $prgData->{fps}                 = 0.0;
-	defined( $prgData->{frames} ) or $prgData->{frames}           = 0;
-	defined( $prgData->{out_time} ) or $prgData->{out_time}       = 0; ## "00:00:00.000000" in the file, but we read out_time_ms
-	defined( $prgData->{total_size} ) or $prgData->{total_size}   = 0;
+	defined( $prgData->{dup_frames} )  or $prgData->{dup_frames}  = 0;
+	defined( $prgData->{fps} )         or $prgData->{fps}         = 0.0;
+	defined( $prgData->{frames} )      or $prgData->{frames}      = 0;
+	defined( $prgData->{out_time} )    or $prgData->{out_time}    = 0;    ## "00:00:00.000000" in the file, but we read out_time_ms
+	defined( $prgData->{total_size} )  or $prgData->{total_size}  = 0;
 
 	load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS or --$fork_timeout->{$pid};
 
-	return $result
-}
+	return $result;
+} ## end sub handle_fork_progress
 
 sub handle_fork_strikes {
 	my ( $pid, $fork_timeout, $fork_strikes ) = @_;
 
-	my $status                                                = get_pid_status( $pid );
+	my $status = get_pid_status($pid);
 	defined( $fork_timeout->{$pid} ) or $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
 	defined( $fork_strikes->{$pid} ) or $fork_strikes->{$pid} = 0;
 
 	if ( ( $fork_strikes->{$pid} <= 0 ) and ( $FF_RUNNING == $status ) ) {
 		++$fork_strikes->{$pid};
-		$fork_strikes->{$pid} = ( $fork_strikes->{$pid} == 13 ) ? strike_fork_reap( $pid ) :
-		                        ( $fork_strikes->{$pid} == 7 ) ? strike_fork_kill( $pid ) :
-		                        ( $fork_strikes->{$pid} == 1 ) ? strike_fork_term( $pid ) :
-		                        $fork_strikes->{$pid};
+		$fork_strikes->{$pid} =
+		    ( $fork_strikes->{$pid} == 13 ) ? strike_fork_reap($pid)
+		  : ( $fork_strikes->{$pid} == 7 )  ? strike_fork_kill($pid)
+		  : ( $fork_strikes->{$pid} == 1 )  ? strike_fork_term($pid)
+		  :                                   $fork_strikes->{$pid};
 		if ( $fork_strikes->{$pid} > 17 ) {
-			my $kid               = strike_fork_restart( $pid );
+			my $kid = strike_fork_restart($pid);
 			$fork_timeout->{$kid} = $TIMEOUT_INTERVALS;
 			$fork_strikes->{$kid} = 0;
 			log_debug( 'Worker PID %d substituted PID %d', $kid, $pid );
-		}
-	}
+		} ## end if ( $fork_strikes->{$pid...})
+	} ## end if ( ( $fork_strikes->...))
 
 	return 1;
-}
+} ## end sub handle_fork_strikes
 
 sub human_readable_size {
-	my ( $number_string ) = @_;
-	my $int               = floor( $number_string );
-	my @exps              = qw( B K M G T P E Z );
-	my $exp               = 0;
+	my ($number_string) = @_;
+	my $int             = floor($number_string);
+	my @exps            = qw( B K M G T P E Z );
+	my $exp             = 0;
 
 	while ( $int >= 1024 ) {
 		++$exp;
@@ -1001,7 +985,7 @@ sub human_readable_size {
 	}
 
 	return sprintf '%3.2f%s', floor( $int * 100. ) / 100., $exps[$exp];
-}
+} ## end sub human_readable_size
 
 sub interpolate_source_group {
 	my ( $gid, $tmp_from, $tmp_to, $filter_string ) = @_;
@@ -1023,23 +1007,22 @@ sub interpolate_source_group {
 
 	# Watch and join
 	return watch_my_forks();
-}
+} ## end sub interpolate_source_group
 
 sub is_progress_line {
-	my ( $line ) = @_;
+	my ($line) = @_;
 	return $line =~ m/^progress=/xms;
 }
-
 
 # Load data from between the last two "progress=<state>" lines in the given log file, and store it in the given hash
 # If the hash has values, progress data is added.
 sub load_progress {
 	my ( $progress_log, $progress_data ) = @_;
 
-	file_exists( $progress_log ) or croak( "Log file $progress_log does not exist!" );
+	file_exists($progress_log) or croak("Log file $progress_log does not exist!");
 
 	my @args          = ( 'tail', '-n', '20', $progress_log );
-	my @last_20_lines = reverse split /\n/ms, capture_cmd( @args );
+	my @last_20_lines = reverse split /\n/ms, capture_cmd(@args);
 	my $lines_count   = scalar @last_20_lines;
 
 	my $progress_count = 0;
@@ -1054,14 +1037,14 @@ sub load_progress {
 		if ( is_progress_line( $last_20_lines[$i] ) ) {
 			$progress_count++;
 		} else {
-			foreach ( @progress_field_names ) {
+			foreach (@progress_field_names) {
 				parse_progress_data( $last_20_lines[$i], $_, $progress_data ) && $i++;
 			}
 		}
 		$i++;
-	}
+	} ## end while ( ( $progress_count...))
 	return $progress_count == 2 ? 1 : 0;
-}
+} ## end sub load_progress
 
 sub logMsg {
 	my ( $lvl, $fmt, @args ) = @_;
@@ -1071,16 +1054,15 @@ sub logMsg {
 	( $LOG_DEBUG == $lvl ) and ( 0 == $do_debug ) and return 1;
 
 	my $stTime  = get_time_now();
-	my $stLevel = get_log_level( $lvl );
+	my $stLevel = get_log_level($lvl);
 	my $stLoc   = get_location( ( caller 2 )[3], caller 1 );
 	my $stMsg   = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, $stLoc, @args;
 
-	( 0 < ( length $logfile ) ) and write_to_log( $stMsg );
-	( $LOG_DEBUG != $lvl ) and write_to_console( $stMsg );
+	( 0 < ( length $logfile ) ) and write_to_log($stMsg);
+	( $LOG_DEBUG != $lvl ) and write_to_console($stMsg);
 
 	return 1;
 } ## end sub logMsg
-
 
 sub log_info {
 	my ( $fmt, @args ) = @_;
@@ -1094,7 +1076,7 @@ sub log_warning {
 
 sub log_error {
 	my ( $fmt, @args ) = @_;
-	$ret_global        = 1;
+	$ret_global = 1;
 	return logMsg( $LOG_ERROR, $fmt, @args );
 }
 
@@ -1107,8 +1089,7 @@ sub log_debug {
 	my ( $fmt, @args ) = @_;
 	$do_debug or return 1;
 	return logMsg( $LOG_DEBUG, $fmt, @args );
-} ## end sub log_debug
-
+}
 
 sub make_filter_string {
 	my ( $tmp_to, $dec_max, $dec_frac, $tgt_fps ) = @_;
@@ -1119,44 +1100,45 @@ sub make_filter_string {
 	my $F_scale_FPS   = "fps=${tgt_fps}:round=near";
 	my $F_mpdecimate  = "mpdecimate='max=${dec_max}:frac=${dec_frac}'";
 	my $F_out_scale   = "scale='flags=accurate_rnd+full_chroma_inp+full_chroma_int:in_range=full:out_range=full'";
-	my $F_interpolate = "libplacebo='extra_opts=preset=high_quality:frame_mixer=" .
-	                    ( ( 'iup' eq $tmp_to ) ? 'mitchell_clamp' : 'oversample' ) .
-	                    ":fps=${tgt_fps}'";
-	return "${B_in}${F_in_scale}" .
-	       ( ( 'iup' eq $tmp_to ) ? "${B_FPS}${F_scale_FPS}" : $EMPTY ) .
-	       "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}${B_out}";
-}
+	my $F_interpolate = "libplacebo='extra_opts=preset=high_quality:frame_mixer=" . ( ( 'iup' eq $tmp_to ) ? 'mitchell_clamp' : 'oversample' ) . ":fps=${tgt_fps}'";
+	return
+	    "${B_in}${F_in_scale}"
+	  . ( ( 'iup' eq $tmp_to ) ? "${B_FPS}${F_scale_FPS}" : $EMPTY )
+	  . "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}${B_out}";
+} ## end sub make_filter_string
 
 sub parse_progress_data {
 	my ( $line, $property_name, $data ) = @_;
 	if ( $line =~ m/^${property_name}=(\S+)\s*$/xms ) {
+
 		# Assuming all metadata are numeric values
 		$data->{$property_name} += ( 1 * $1 );
 		return 1;
-	}
+	} ## end if ( $line =~ m/^${property_name}=(\S+)\s*$/xms)
 	return 0;
-}
+} ## end sub parse_progress_data
 
 sub pid_exists {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 	$work_lock->lock;
 	my $exists = defined( $work_data->{PIDs}{$pid} );
 	$work_lock->unlock;
 	return $exists;
-}
+} ## end sub pid_exists
 
 sub reap_pid {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 
 	defined $pid and ( $pid =~ m/^\d+$/ms )
-	or log_error( q{reap_pid(): BUG! '%s' is not a valid pid!}, $pid // 'undef' ) and confess( 'FATAL BUG!' );
+	  or log_error( q{reap_pid(): BUG! '%s' is not a valid pid!}, $pid // 'undef' )
+	  and confess('FATAL BUG!');
 	defined( $work_data->{PIDs}{$pid} ) or return 1;
 	$work_lock->lock;
 	my $status = $work_data->{PIDs}{$pid}{status} // $FF_REAPED;
 	$work_lock->unlock;
 	( $FF_REAPED == $status ) and return 1;
 
-	( 0 == ( waitpid $pid, POSIX::WNOHANG ) ) and return 0; ## PID is still busy!
+	( 0 == ( waitpid $pid, POSIX::WNOHANG ) ) and return 0;  ## PID is still busy!
 
 	log_debug( '(reap_pid) PID %d finished', $pid );
 
@@ -1165,8 +1147,7 @@ sub reap_pid {
 	$work_lock->unlock;
 
 	return 1;
-}
-
+} ## end sub reap_pid
 
 # ---------------------------------------------------------
 # REAPER function - $SIG{CHLD} exit handler
@@ -1175,27 +1156,28 @@ sub reaper {
 	my @args = @_;
 
 	while ( ( my $pid = ( waitpid -1, POSIX::WNOHANG ) ) > 0 ) {
-		log_debug( '(reaper) KID %d finished [%s]', $pid, ( join q{,}, @args ));
+		log_debug( '(reaper) KID %d finished [%s]', $pid, ( join q{,}, @args ) );
 		$work_lock->lock;
 		$work_data->{PIDs}{$pid}{status} = $FF_REAPED;
 		$work_lock->unlock;
-	}
+	} ## end while ( ( my $pid = ( waitpid...)))
 
 	$SIG{CHLD} = \&reaper;
 
 	return 1;
-}
+} ## end sub reaper
 
 sub remove_pid {
 	my ( $pid, $do_cleanup ) = @_;
 	defined $pid and ( $pid =~ m/^\d+$/ms )
-	or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' ) and confess( 'FATAL BUG!' );
+	  or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
+	  and confess('FATAL BUG!');
 	defined $work_data->{PIDs}{$pid} or return 1;
 
 	my $result = 1;
 
-	while ( can_work && ( 0 == reap_pid( $pid ) ) ) {
-		usleep( 50 );
+	while ( can_work && ( 0 == reap_pid($pid) ) ) {
+		usleep(50);
 	}
 
 	$work_lock->lock;
@@ -1204,13 +1186,14 @@ sub remove_pid {
 	if ( 1 == $do_cleanup ) {
 		log_debug( 'args      => %d', scalar @{ $work_data->{PIDs}{$pid}{args} // [] } );
 		log_debug( 'exit_code => %d', $work_data->{PIDs}{$pid}{exit_code} // -1 );
-		log_debug( 'id        => %d', $work_data->{PIDs}{$pid}{id} // -1 );
-		log_debug( 'prgfile   => %s', $work_data->{PIDs}{$pid}{prgfile} // 'undef' );
-		log_debug( 'result    => %s', $work_data->{PIDs}{$pid}{result} // 'undef' );
-		log_debug( 'source    => %s', $work_data->{PIDs}{$pid}{source} // 'undef' );
-		log_debug( 'target    => %s', $work_data->{PIDs}{$pid}{target} // 'undef' );
+		log_debug( 'id        => %d', $work_data->{PIDs}{$pid}{id}        // -1 );
+		log_debug( 'prgfile   => %s', $work_data->{PIDs}{$pid}{prgfile}   // 'undef' );
+		log_debug( 'result    => %s', $work_data->{PIDs}{$pid}{result}    // 'undef' );
+		log_debug( 'source    => %s', $work_data->{PIDs}{$pid}{source}    // 'undef' );
+		log_debug( 'target    => %s', $work_data->{PIDs}{$pid}{target}    // 'undef' );
 		if ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) {
 			log_error( 'Worker PID %d FAILED [%d] %s', $pid, $work_data->{PIDs}{$pid}{exit_code}, $work_data->{PIDs}{$pid}{result} );
+
 			# We do not need the target file any more, the thread failed! (if an fmt is set)
 			if ( 0 == $do_debug ) {
 				if ( 0 < length( $work_data->{PIDs}{$pid}{target} ) ) {
@@ -1218,9 +1201,9 @@ sub remove_pid {
 					log_debug( "Removing target file '%s' ...", $f );
 					-f $f and unlink $f;
 				}
-			}
-			$result = 0; ## We _did_ fail!
-		}
+			} ## end if ( 0 == $do_debug )
+			$result = 0;  ## We _did_ fail!
+		} ## end if ( defined( $work_data...))
 
 		# We do not need the source file any more (if an fmt is set)
 		if ( defined( $work_data->{PIDs}{$pid}{source} ) && ( 0 == $do_debug ) ) {
@@ -1229,13 +1212,13 @@ sub remove_pid {
 				log_debug( "Removing source file '%s' ...", $f );
 				-f $f and unlink $f;
 			}
-		}
-	}
+		} ## end if ( defined( $work_data...))
+	} ## end if ( 1 == $do_cleanup )
 
 	# Progress files are already removed, because the only part where they are used
 	# will no longer pick them up once the PID was removed from %work_data (See watch_my_forks())
-	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY; ## shortcut including defined check
-	( length( $prgfile ) > 0 ) and ( -f $prgfile ) and unlink $prgfile;
+	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;  ## shortcut including defined check
+	( length($prgfile) > 0 ) and ( -f $prgfile ) and unlink $prgfile;
 
 	delete( $work_data->{PIDs}{$pid} );
 	--$work_data->{cnt};
@@ -1243,8 +1226,7 @@ sub remove_pid {
 	$work_lock->unlock;
 
 	return $result;
-}
-
+} ## end sub remove_pid
 
 # ---------------------------------------------------------
 # A signal handler that sets global vars according to the
@@ -1252,62 +1234,63 @@ sub remove_pid {
 # Unknown signals are ignored.
 # ---------------------------------------------------------
 sub sigHandler {
-	my ( $sig ) = @_;
+	my ($sig) = @_;
 	if ( exists $signalHandlers{$sig} ) {
 		$signalHandlers{$sig}->();
 	} else {
 		log_warning( 'Caught Unknown Signal [%s] ... ignoring Signal!', $sig );
 	}
 	return 1;
-}
+} ## end sub sigHandler
 
 sub segment_all_groups {
 	can_work() or return 1;
 
-	log_info( 'Segmenting source groups...' );
+	log_info('Segmenting source groups...');
 
 	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 		can_work() or last;
 		my $prgfile = sprintf '%s/temp_%d_progress_%d.log', $source_groups{$groupID}{dir}, $tmp_pid, $groupID;
 		segment_source_group( $groupID, $prgfile ) or exit 8;
 		-f $prgfile and ( 0 == $do_debug ) and unlink $prgfile;
-	}
+	} ## end foreach my $groupID ( sort ...)
 
 	return 1;
-}
+} ## end sub segment_all_groups
 
 sub segment_source_group {
 	my ( $gid, $prgfile ) = @_;
 	defined $source_groups{$gid} or log_error( 'Source Group ID %d does not exist!', $gid ) and return 0;
-	can_work() or return 1;
+	can_work()                   or return 1;
 
 	# We use this to check on the overall maximum fps
 	( $source_groups{$gid}{fps} > $max_fps ) and $max_fps = $source_groups{$gid}{fps};
 
 	# Each segment must be a quarter of the total duration, raised to the next full second
-	my $seg_len = floor( 1. + ( $source_groups{$gid}{dur} / 4. ));
+	my $seg_len = floor( 1. + ( $source_groups{$gid}{dur} / 4. ) );
 
 	# Luckily we can concat and segment in one go, but we need the concat demuxer for that, which requires an input file
 	if ( open my $fOut, '>', $source_groups{$gid}{lst} ) {
 		foreach my $fid ( sort { $a <=> $b } @{ $source_groups{$gid}{ids} } ) {
-			printf { $fOut } "file '%s'\n", $source_ids{$fid};
+			printf {$fOut} "file '%s'\n", $source_ids{$fid};
 		}
-		close $fOut or confess( "Closing listfile '$source_groups{$gid}{lst}' FAILED!" );
+		close $fOut or confess("Closing listfile '$source_groups{$gid}{lst}' FAILED!");
 	} else {
 		log_error( q{Cannot write list file '%s': %s}, $source_groups{$gid}{lst}, $! );
 		return 0;
 	}
 
 	# Let's build the command line arguments:
-	my @ffargs = ( $FF, @FF_ARGS_START, '-progress', $prgfile,
-	               ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-	               @FF_CONCAT_BEGIN, $source_groups{$gid}{lst}, @FF_CONCAT_END,
-	               qw( -f segment -segment_time ), "$seg_len",
-	               $source_groups{$gid}{tmp} );
+	my @ffargs = (
+		$FF,              @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_CONCAT_BEGIN, $source_groups{$gid}{lst},
+		@FF_CONCAT_END,   qw( -f segment -segment_time ),
+		"$seg_len",       $source_groups{$gid}{tmp}
+	);
 
-	log_debug( "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ));
+	log_debug( "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ) );
 	my $pid = start_work( 1, @ffargs );
-	defined $pid and ( $pid > 0 ) or croak( 'BUG! start_work() returned invalid PID!' );
+	defined $pid and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid}{args}    = \@ffargs;
 	$work_data->{PIDs}{$pid}{prgfile} = $prgfile;
@@ -1320,7 +1303,7 @@ sub segment_source_group {
 	-f $source_groups{$gid}{lst} and ( 0 == $do_debug ) and unlink $source_groups{$gid}{lst};
 
 	return $result;
-}
+} ## end sub segment_source_group
 
 sub send_forks_the_kill() {
 	$work_lock->lock;
@@ -1330,20 +1313,20 @@ sub send_forks_the_kill() {
 			$work_lock->unlock;
 			terminator( $pid, 'TERM' );
 			$work_lock->lock;
-		}
+		} ## end if ( ( 1 == $death_note...))
+
 		# Note: 5 is after 2 seconds
 		elsif ( ( 5 == $death_note ) && ( $work_data->{PIDs}{$pid}{status} != $FF_REAPED ) ) {
 			log_warning( 'KILLing worker PID %d', $pid );
 			$work_lock->unlock;
 			terminator( $pid, 'KILL' );
 			$work_lock->lock;
-		}
-	}
+		} ## end elsif ( ( 5 == $death_note...))
+	} ## end foreach my $pid ( keys %{ $work_data...})
 	++$death_note;
 	$work_lock->unlock;
 	return 1;
-}
-
+} ## end sub send_forks_the_kill
 
 # Show data from between the last two "progress=<state>" lines in the given log file
 sub show_progress {
@@ -1351,28 +1334,30 @@ sub show_progress {
 
 	# Formualate the progress line
 	my $size_str     = human_readable_size( $prgData->{total_size} // 0 );
-	my $time_str     = format_out_time( $prgData->{out_time} // 0 );
-	my $bitrate_str  = format_bitrate( ( $prgData->{bitrate} // 0.0 ) / $thr_count ); ## Average, not the sum.
+	my $time_str     = format_out_time( $prgData->{out_time}       // 0 );
+	my $bitrate_str  = format_bitrate( ( $prgData->{bitrate} // 0.0 ) / $thr_count );                               ## Average, not the sum.
 	my $progress_str = sprintf '[%d/%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ',
-	                           $thr_active, $thr_count,
-	                           $prgData->{frames}, $prgData->{drop_frames}, $prgData->{dup_frames},
-	                           $time_str, $prgData->{fps}, $bitrate_str, $size_str;
+	  $thr_active, $thr_count,
+	  $prgData->{frames}, $prgData->{drop_frames}, $prgData->{dup_frames},
+	  $time_str, $prgData->{fps}, $bitrate_str, $size_str;
 
 	# Clear a previous progress line
 	( $have_progress_msg > 0 ) and print "\r" . ( $SPACE x length $progress_str ) . "\r";
 
 	if ( 0 < $log_as_info ) {
+
 		# Write into log file
 		log_info( '%s', $progress_str );
 	} else {
+
 		# Output on console
 		$have_progress_msg = 1;
-		local $|           = 1;
+		local $| = 1;
 		print "\r${progress_str}";
-	}
+	} ## end else [ if ( 0 < $log_as_info )]
 
 	return 1;
-}
+} ## end sub show_progress
 
 sub start_capture {
 	my @cmd = @_;
@@ -1382,8 +1367,9 @@ sub start_capture {
 
 	#@type IPC::Shareable
 	my $fork_data = IPC::Shareable->new( key => 'WORK_DATA' );
+
 	#@type IPC::Shareable
-	my $fork_lock = tied %{ $fork_data };
+	my $fork_lock = tied %{$fork_data};
 
 	# Wait until we can really start
 	wait_for_startup( $pid, $fork_data, $fork_lock );
@@ -1401,7 +1387,7 @@ sub start_capture {
 	$fork_lock->unlock;
 
 	return 1;
-}
+} ## end sub start_capture
 
 sub start_forked {
 	my @cmd = @_;
@@ -1411,8 +1397,9 @@ sub start_forked {
 
 	#@type IPC::Shareable
 	my $fork_data = IPC::Shareable->new( key => 'WORK_DATA' );
+
 	#@type IPC::Shareable
-	my $fork_lock = tied %{ $fork_data };
+	my $fork_lock = tied %{$fork_data};
 
 	# Wait until we can really start
 	wait_for_startup( $pid, $fork_data, $fork_lock );
@@ -1430,53 +1417,50 @@ sub start_forked {
 	$fork_lock->unlock;
 
 	return 1;
-}
-
+} ## end sub start_forked
 
 # ---------------------------------------------------------
 # Start a command asynchronously
 # ---------------------------------------------------------
 sub start_work {
 	my ( $tid, @cmd ) = @_;
-	my $kid           = fork;
-	defined $kid or croak( "Cannot fork()! $!\n" );
+	my $kid = fork;
+	defined $kid or croak("Cannot fork()! $!\n");
 
 	# Handle being the fork first
 	# =======================================
 	if ( 0 == $kid ) {
-		start_forked( @cmd );
-		POSIX::_exit( 0 ); ## Regular exit() would call main::END block
+		start_forked(@cmd);
+		POSIX::_exit(0);  ## Regular exit() would call main::END block
 	}
 
 	# === Do the bookkeeping before we return
 	# =======================================
-	add_pid( $kid );
+	add_pid($kid);
 
-	usleep( 0 ); ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
+	usleep(0);  ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
 	$work_lock->lock;
 	$work_data->{PIDs}{$kid}{status} = $FF_RUNNING;
 	log_info( 'Worker %d forked out as PID %d', $tid, $kid );
 	$work_lock->unlock;
 
 	return $kid;
-}
+} ## end sub start_work
 
 sub start_worker_fork {
 	my ( $gid, $i, $tmp_from, $tmp_to, $F_assembled ) = @_;
 
 	my $prgLog    = sprintf $source_groups{$gid}{prg}, $i;
 	my $file_from = sprintf $source_groups{$gid}{$tmp_from}, $i;
-	my $file_to   = sprintf $source_groups{$gid}{$tmp_to}, $i;
-	my $ffargs    = [ $FF, @FF_ARGS_START, '-progress', $prgLog,
-	                  ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-	                  @FF_ARGS_INPUT_VULK, $file_from,
-	                  @FF_ARGS_ACOPY_FIL, $F_assembled, '-fps_mode', 'cfr', @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV,
-	                  $file_to
+	my $file_to   = sprintf $source_groups{$gid}{$tmp_to},   $i;
+	my $ffargs    = [
+		$FF, @FF_ARGS_START, '-progress', $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_ARGS_INPUT_VULK, $file_from, @FF_ARGS_ACOPY_FIL, $F_assembled, '-fps_mode', 'cfr', @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
 	];
 
-	log_debug( "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @{ $ffargs } ));
-	my $pid = start_work( $i, @{ $ffargs } );
-	defined $pid and ( $pid > 0 ) or croak( 'BUG! start_work() returned invalid PID!' );
+	log_debug( "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @{$ffargs} ) );
+	my $pid = start_work( $i, @{$ffargs} );
+	defined $pid and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid}{args}    = $ffargs;
 	$work_data->{PIDs}{$pid}{id}      = $i;
@@ -1486,43 +1470,40 @@ sub start_worker_fork {
 	$work_lock->unlock;
 
 	return 1;
-}
-
+} ## end sub start_worker_fork
 
 # --- Second strike, 3 seconds after $thr_progress timeout  ---
 # -------------------------------------------------------------
 sub strike_fork_kill {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 	$work_lock->lock;
 	if ( $work_data->{PIDs}{$pid}{status} == $FF_RUNNING ) {
 		log_warning( 'Sending SIGKILL to fork PID %d', $pid );
 		$work_lock->unlock;
 		terminator( $pid, 'KILL' );
 		return 7;
-	}
+	} ## end if ( $work_data->{PIDs...})
 	log_error( 'Fork PID %d is gone! Will restart...', $pid );
 	$work_lock->unlock;
-	return 13; # Thread is already gone, start a new one.
-}
-
+	return 13;  # Thread is already gone, start a new one.
+} ## end sub strike_fork_kill
 
 # --- Third strike, 6 seconds after $thr_progress timeout  ---
 # -------------------------------------------------------------
 sub strike_fork_reap {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 
-	while ( can_work && ( 0 == reap_pid( $pid ) ) ) {
-		usleep( 50 );
+	while ( can_work && ( 0 == reap_pid($pid) ) ) {
+		usleep(50);
 	}
 
 	return 13;
-}
-
+} ## end sub strike_fork_reap
 
 # --- Last strike, 9 seconds after $thr_progress timeout  ---
 # -------------------------------------------------------------
 sub strike_fork_restart {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 	log_warning( 'Re-starting frozen Fork %d', $pid );
 
 	$work_lock->lock;
@@ -1530,7 +1511,7 @@ sub strike_fork_restart {
 	$work_lock->unlock;
 
 	my $kid = start_work( 1, @args );
-	defined $kid and ( $kid > 0 ) or croak( 'BUG! start_work() returned invalid PID!' );
+	defined $kid and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$kid}{args}    = $work_data->{PIDs}{$pid}{args};
 	$work_data->{PIDs}{$kid}{prgfile} = $work_data->{PIDs}{$pid}{prgfile};
@@ -1538,28 +1519,26 @@ sub strike_fork_restart {
 	$work_data->{PIDs}{$kid}{target}  = $work_data->{PIDs}{$pid}{target};
 	$work_lock->unlock;
 
-	remove_pid( $pid, 0 ); ## No cleanup, the restarted process will overwrite and we don't want to interfere with the substitute
+	remove_pid( $pid, 0 );  ## No cleanup, the restarted process will overwrite and we don't want to interfere with the substitute
 
 	return $kid;
-}
-
+} ## end sub strike_fork_restart
 
 # --- First strike after $thr_progress ran out (30 seconds) ---
 # -------------------------------------------------------------
 sub strike_fork_term {
-	my ( $pid ) = @_;
+	my ($pid) = @_;
 	$work_lock->lock;
 	if ( $work_data->{PIDs}{$pid}{status} == $FF_RUNNING ) {
 		log_warning( 'Sending SIGTERM to frozen fork PID %d', $pid );
 		$work_lock->unlock;
 		terminator( $pid, 'TERM' );
 		return 1;
-	}
+	} ## end if ( $work_data->{PIDs...})
 	log_error( 'Fork PID %d is gone! Will restart...', $pid );
 	$work_lock->unlock;
-	return 13; # Thread is already gone, start a new one.
-}
-
+	return 13;  # Thread is already gone, start a new one.
+} ## end sub strike_fork_term
 
 # ---------------------------------------------------------
 # TERM/KILL handler for sending signals to forked children
@@ -1567,19 +1546,19 @@ sub strike_fork_term {
 sub terminator {
 	my ( $kid, $signal ) = @_;
 
-	defined $kid or log_error( 'BUG! terminator() called with UNDEF kid argument!' ) and return 0;
-	defined $signal or log_error( 'BUG! terminator() called with UNDEF signal argument!' ) and return 0;
+	defined $kid    or log_error('BUG! terminator() called with UNDEF kid argument!')    and return 0;
+	defined $signal or log_error('BUG! terminator() called with UNDEF signal argument!') and return 0;
 
 	if ( !( ( 'TERM' eq $signal ) || ( 'KILL' eq $signal ) ) ) {
 		log_error( q{Bug: terminator(%d, '%s') called, only TERM and KILL supported!}, $kid, $signal );
 		return 0;
 	}
 
-	if ( ( $kid ) > 0 ) {
+	if ( ($kid) > 0 ) {
 		log_warning( 'Sending %s to pid %d', $signal, $kid );
 		if ( kill( $signal, $kid ) > 0 ) {
-			usleep( 100_000 );
-			reap_pid( $kid );
+			usleep(100_000);
+			reap_pid($kid);
 		} else {
 			$work_lock->lock;
 			$work_data->{PIDs}{$kid}{status} = $FF_REAPED;
@@ -1591,16 +1570,15 @@ sub terminator {
 			my $status = $work_data->{PIDs}{$pid}{status};
 			$work_lock->unlock;
 			( $FF_REAPED == $status ) or terminator( $pid, $signal );
-		}
-	}
+		} ## end foreach my $pid ( keys %{ $work_data...})
+	} ## end else [ if ( ($kid) > 0 ) ]
 
 	return 1;
-}
-
+} ## end sub terminator
 
 # A warnings handler that lets perl warnings be printed via log
 sub warnHandler {
-	my ( $warn ) = @_;
+	my ($warn) = @_;
 	return log_warning( '%s', $warn );
 }
 
@@ -1609,37 +1587,37 @@ sub wait_for_all_forks {
 	my @PIDs = ( sort keys %{ $work_data->{PIDs} } );
 	$work_lock->unlock;
 
-	foreach my $pid ( @PIDs ) {
+	foreach my $pid (@PIDs) {
 
 		# Wait for PID
-		while ( can_work && ( 0 == reap_pid( $pid ) ) ) {
-			usleep( 50 );
+		while ( can_work && ( 0 == reap_pid($pid) ) ) {
+			usleep(50);
 		}
 
 		remove_pid( $pid, 1 );
 
-	} ## end of Clearing PIDs
+	} ## end foreach my $pid (@PIDs)
 
 	return 1;
-}
+} ## end sub wait_for_all_forks
 
 sub wait_for_capture {
-	my ( $kid ) = @_;
+	my ($kid) = @_;
 
 	$work_lock->lock;
 	$work_data->{PIDs}{$kid}{status} = $FF_RUNNING;
 	$work_lock->unlock;
-	usleep( 0 ); ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
+	usleep(0);  ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
 
 	log_debug( 'Process %d forked out', $kid );
 
 	# Now wait for the result
-	while ( can_work && ( 0 == reap_pid( $kid ) ) ) {
-		usleep( 50 );
+	while ( can_work && ( 0 == reap_pid($kid) ) ) {
+		usleep(50);
 	}
 
 	return 1;
-}
+} ## end sub wait_for_capture
 
 sub wait_for_startup {
 	my ( $pid, $fork_data, $fork_lock ) = @_;
@@ -1648,26 +1626,26 @@ sub wait_for_startup {
 	$fork_lock->lock;
 	while ( !defined( $fork_data->{PIDs}{$pid} ) ) {
 		$fork_lock->unlock;
-		usleep( 500 ); # poll each half millisecond
+		usleep(500);  # poll each half millisecond
 		$fork_lock->lock;
 	}
+
 	# Now we can tell the world that we are created
 	$fork_data->{PIDs}{$pid}{status} = $FF_CREATED;
 	$fork_lock->unlock;
 
 	# Wait until we got started, poll each ms
-	usleep( 1 ); ## A little "yield()" simulation
+	usleep(1);  ## A little "yield()" simulation
 	$fork_lock->lock;
 	while ( $FF_RUNNING != $fork_data->{PIDs}{$pid}{status} ) {
 		$fork_lock->unlock;
-		usleep( 500 ); # poll each half millisecond
+		usleep(500);  # poll each half millisecond
 		$fork_lock->lock;
 	}
 	$fork_lock->unlock;
 
 	return 1;
-}
-
+} ## end sub wait_for_startup
 
 # This is a watchdog function that displays progress and joins all threads nicely if needed
 sub watch_my_forks {
@@ -1676,7 +1654,7 @@ sub watch_my_forks {
 	my $forks_active = $work_data->{cnt};
 	my %fork_timeout = ();
 	my %fork_strikes = ();
-	log_debug( 'Forks : %s', ( join ', ', keys %{ $work_data->{PIDs} } ));
+	log_debug( 'Forks : %s', ( join ', ', keys %{ $work_data->{PIDs} } ) );
 	$work_lock->unlock;
 
 	while ( $forks_active > 0 ) {
@@ -1689,10 +1667,10 @@ sub watch_my_forks {
 
 		can_work() or last;
 
-		foreach my $pid ( @PIDs ) {
-			pid_exists( $pid ) or next;
+		foreach my $pid (@PIDs) {
+			pid_exists($pid) or next;
 			$forks_active += handle_fork_progress( $pid, \%prgData, \%fork_timeout, \%fork_strikes );
-			usleep( 0 );
+			usleep(0);
 		}
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
@@ -1702,20 +1680,20 @@ sub watch_my_forks {
 		@PIDs = sort keys %{ $work_data->{PIDs} };
 		$work_lock->unlock;
 
-		foreach my $pid ( @PIDs ) {
-			can_work() or last;
-			pid_exists( $pid ) or next;
+		foreach my $pid (@PIDs) {
+			can_work()       or last;
+			pid_exists($pid) or next;
 			handle_fork_strikes( $pid, \%fork_timeout, \%fork_strikes );
 		}
 
-		usleep( 500_000 );
-	}
+		usleep(500_000);
+	} ## end while ( $forks_active > 0)
 	$result = wait_for_all_forks();
 	return $result;
-}
+} ## end sub watch_my_forks
 
 sub write_to_console {
-	my ( $msg ) = @_;
+	my ($msg) = @_;
 
 	if ( $have_progress_msg > 0 ) {
 		print "\n";
@@ -1724,19 +1702,18 @@ sub write_to_console {
 
 	local $| = 1;
 	return print "${msg}\n";
-}
+} ## end sub write_to_console
 
 sub write_to_log {
-	my ( $msg ) = @_;
+	my ($msg) = @_;
 
 	if ( open my $fLog, '>>', $logfile ) {
-		print { $fLog } "${msg}\n";
-		close $fLog or confess( "Closing logfile '$logfile' FAILED!" );
+		print {$fLog} "${msg}\n";
+		close $fLog or confess("Closing logfile '$logfile' FAILED!");
 	}
 
 	return 1;
-}
-
+} ## end sub write_to_log
 
 __END__
 

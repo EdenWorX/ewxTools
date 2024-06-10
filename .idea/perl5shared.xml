@@ -10,6 +10,5 @@
       </PerlVersion>
     </option>
     <option name="PERL_CRITIC_ENABLED" value="true" />
-    <option name="PERL_TIDY_ARGS" value="-l=168 -dt=4 -csc -ce -nbl -nolc -msc=2 -iscl -otr -cab=1" />
   </component>
 </project>

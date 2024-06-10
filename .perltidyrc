@@ -1,8 +1,10 @@
+-enc=none
 -l=168
--dt=4
+-t
 -csc
 -ce
 -nbl
+-nola
 -nolc
 -msc=2
 -iscl
