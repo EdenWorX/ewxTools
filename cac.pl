@@ -220,71 +220,45 @@ log_info( 'Processing %s start', $path_target );
 # ---
 # --- 1) we need information about each source file
 # ---
-if ( can_work() ) {
-	analyze_all_inputs() or exit 6;
-}
+analyze_all_inputs();
 
 
 # ---
 # --- 2) All input files per temp directory have to be grouped. Each group is then segmented
 # ---    Into four parts, so that four threads can do the interpolation in parallel per group.
 # ---
-if ( can_work() ) {
-	( $source_count > 0 ) and build_source_groups() or ( 1 == $source_count ) and declare_single_source() or exit 7;
-}
-
-if ( can_work() ) {
-	log_info( 'Segmenting source groups...' );
-	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
-		can_work() or last;
-		my $prgfile = sprintf '%s/temp_%d_progress_%d.log', $source_groups{$groupID}{dir}, $tmp_pid, $groupID;
-		segment_source_group( $groupID, $prgfile ) or exit 8;
-		-f $prgfile and ( 0 == $do_debug ) and unlink $prgfile;
-	}
-}
-
-# Make sure we have a sane target FPS. max_fps is reused as upper fps
-if ( can_work() ) {
-	$target_fps = ( ( $max_fps < 50 ) && ( 0 == $force_upgrade ) ) ? 30 : 60;
-	$max_fps    = 2 * $target_fps;
-	log_info( 'Decimate and interpolate up to %d FPS', $max_fps );
-	log_info( 'Then interpolate to the target %d FPS', $target_fps );
-}
+build_source_groups() or declare_single_source() or exit 7;
+segment_all_groups();
+check_target_fps();
 
 
 # ---
 # --- 3) Now each groups segments can be decimated and interpolated up to max fps (round 1)
 # ---
-if ( can_work() ) {
-	log_info( 'Interpolating segments up to %d FPS...', $max_fps );
-	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
-		can_work() or last;
-		my $filter_string = make_filter_string( 'iup', 7, 0.5, $max_fps );
-		interpolate_source_group( $groupID, 'tmp', 'iup', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 9;
-	}
+can_work() and log_info( 'Interpolating segments up to %d FPS...', $max_fps );
+foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
+	can_work() or last;
+	my $filter_string = make_filter_string( 'iup', 7, 0.5, $max_fps );
+	interpolate_source_group( $groupID, 'tmp', 'iup', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 9;
 }
 
 
 # ---
 # --- 4) Then all groups segments have to be decimated and interpolated down to target fps (round 2)
 # ---
-if ( can_work() ) {
-	log_info( 'Interpolating segments down to %d FPS...', $target_fps );
-	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
-		can_work() or last;
-		my $filter_string = make_filter_string( 'iup', 3, 0.667, $target_fps );
-		interpolate_source_group( $groupID, 'iup', 'idn', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 10;
-	}
+can_work() and log_info( 'Interpolating segments down to %d FPS...', $target_fps );
+foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
+	can_work() or last;
+	my $filter_string = make_filter_string( 'iup', 3, 0.667, $target_fps );
+	interpolate_source_group( $groupID, 'iup', 'idn', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 10;
 }
 
 
 # ---
 # --- 5) And finally we can put all the latest temp files together and create the target vid
 # ---
-if ( can_work() ) {
-	log_info( 'Creating %s ...', $path_target );
-	assemble_output() or exit 12;
-}
+can_work() and log_info( 'Creating %s ...', $path_target );
+assemble_output();
 
 
 # ---------------------------------------------------------
@@ -347,7 +321,7 @@ sub add_pid {
 }
 
 sub analyze_all_inputs {
-
+	can_work() or return 1;
 	my $pathID = 0; ## Counter for the source id hash
 
 	foreach my $src ( @path_source ) {
@@ -366,7 +340,7 @@ sub analyze_all_inputs {
 		};
 		$source_ids{$pathID} = $src;
 
-		analyze_input( $src ) or return 0;
+		analyze_input( $src ) or exit 6;
 	}
 
 	return 1;
@@ -475,6 +449,7 @@ sub analyze_stream_info {
 }
 
 sub assemble_output {
+	can_work() or return 1;
 	my $lstfile = sprintf '%s/temp_%d_src.lst', dirname( $path_target ), $tmp_pid;
 	my $prgfile = sprintf '%s/temp_%d_prg.log', dirname( $path_target ), $tmp_pid;
 	my $mapfile = $path_target;
@@ -494,7 +469,7 @@ sub assemble_output {
 
 	# Having a list file we can go and create our output:
 	if ( can_work() ) {
-		create_target_file( $lstfile, $prgfile, $mapfile ) or return 0;
+		create_target_file( $lstfile, $prgfile, $mapfile ) or exit 12;
 	}
 
 	# When everything is good, we no longer need the list file, progress file and the temp files
@@ -514,6 +489,8 @@ sub assemble_output {
 }
 
 sub build_source_groups {
+	can_work() or return 1;
+	( $source_count > 1 ) or return 0;
 	my $group_id    = 0;
 	my $last_dir    = ( 0 == ( length $path_temp ) ) ? 'n/a' : $path_temp;
 	my $last_ch_cnt = 0;
@@ -739,6 +716,16 @@ sub check_single_temp_dir {
 	return 1;
 }
 
+# Make sure we have a sane target FPS. max_fps is reused as upper fps
+sub check_target_fps {
+	can_work() or return 1;
+	$target_fps = ( ( $max_fps < 50 ) && ( 0 == $force_upgrade ) ) ? 30 : 60;
+	$max_fps    = 2 * $target_fps;
+	log_info( 'Decimate and interpolate up to %d FPS', $max_fps );
+	log_info( 'Then interpolate to the target %d FPS', $target_fps );
+	return 1;
+}
+
 sub check_temp_dir {
 	my ( $errCount, $total_size ) = @_;
 
@@ -834,6 +821,8 @@ sub commify {
 }
 
 sub declare_single_source {
+	can_work() or return 1;
+	( 1 == $source_count ) or return 0;
 	my $src      = $path_source[0];
 	my $data     = $source_info{$src}; ## shortcut
 	my $fileID   = $data->{id};
@@ -1016,6 +1005,7 @@ sub human_readable_size {
 
 sub interpolate_source_group {
 	my ( $gid, $tmp_from, $tmp_to, $filter_string ) = @_;
+	can_work() or return 1;
 
 	if ( !defined $source_groups{$gid} ) {
 		log_error( 'Source Group ID %d does not exist!', $gid );
@@ -1122,6 +1112,7 @@ sub log_debug {
 
 sub make_filter_string {
 	my ( $tmp_to, $dec_max, $dec_frac, $tgt_fps ) = @_;
+	can_work() or return 1;
 
 	# Prepare filter components
 	my $F_in_scale    = "scale='in_range=full:out_range=full'";
@@ -1267,6 +1258,21 @@ sub sigHandler {
 	} else {
 		log_warning( 'Caught Unknown Signal [%s] ... ignoring Signal!', $sig );
 	}
+	return 1;
+}
+
+sub segment_all_groups {
+	can_work() or return 1;
+
+	log_info( 'Segmenting source groups...' );
+
+	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
+		can_work() or last;
+		my $prgfile = sprintf '%s/temp_%d_progress_%d.log', $source_groups{$groupID}{dir}, $tmp_pid, $groupID;
+		segment_source_group( $groupID, $prgfile ) or exit 8;
+		-f $prgfile and ( 0 == $do_debug ) and unlink $prgfile;
+	}
+
 	return 1;
 }
 
@@ -1773,8 +1779,6 @@ This help message
 
 Path to the directory where the temporary files are written. Defaults to the
 directory of the input file(s). Ensure to have 50x the space of the input!
-
-=for stopwords splitaudio
 
 =item B<-s | --splitaudio>
 
