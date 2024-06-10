@@ -16,6 +16,7 @@ use Pod::Usage;
 use Readonly;
 use Time::HiRes qw( usleep );
 
+my $work_done = 0;
 
 # ===============
 # === HISTORY ===
@@ -26,7 +27,7 @@ use Time::HiRes qw( usleep );
 # 1.0.2    2024-05-30  sed, EdenWorX  Rewrote the workers to be true forks instead of using iThreads.
 #
 # Please keep this current:
-our $VERSION => '1.0.2';
+our $VERSION = '1.0.2';
 
 
 # =======================================================================================
@@ -61,8 +62,8 @@ my $work_lock      = tied %{ $work_data };
 $work_data->{cnt}  = 0;
 $work_data->{PIDs} = {};
 
-Readonly my $EMPTY = q{};
-Readonly my $SPACE = q{ };
+Readonly my $EMPTY => q{};
+Readonly my $SPACE => q{ };
 
 
 # ---------------------------------------------------------
@@ -169,7 +170,6 @@ my $audio_channels     = 0;
 my $audio_layout       = 'guess';
 my $voice_channels     = 0;
 my $voice_layout       = 'guess';
-my $work_done          = 0;
 
 
 # ---------------------------------------------------------
