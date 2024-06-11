@@ -336,17 +336,21 @@ sub analyze_all_inputs {
 sub analyze_input {
 	my ($src) = @_;
 
-	my $formats = $source_info{$src};   ## Shortcut
-	my $streams = $formats->{streams};  ## shortcut, too
+	my $formats = $source_info{$src};  ## Shortcut
 
 	# Get basic duration
 	my $stream_fields = 'avg_frame_rate,duration';
 	my $frstream_no   = get_info_from_ffprobe( $src, $stream_fields );
 	( $frstream_no >= 0 ) or return 0;        ## Something went wrong
+	my $streams  = $formats->{streams};       ## shortcut, too
 	my $frstream = $streams->[$frstream_no];  ## shortcut, three
 
-	( $formats->{duration} > 0 )        or log_error( "Unable to determine duration of '%s'",           $src ) and return 0;
-	( $frstream->{avg_frame_rate} > 0 ) or log_error( "Unable to determine average frame rate of '%s'", $src ) and return 0;
+	defined $formats->{duration} and ( $formats->{duration} > 0 )
+	  or log_error( "Unable to determine duration of '%s'", $src )
+	  and return 0;
+	defined $frstream->{avg_frame_rate} and ( $frstream->{avg_frame_rate} > 0 )
+	  or log_error( "Unable to determine average frame rate of '%s'", $src )
+	  and return 0;
 
 	log_debug( 'Duration   : %d', $formats->{duration} );
 	log_debug( 'Average FPS: %d', $frstream->{avg_frame_rate} );
@@ -396,6 +400,8 @@ sub analyze_input {
 sub analyze_stream_info {
 	my ( $src, $streams ) = @_;
 
+	can_work() or return 0;
+
 	my $have_video = 0;
 	my $have_audio = 0;
 	my $have_voice = 0;
@@ -405,11 +411,7 @@ sub analyze_stream_info {
 		if ( $streams->[$i]{codec_type} eq 'video' ) {
 			$have_video   = 1;
 			$video_stream = $i;
-			$streams->[$i]{avg_frame_rate} =~ m/(\d+)\/(\d+)/ms
-			  and ( 1. * $1 > 0. )
-			  and ( 1. * $2 > 0. )
-			  and $streams->[$i]{avg_frame_rate} = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ) );
-		} ## end if ( $streams->[$i]{codec_type...})
+		}
 		if ( $streams->[$i]{codec_type} eq 'audio' ) {
 			if ( 0 == $have_audio ) {
 				$have_audio   = 1;
@@ -840,7 +842,7 @@ sub dieHandler {
 
 sub file_exists {
 	my ($file) = @_;
-	return defined $file && ( ( length $file ) > 0 ) && ( -f $file );
+	return (defined $file && ( ( length $file ) > 0 ) && ( -f $file )) ? 1 : 0;
 }
 
 sub format_bitrate {
@@ -869,17 +871,28 @@ sub get_info_from_ffprobe {
 	foreach my $line (@fplines) {
 		chomp $line;
 
-		#log_debug("RAW[%s]", $line);
+		log_debug( 'RAW[%s]', $line );
 		if ( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/xms ) {
 			$source_info{$src}{streams}[$1]{$2} = "$3";
-			      ( 'avg_frame_rate' eq $2 )
-			  and ( '0' ne "$3" )
-			  and ( '0/0' ne "$3" )
-			  and ( $avg_frame_rate_stream < 0 )
-			  and $avg_frame_rate_stream = $1;
+			log_debug( "    ==> Stream %d Field '%s' Value \"%s\"", $1, $2, $3 );
+			if ( ( 'avg_frame_rate' eq $2 ) && ( '0' ne "$3" ) && ( '0/0' ne "$3" ) ) {
+				my ( $s, $n, $v ) = ( $1, $2, $3 );
+
+				# If we do not have found the stream defining our average framerate, yet, not it down now.
+				( $avg_frame_rate_stream < 0 )
+				  and log_debug('    ==> Avg Frame Rate Stream found!')
+				  and $avg_frame_rate_stream = $s;
+
+				# If the framerate is noted as a fraction, calculate the numeric value
+				$v =~ m/(\d+)\/(\d+)/ms
+				  and ( 1. * $1 > 0. )
+				  and ( 1. * $2 > 0. )
+				  and $source_info{$src}{streams}[$s]{$n} = floor( 1. * ( ( 1. * $1 ) / ( 1. * $2 ) ) );
+			} ## end if ( ( 'avg_frame_rate'...))
 			next;
 		} ## end if ( $line =~ m/streams_stream_(\d)_([^=]+)="?([^"]+)"?/xms)
 		if ( $line =~ m/format_([^=]+)="?([^"]+)"?/xms ) {
+			log_debug( "    ==> Format Field '%s' Value \"%s\"", $1, $2 );
 			$source_info{$src}{$1} = "$2";
 		}
 	} ## end foreach my $line (@fplines)
@@ -1019,7 +1032,7 @@ sub is_progress_line {
 sub load_progress {
 	my ( $progress_log, $progress_data ) = @_;
 
-	file_exists($progress_log) or croak("Log file $progress_log does not exist!");
+	file_exists($progress_log) or return 0;
 
 	my @args          = ( 'tail', '-n', '20', $progress_log );
 	my @last_20_lines = reverse split /\n/ms, capture_cmd(@args);
@@ -1197,24 +1210,20 @@ sub remove_pid {
 			log_error( 'Worker PID %d FAILED [%d] %s', $pid, $work_data->{PIDs}{$pid}{exit_code}, $work_data->{PIDs}{$pid}{result} );
 
 			# We do not need the target file any more, the thread failed! (if an fmt is set)
-			if ( 0 == $do_debug ) {
-				if ( 0 < length( $work_data->{PIDs}{$pid}{target} ) ) {
-					my $f = sprintf $work_data->{PIDs}{$pid}{target}, $work_data->{PIDs}{$pid}{id};
-					log_debug( "Removing target file '%s' ...", $f );
-					-f $f and unlink $f;
-				}
-			} ## end if ( 0 == $do_debug )
+			if ( ( 0 == $do_debug ) && ( length( $work_data->{PIDs}{$pid}{target} ) > 0 ) ) {
+				my $f = sprintf $work_data->{PIDs}{$pid}{target}, $work_data->{PIDs}{$pid}{id};
+				log_debug( "Removing target file '%s' ...", $f );
+				-f $f and unlink $f;
+			}
 			$result = 0;  ## We _did_ fail!
 		} ## end if ( defined( $work_data...))
 
 		# We do not need the source file any more (if an fmt is set)
-		if ( defined( $work_data->{PIDs}{$pid}{source} ) && ( 0 == $do_debug ) ) {
-			if ( 0 < length( $work_data->{PIDs}{$pid}{source} ) ) {
-				my $f = sprintf $work_data->{PIDs}{$pid}{source}, $work_data->{PIDs}{$pid}{id};
-				log_debug( "Removing source file '%s' ...", $f );
-				-f $f and unlink $f;
-			}
-		} ## end if ( defined( $work_data...))
+		if ( ( 0 == $do_debug ) && defined( $work_data->{PIDs}{$pid}{source} ) && ( length( $work_data->{PIDs}{$pid}{source} ) > 0 ) ) {
+			my $f = sprintf $work_data->{PIDs}{$pid}{source}, $work_data->{PIDs}{$pid}{id};
+			log_debug( "Removing source file '%s' ...", $f );
+			-f $f and unlink $f;
+		}
 	} ## end if ( 1 == $do_cleanup )
 
 	# Progress files are already removed, because the only part where they are used
@@ -1438,12 +1447,15 @@ sub start_work {
 
 	# === Do the bookkeeping before we return
 	# =======================================
-	add_pid($kid);
+	add_pid($kid) and usleep(0);
 
-	usleep(0);  ## Simulates a yield() without multi-threading (We have (a) fork(s) !)
+	# Wait for the fork to mark itself as "created"
+	wait_for_pid_status( $kid, $work_data, $work_lock, $FF_CREATED ) and usleep(0);
+
+	# Now the fork waits for the starting signal, let's hand it over
 	$work_lock->lock;
 	$work_data->{PIDs}{$kid}{status} = $FF_RUNNING;
-	log_info( 'Worker %d forked out as PID %d', $tid, $kid );
+	log_debug( 'Worker %d forked out as PID %d', $tid, $kid );
 	$work_lock->unlock;
 
 	return $kid;
@@ -1621,32 +1633,44 @@ sub wait_for_capture {
 	return 1;
 } ## end sub wait_for_capture
 
+sub wait_for_pid_status {
+	my ( $pid, $fork_data, $fork_lock, $status ) = @_;
+
+	log_debug( 'Fork Status %d / %d', defined $fork_data->{PIDs}{$pid}{status} ? $fork_data->{PIDs}{$pid}{status} : -1, $status );
+
+	usleep(1);  ## A little "yield()" simulation
+	defined $fork_lock and $fork_lock->lock;
+	while ( defined $fork_data && ( $status != $fork_data->{PIDs}{$pid}{status} ) ) {
+		defined $fork_lock and $fork_lock->unlock;
+		usleep(500);  # poll each half millisecond
+		defined $fork_lock and $fork_lock->lock;
+		log_debug( 'Fork Status %d / %d', defined $fork_data->{PIDs}{$pid}{status} ? $fork_data->{PIDs}{$pid}{status} : -1, $status );
+	} ## end while ( defined $fork_data...)
+	defined $fork_lock and $fork_lock->unlock;
+
+	return 1;
+} ## end sub wait_for_pid_status
+
 sub wait_for_startup {
 	my ( $pid, $fork_data, $fork_lock ) = @_;
 
+	log_debug( 'Have data? %s', defined $fork_data->{PIDs}{$pid} ? 'yes' : 'no' );
+
 	# Wait until the work data is initialized
-	$fork_lock->lock;
-	while ( !defined( $fork_data->{PIDs}{$pid} ) ) {
-		$fork_lock->unlock;
+	defined $fork_lock and $fork_lock->lock;
+	while ( defined $fork_lock && !defined $fork_data->{PIDs}{$pid} ) {
+		defined $fork_lock and $fork_lock->unlock;
 		usleep(500);  # poll each half millisecond
-		$fork_lock->lock;
-	}
+		defined $fork_lock and $fork_lock->lock;
+		log_debug( 'Have data? %s', defined $fork_data->{PIDs}{$pid} ? 'yes' : 'no' );
+	} ## end while ( defined $fork_lock...)
 
 	# Now we can tell the world that we are created
-	$fork_data->{PIDs}{$pid}{status} = $FF_CREATED;
-	$fork_lock->unlock;
+	defined $fork_data and $fork_data->{PIDs}{$pid}{status} = $FF_CREATED;
+	defined $fork_lock and $fork_lock->unlock;
 
-	# Wait until we got started, poll each ms
-	usleep(1);  ## A little "yield()" simulation
-	$fork_lock->lock;
-	while ( $FF_RUNNING != $fork_data->{PIDs}{$pid}{status} ) {
-		$fork_lock->unlock;
-		usleep(500);  # poll each half millisecond
-		$fork_lock->lock;
-	}
-	$fork_lock->unlock;
-
-	return 1;
+	# Wait until we got started
+	return wait_for_pid_status( $pid, $fork_data, $fork_lock, $FF_RUNNING );
 } ## end sub wait_for_startup
 
 # This is a watchdog function that displays progress and joins all threads nicely if needed
