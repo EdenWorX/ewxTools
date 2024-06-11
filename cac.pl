@@ -201,8 +201,8 @@ $do_print_version > 0 and print "EWX cac V$VERSION\n" and exit 0;
 # ---------------------------------------------------------
 check_arguments() > 0 and pod2usage( { -message => $podmsg, -exitval => 1, -verbose => 0 } );  ## The sub has already logged
 
-defined $FF and ( 0 < ( length $FF ) ) and -x $FF or log_error( q{No ffmpeg available (FF: '%s')},  $FF // 'undef' ) and exit 3;
-defined $FP and ( 0 < ( length $FP ) ) and -x $FP or log_error( q{No ffprobe available (FP: '%s')}, $FP // 'undef' ) and exit 3;
+( defined $FF ) and ( 0 < ( length $FF ) ) and -x $FF or log_error( q{No ffmpeg available (FF: '%s')},  $FF // 'undef' ) and exit 3;
+( defined $FP ) and ( 0 < ( length $FP ) ) and -x $FP or log_error( q{No ffprobe available (FP: '%s')}, $FP // 'undef' ) and exit 3;
 
 # ---------------------------------------------------------
 # ================	  MAIN  PROGRAM	  ================
@@ -287,7 +287,7 @@ exit $ret_global;
 
 sub add_pid {
 	my ($pid) = @_;
-	defined $pid and ( $pid =~ m/^\d+$/ms )
+	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
 	  or log_error( "add_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
 	  and confess('FATAL BUG!');
 	defined( $work_data->{PIDs}{$pid} ) and confess("add_pid($pid) called but work_data already defined!");
@@ -345,10 +345,10 @@ sub analyze_input {
 	my $streams  = $formats->{streams};       ## shortcut, too
 	my $frstream = $streams->[$frstream_no];  ## shortcut, three
 
-	defined $formats->{duration} and ( $formats->{duration} > 0 )
+	( defined $formats->{duration} ) and ( $formats->{duration} > 0 )
 	  or log_error( "Unable to determine duration of '%s'", $src )
 	  and return 0;
-	defined $frstream->{avg_frame_rate} and ( $frstream->{avg_frame_rate} > 0 )
+	( defined $frstream->{avg_frame_rate} ) and ( $frstream->{avg_frame_rate} > 0 )
 	  or log_error( "Unable to determine average frame rate of '%s'", $src )
 	  and return 0;
 
@@ -499,7 +499,7 @@ sub build_source_groups {
 
 		# Codecs must be looked at in a loop, as we do not know how many there are.
 		for ( 0 .. ( $data->{nb_streams} - 1 ) ) {
-			( ( !defined $last_codec{$_} ) or ( $last_codec{$_} ne $data->{streams}[$_]{codec_name} ) )
+			( ( !( defined $last_codec{$_} ) ) or ( $last_codec{$_} ne $data->{streams}[$_]{codec_name} ) )
 			  and $codec_changed = 1;
 			$last_codec{$_} = $data->{streams}[$_]{codec_name};
 		}
@@ -545,7 +545,7 @@ sub capture_cmd {
 	my (@cmd) = @_;
 	my $kid = fork;
 
-	defined $kid or croak("Cannot fork()! $!\n");
+	( defined $kid ) or croak("Cannot fork()! $!\n");
 
 	# Handle being the fork first
 	# =======================================
@@ -645,12 +645,12 @@ sub check_multi_temp_dir {
 		if ( -f $src ) {
 			my $dir = dirname($src);
 			( length $dir ) > 0 or $dir = q{.};
-			if ( !defined $dir_stats{$dir} ) {
+			if ( !( defined $dir_stats{$dir} ) ) {
 				$dir_stats{$dir} = { has_space => 0, need_space => 0, srcs => [] };
 			}
 			push @{ $dir_stats{$dir}{srcs} }, $src;
 			my $ref = df($dir);
-			if ( defined $ref ) {
+			if ( ( defined $ref ) ) {
 				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;      ## again count in M not K
 				$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024;  ## also in M now.
 			} else {
@@ -681,7 +681,7 @@ sub check_single_temp_dir {
 		foreach my $src (@path_source) {
 			push @{ $dir_stats{$path_temp}{srcs} }, $src;
 		}
-		if ( defined $ref ) {
+		if ( ( defined $ref ) ) {
 
 			# The temporary UT Video files will need roughly 42-47 times the input
 			# Plus a probably 3 times bigger output than input and we end at x50.
@@ -791,7 +791,7 @@ sub create_target_file {
 
 	log_debug( "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ) );
 	my $pid = start_work( 1, @ffargs );
-	defined $pid and ( $pid > 0 ) or confess('BUG! start_work() returned invalid PID!');
+	( defined $pid ) and ( $pid > 0 ) or confess('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid}{args}    = \@ffargs;
 	$work_data->{PIDs}{$pid}{prgfile} = $prgfile;
@@ -842,7 +842,7 @@ sub dieHandler {
 
 sub file_exists {
 	my ($file) = @_;
-	return ( defined $file && ( ( length $file ) > 0 ) && ( -f $file ) ) ? 1 : 0;
+	return ( defined($file) && ( ( length $file ) > 0 ) && ( -f $file ) ) ? 1 : 0;
 }
 
 sub format_bitrate {
@@ -903,12 +903,12 @@ sub get_info_from_ffprobe {
 sub get_location {
 	my ( $caller, undef, undef, $lineno, $logger ) = @_;
 
-	defined $logger and $logger =~ m/^main::log_(info|warning|error|status|debug)$/xms
+	( defined $logger ) and $logger =~ m/^main::log_(info|warning|error|status|debug)$/xms
 	  or confess("get_location(): logMsg() called from wrong sub $logger");
 
 	my $subname = $caller // 'main';
 	$subname =~ s/^.*::([^:]+)$/$1/xms;
-	defined $lineno or $lineno = -1;
+	( defined $lineno ) or $lineno = -1;
 
 	return ( $lineno > -1 ) ? ( sprintf '%d:%s()', $lineno, $subname ) : ( sprintf '%s', $subname );
 } ## end sub get_location
@@ -1004,12 +1004,12 @@ sub interpolate_source_group {
 	my ( $gid, $tmp_from, $tmp_to, $filter_string ) = @_;
 	can_work() or return 1;
 
-	if ( !defined $source_groups{$gid} ) {
+	if ( !( defined $source_groups{$gid} ) ) {
 		log_error( 'Source Group ID %d does not exist!', $gid );
 		return 0;
 	}
 
-	defined $filter_string or $filter_string = $EMPTY;
+	( defined $filter_string ) or $filter_string = $EMPTY;
 	can_work() or return 1;
 
 	# Building the four worker threads is quite trivial
@@ -1062,7 +1062,7 @@ sub load_progress {
 sub logMsg {
 	my ( $lvl, $fmt, @args ) = @_;
 
-	defined $lvl or $lvl = 2;
+	( defined $lvl ) or $lvl = 2;
 
 	( $LOG_DEBUG == $lvl ) and ( 0 == $do_debug ) and return 1;
 
@@ -1142,7 +1142,7 @@ sub pid_exists {
 sub reap_pid {
 	my ($pid) = @_;
 
-	defined $pid and ( $pid =~ m/^\d+$/ms )
+	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
 	  or log_error( q{reap_pid(): BUG! '%s' is not a valid pid!}, $pid // 'undef' )
 	  and confess('FATAL BUG!');
 	defined( $work_data->{PIDs}{$pid} ) or return 1;
@@ -1182,10 +1182,10 @@ sub reaper {
 
 sub remove_pid {
 	my ( $pid, $do_cleanup ) = @_;
-	defined $pid and ( $pid =~ m/^\d+$/ms )
+	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
 	  or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
 	  and confess('FATAL BUG!');
-	defined $work_data->{PIDs}{$pid} or return 1;
+	( defined $work_data->{PIDs}{$pid} ) or return 1;
 
 	my $result = 1;
 
@@ -1226,7 +1226,7 @@ sub remove_pid {
 
 	# Progress files are already removed, because the only part where they are used
 	# will no longer pick them up once the PID was removed from %work_data (See watch_my_forks())
-	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;  ## shortcut including defined check
+	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;  ## shortcut including (defined check)
 	( length($prgfile) > 0 ) and ( -f $prgfile ) and unlink $prgfile;
 
 	delete( $work_data->{PIDs}{$pid} );
@@ -1269,8 +1269,8 @@ sub segment_all_groups {
 
 sub segment_source_group {
 	my ( $gid, $prgfile ) = @_;
-	defined $source_groups{$gid} or log_error( 'Source Group ID %d does not exist!', $gid ) and return 0;
-	can_work()                   or return 1;
+	( defined $source_groups{$gid} ) or log_error( 'Source Group ID %d does not exist!', $gid ) and return 0;
+	can_work()                       or return 1;
 
 	# We use this to check on the overall maximum fps
 	( $source_groups{$gid}{fps} > $max_fps ) and $max_fps = $source_groups{$gid}{fps};
@@ -1299,7 +1299,7 @@ sub segment_source_group {
 
 	log_debug( "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ) );
 	my $pid = start_work( 1, @ffargs );
-	defined $pid and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
+	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid}{args}    = \@ffargs;
 	$work_data->{PIDs}{$pid}{prgfile} = $prgfile;
@@ -1434,7 +1434,7 @@ sub start_forked {
 sub start_work {
 	my ( $tid, @cmd ) = @_;
 	my $kid = fork;
-	defined $kid or croak("Cannot fork()! $!\n");
+	( defined $kid ) or croak("Cannot fork()! $!\n");
 
 	# Handle being the fork first
 	# =======================================
@@ -1472,7 +1472,7 @@ sub start_worker_fork {
 
 	log_debug( "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @{$ffargs} ) );
 	my $pid = start_work( $i, @{$ffargs} );
-	defined $pid and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
+	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$pid}{args}    = $ffargs;
 	$work_data->{PIDs}{$pid}{id}      = $i;
@@ -1523,7 +1523,7 @@ sub strike_fork_restart {
 	$work_lock->unlock;
 
 	my $kid = start_work( 1, @args );
-	defined $kid and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
+	( defined $kid ) and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	$work_lock->lock;
 	$work_data->{PIDs}{$kid}{args}    = $work_data->{PIDs}{$pid}{args};
 	$work_data->{PIDs}{$kid}{prgfile} = $work_data->{PIDs}{$pid}{prgfile};
@@ -1558,8 +1558,8 @@ sub strike_fork_term {
 sub terminator {
 	my ( $kid, $signal ) = @_;
 
-	defined $kid    or log_error('BUG! terminator() called with UNDEF kid argument!')    and return 0;
-	defined $signal or log_error('BUG! terminator() called with UNDEF signal argument!') and return 0;
+	( defined $kid )    or log_error('BUG! terminator() called with UNDEF kid argument!')    and return 0;
+	( defined $signal ) or log_error('BUG! terminator() called with UNDEF signal argument!') and return 0;
 
 	if ( !( ( 'TERM' eq $signal ) || ( 'KILL' eq $signal ) ) ) {
 		log_error( q{Bug: terminator(%d, '%s') called, only TERM and KILL supported!}, $kid, $signal );
@@ -1634,17 +1634,17 @@ sub wait_for_capture {
 sub wait_for_pid_status {
 	my ( $pid, $fork_data, $fork_lock, $status ) = @_;
 
-	log_debug( 'Fork Status %d / %d', defined $fork_data->{PIDs}{$pid}{status} ? $fork_data->{PIDs}{$pid}{status} : -1, $status );
+	log_debug( 'Fork Status %d / %d', ( defined $fork_data->{PIDs}{$pid}{status} ) ? $fork_data->{PIDs}{$pid}{status} : -1, $status );
 
 	usleep(1);  ## A little "yield()" simulation
-	defined $fork_lock and $fork_lock->lock;
-	while ( defined $fork_data && ( $status != $fork_data->{PIDs}{$pid}{status} ) ) {
-		defined $fork_lock and $fork_lock->unlock;
+	( defined $fork_lock ) and $fork_lock->lock;
+	while ( defined($fork_data) && ( $status != $fork_data->{PIDs}{$pid}{status} ) ) {
+		( defined $fork_lock ) and $fork_lock->unlock;
 		usleep(500);  # poll each half millisecond
-		defined $fork_lock and $fork_lock->lock;
-		log_debug( 'Fork Status %d / %d', defined $fork_data->{PIDs}{$pid}{status} ? $fork_data->{PIDs}{$pid}{status} : -1, $status );
-	} ## end while ( defined $fork_data...)
-	defined $fork_lock and $fork_lock->unlock;
+		( defined $fork_lock ) and $fork_lock->lock;
+		log_debug( 'Fork Status %d / %d', ( defined $fork_data->{PIDs}{$pid}{status} ) ? $fork_data->{PIDs}{$pid}{status} : -1, $status );
+	} ## end while ( defined($fork_data...))
+	( defined $fork_lock ) and $fork_lock->unlock;
 
 	return 1;
 } ## end sub wait_for_pid_status
@@ -1652,20 +1652,20 @@ sub wait_for_pid_status {
 sub wait_for_startup {
 	my ( $pid, $fork_data, $fork_lock ) = @_;
 
-	log_debug( 'Have data? %s', defined $fork_data->{PIDs}{$pid} ? 'yes' : 'no' );
+	log_debug( 'Have data? %s', ( defined $fork_data->{PIDs}{$pid} ) ? 'yes' : 'no' );
 
 	# Wait until the work data is initialized
-	defined $fork_lock and $fork_lock->lock;
-	while ( defined $fork_lock && !defined $fork_data->{PIDs}{$pid} ) {
-		defined $fork_lock and $fork_lock->unlock;
+	( defined $fork_lock ) and $fork_lock->lock;
+	while ( defined($fork_lock) && !( defined $fork_data->{PIDs}{$pid} ) ) {
+		( defined $fork_lock ) and $fork_lock->unlock;
 		usleep(500);  # poll each half millisecond
-		defined $fork_lock and $fork_lock->lock;
-		log_debug( 'Have data? %s', defined $fork_data->{PIDs}{$pid} ? 'yes' : 'no' );
-	} ## end while ( defined $fork_lock...)
+		( defined $fork_lock ) and $fork_lock->lock;
+		log_debug( 'Have data? %s', ( defined $fork_data->{PIDs}{$pid} ) ? 'yes' : 'no' );
+	} ## end while ( defined($fork_lock...))
 
 	# Now we can tell the world that we are created
-	defined $fork_data and $fork_data->{PIDs}{$pid}{status} = $FF_CREATED;
-	defined $fork_lock and $fork_lock->unlock;
+	( defined $fork_data ) and $fork_data->{PIDs}{$pid}{status} = $FF_CREATED;
+	( defined $fork_lock ) and $fork_lock->unlock;
 
 	# Wait until we got started
 	return wait_for_pid_status( $pid, $fork_data, $fork_lock, $FF_RUNNING );
