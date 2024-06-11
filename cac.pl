@@ -842,7 +842,7 @@ sub dieHandler {
 
 sub file_exists {
 	my ($file) = @_;
-	return (defined $file && ( ( length $file ) > 0 ) && ( -f $file )) ? 1 : 0;
+	return ( defined $file && ( ( length $file ) > 0 ) && ( -f $file ) ) ? 1 : 0;
 }
 
 sub format_bitrate {
@@ -968,7 +968,7 @@ sub handle_fork_strikes {
 	defined( $fork_timeout->{$pid} ) or $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
 	defined( $fork_strikes->{$pid} ) or $fork_strikes->{$pid} = 0;
 
-	if ( ( $fork_strikes->{$pid} <= 0 ) and ( $FF_RUNNING == $status ) ) {
+	if ( ( $fork_timeout->{$pid} <= 0 ) and ( $FF_RUNNING == $status ) ) {
 		++$fork_strikes->{$pid};
 		$fork_strikes->{$pid} =
 		    ( $fork_strikes->{$pid} == 13 ) ? strike_fork_reap($pid)
@@ -981,7 +981,7 @@ sub handle_fork_strikes {
 			$fork_strikes->{$kid} = 0;
 			log_debug( 'Worker PID %d substituted PID %d', $kid, $pid );
 		} ## end if ( $fork_strikes->{$pid...})
-	} ## end if ( ( $fork_strikes->...))
+	} ## end if ( ( $fork_timeout->...))
 
 	return 1;
 } ## end sub handle_fork_strikes
@@ -1124,12 +1124,10 @@ sub make_filter_string {
 
 sub parse_progress_data {
 	my ( $line, $property_name, $data ) = @_;
-	if ( $line =~ m/^${property_name}=(\S+)\s*$/xms ) {
-
-		# Assuming all metadata are numeric values
+	if ( $line =~ m/^${property_name}="?([.0-9]+)"?\s*$/xms ) {
 		$data->{$property_name} += ( 1 * $1 );
 		return 1;
-	} ## end if ( $line =~ m/^${property_name}=(\S+)\s*$/xms)
+	}
 	return 0;
 } ## end sub parse_progress_data
 

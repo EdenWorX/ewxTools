@@ -45,6 +45,10 @@ allow_if_string_contains_single_quote = 1
 #  it has to wait until I have time to figure it out.)
 [-NamingConventions::Capitalization]
 
+# We work in pure ASCII, so this rule should be disabled as
+# it may lead to many false positives according to its POD.
+[-RegularExpressions::ProhibitEnumeratedClasses]
+
 # This one brings too many false positives
 [-ValuesAndExpressions::ProhibitAccessOfPrivateData]
 
