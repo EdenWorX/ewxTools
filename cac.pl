@@ -865,6 +865,7 @@ sub get_info_from_ffprobe {
 	log_debug( 'Calling: %s', ( join $SPACE, @fpcmd ) );
 
 	my @fplines = split /\n/ms, capture_cmd(@fpcmd);
+	can_work or return 0;
 
 	foreach my $line (@fplines) {
 		chomp $line;
@@ -1149,10 +1150,10 @@ sub parse_progress_data {
 } ## end sub parse_progress_data
 
 sub pid_exists {
-	my ($pid) = @_;
-	lock_data($work_data);
-	my $exists = defined( $work_data->{PIDs}{$pid} );
-	unlock_data($work_data);
+	my ( $data, $pid ) = @_;
+	lock_data($data);
+	my $exists = defined( $data->{PIDs}{$pid} );
+	unlock_data($data);
 	return $exists;
 } ## end sub pid_exists
 
@@ -1202,7 +1203,7 @@ sub remove_pid {
 
 	my $result = 1;
 
-	while ( can_work && ( 0 == reap_pid($pid) ) ) {
+	while ( 0 == reap_pid($pid) ) {
 		usleep(50);
 	}
 
@@ -1667,9 +1668,7 @@ sub wait_for_capture {
 	log_debug( 'Process %d forked out', $kid );
 
 	# Now wait for the result
-	while ( can_work && ( 0 == reap_pid($kid) ) ) {
-		usleep(50);
-	}
+	wait_for_pid_status( $kid, $work_data, $FF_FINISHED );
 
 	return 1;
 } ## end sub wait_for_capture
@@ -1697,13 +1696,10 @@ sub wait_for_startup {
 	log_debug( 'Have data? %s', ( defined($fork_data) && defined( $fork_data->{PIDs}{$pid} ) ) ? 'yes' : 'no' );
 
 	# Wait until the work data is initialized
-	lock_data($fork_data);
-	while ( defined($fork_data) && !( defined $fork_data->{PIDs}{$pid} ) ) {
-		unlock_data($fork_data);
+	while ( !pid_exists( $fork_data, $pid ) ) {
 		usleep(500);  # poll each half millisecond
-		lock_data($fork_data) and log_debug( 'Have data? %s', ( defined $fork_data->{PIDs}{$pid} ) ? 'yes' : 'no' );
+		log_debug( 'Have data? %s', pid_exists( $fork_data, $pid ) ? 'yes' : 'no' );
 	}
-	unlock_data($fork_data);
 
 	# Now we can tell the world that we are created
 	set_fork_status( $fork_data, $pid, $FF_CREATED );
@@ -1732,10 +1728,10 @@ sub watch_my_forks {
 		unlock_data($work_data);
 		$forks_active = 0;
 
-		can_work() or last;
+		can_work or last;
 
 		foreach my $pid (@PIDs) {
-			pid_exists($pid) or next;
+			pid_exists( $work_data, $pid ) or next;
 			$forks_active += handle_fork_progress( $pid, \%prgData, \%fork_timeout, \%fork_strikes );
 			usleep(0);
 		}
@@ -1748,8 +1744,8 @@ sub watch_my_forks {
 		unlock_data($work_data);
 
 		foreach my $pid (@PIDs) {
-			can_work()       or last;
-			pid_exists($pid) or next;
+			can_work                       or last;
+			pid_exists( $work_data, $pid ) or next;
 			handle_fork_strikes( $pid, \%fork_timeout, \%fork_strikes );
 		}
 
