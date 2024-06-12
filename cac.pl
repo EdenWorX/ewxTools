@@ -926,10 +926,14 @@ sub get_log_level {
 } ## end sub get_log_level
 
 sub get_pid_status {
-	my ($pid) = @_;
-	lock_data($work_data);
-	my $status = $work_data->{PIDs}{$pid}{status};
-	unlock_data($work_data);
+	my ( $data, $pid ) = @_;
+
+	( defined $data ) and ( defined $pid ) or return $FF_REAPED;
+
+	lock_data($data);
+	my $status = $data->{PIDs}{$pid}{status} // $FF_REAPED;
+	unlock_data($data);
+
 	return $status;
 } ## end sub get_pid_status
 
@@ -964,11 +968,10 @@ sub handle_fork_progress {
 sub handle_fork_strikes {
 	my ( $pid, $fork_timeout, $fork_strikes ) = @_;
 
-	my $status = get_pid_status($pid);
 	defined( $fork_timeout->{$pid} ) or $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
 	defined( $fork_strikes->{$pid} ) or $fork_strikes->{$pid} = 0;
 
-	if ( ( $fork_timeout->{$pid} <= 0 ) and ( $FF_RUNNING == $status ) ) {
+	if ( ( $fork_timeout->{$pid} <= 0 ) and ( $FF_RUNNING == get_pid_status( $work_data, $pid ) ) ) {
 		++$fork_strikes->{$pid};
 		$fork_strikes->{$pid} =
 		    ( $fork_strikes->{$pid} == 13 ) ? strike_fork_reap($pid)
@@ -1164,16 +1167,13 @@ sub reap_pid {
 	  or log_error( q{reap_pid(): BUG! '%s' is not a valid pid!}, $pid // 'undef' )
 	  and confess('FATAL BUG!');
 	defined( $work_data->{PIDs}{$pid} ) or return 1;
-	lock_data($work_data);
-	my $status = $work_data->{PIDs}{$pid}{status} // $FF_REAPED;
-	unlock_data($work_data);
-	( $FF_REAPED == $status ) and return 1;
+	( $FF_REAPED == get_pid_status( $work_data, $pid ) ) and return 1;
 
 	( 0 == ( waitpid $pid, POSIX::WNOHANG ) ) and return 0;  ## PID is still busy!
 
 	log_debug( '(reap_pid) PID %d finished', $pid );
 
-	set_fork_status( $work_data, $pid, $FF_REAPED );
+	set_pid_status( $work_data, $pid, $FF_REAPED );
 
 	return 1;
 } ## end sub reap_pid
@@ -1186,7 +1186,7 @@ sub reaper {
 
 	while ( ( my $pid = ( waitpid -1, POSIX::WNOHANG ) ) > 0 ) {
 		log_debug( '(reaper) KID %d finished [%s]', $pid, ( join q{,}, @args ) );
-		set_fork_status( $work_data, $pid, $FF_REAPED );
+		set_pid_status( $work_data, $pid, $FF_REAPED );
 	}
 
 	$SIG{CHLD} = \&reaper;
@@ -1330,31 +1330,31 @@ sub segment_source_group {
 
 sub send_forks_the_kill() {
 	lock_data($work_data);
-	foreach my $pid ( keys %{ $work_data->{PIDs} } ) {
-		if ( ( 1 == $death_note ) && ( $work_data->{PIDs}{$pid}{status} != $FF_REAPED ) ) {
+	my @PIDs = keys %{ $work_data->{PIDs} };
+	unlock_data($work_data);
+
+	foreach my $pid (@PIDs) {
+		if ( ( 1 == $death_note ) && ( $FF_REAPED != get_pid_status( $work_data, $pid ) ) ) {
 			log_warning( 'TERMing worker PID %d', $pid );
-			unlock_data($work_data);
 			terminator( $pid, 'TERM' );
-			lock_data($work_data);
-		} ## end if ( ( 1 == $death_note...))
+		}
 
 		# Note: 5 is after 2 seconds
-		elsif ( ( 5 == $death_note ) && ( $work_data->{PIDs}{$pid}{status} != $FF_REAPED ) ) {
+		elsif ( ( 5 == $death_note ) && ( $FF_REAPED != get_pid_status( $work_data, $pid ) ) ) {
 			log_warning( 'KILLing worker PID %d', $pid );
-			unlock_data($work_data);
 			terminator( $pid, 'KILL' );
-			lock_data($work_data);
-		} ## end elsif ( ( 5 == $death_note...))
-	} ## end foreach my $pid ( keys %{ $work_data...})
+		}
+	} ## end foreach my $pid (@PIDs)
+
 	++$death_note;
-	unlock_data($work_data);
+
 	return 1;
 } ## end sub send_forks_the_kill
 
-sub set_fork_status {
+sub set_pid_status {
 	my ( $data, $pid, $status ) = @_;
 
-	( defined $data ) or return 1;
+	( defined $data ) and ( defined $pid ) or return 1;
 
 	if ( lock_data($data) ) {
 		$data->{PIDs}{$pid}{status} = $status;
@@ -1362,7 +1362,7 @@ sub set_fork_status {
 	}
 
 	return 1;
-} ## end sub set_fork_status
+} ## end sub set_pid_status
 
 # Show data from between the last two "progress=<state>" lines in the given log file
 sub show_progress {
@@ -1420,7 +1420,7 @@ sub start_capture {
 	} ## end if ( lock_data($fork_data...))
 
 	# This fork is finished now
-	set_fork_status( $fork_data, $pid, $FF_FINISHED );
+	set_pid_status( $fork_data, $pid, $FF_FINISHED );
 
 	return 1;
 } ## end sub start_capture
@@ -1452,7 +1452,7 @@ sub start_forked {
 	} ## end if ( lock_data($fork_data...))
 
 	# This fork is finished now
-	set_fork_status( $fork_data, $pid, $FF_FINISHED );
+	set_pid_status( $fork_data, $pid, $FF_FINISHED );
 
 	return 1;
 } ## end sub start_forked
@@ -1480,7 +1480,7 @@ sub start_work {
 	wait_for_pid_status( $kid, $work_data, $FF_CREATED ) and usleep(0);
 
 	# Now the fork waits for the starting signal, let's hand it over
-	set_fork_status( $work_data, $kid, $FF_RUNNING );
+	set_pid_status( $work_data, $kid, $FF_RUNNING );
 	log_debug( 'Worker %d forked out as PID %d', $tid, $kid );
 
 	return $kid;
@@ -1515,15 +1515,15 @@ sub start_worker_fork {
 # -------------------------------------------------------------
 sub strike_fork_kill {
 	my ($pid) = @_;
-	lock_data($work_data);
-	if ( $work_data->{PIDs}{$pid}{status} == $FF_RUNNING ) {
+
+	if ( $FF_RUNNING == get_pid_status( $work_data, $pid ) ) {
 		log_warning( 'Sending SIGKILL to fork PID %d', $pid );
-		unlock_data($work_data);
 		terminator( $pid, 'KILL' );
 		return 7;
-	} ## end if ( $work_data->{PIDs...})
-	log_error( 'Fork PID %d is gone! Will restart...', $pid );
-	unlock_data($work_data);
+	}
+
+	log_info( 'Fork PID %d is gone! Will restart...', $pid );
+
 	return 13;  # Thread is already gone, start a new one.
 } ## end sub strike_fork_kill
 
@@ -1567,15 +1567,15 @@ sub strike_fork_restart {
 # -------------------------------------------------------------
 sub strike_fork_term {
 	my ($pid) = @_;
-	lock_data($work_data);
-	if ( $work_data->{PIDs}{$pid}{status} == $FF_RUNNING ) {
+
+	if ( $FF_RUNNING == get_pid_status( $work_data, $pid ) ) {
 		log_warning( 'Sending SIGTERM to frozen fork PID %d', $pid );
-		unlock_data($work_data);
 		terminator( $pid, 'TERM' );
 		return 1;
-	} ## end if ( $work_data->{PIDs...})
-	log_error( 'Fork PID %d is gone! Will restart...', $pid );
-	unlock_data($work_data);
+	}
+
+	log_info( 'Fork PID %d is gone! Will restart...', $pid );
+
 	return 13;  # Thread is already gone, start a new one.
 } ## end sub strike_fork_term
 
@@ -1599,16 +1599,13 @@ sub terminator {
 			usleep(100_000);
 			reap_pid($kid);
 		} else {
-			set_fork_status( $work_data, $kid, $FF_REAPED );
+			set_pid_status( $work_data, $kid, $FF_REAPED );
 		}
 	} else {
 		foreach my $pid ( keys %{ $work_data->{PIDs} } ) {
-			lock_data($work_data);
-			my $status = $work_data->{PIDs}{$pid}{status};
-			unlock_data($work_data);
-			( $FF_REAPED == $status ) or terminator( $pid, $signal );
-		} ## end foreach my $pid ( keys %{ $work_data...})
-	} ## end else [ if ( ($kid) > 0 ) ]
+			( $FF_REAPED == get_pid_status( $work_data, $pid ) ) or terminator( $pid, $signal );
+		}
+	}
 
 	return 1;
 } ## end sub terminator
@@ -1664,7 +1661,7 @@ sub wait_for_capture {
 	my ($kid) = @_;
 
 	wait_for_pid_status( $kid, $work_data, $FF_CREATED );
-	set_fork_status( $work_data, $kid, $FF_RUNNING );
+	set_pid_status( $work_data, $kid, $FF_RUNNING );
 	log_debug( 'Process %d forked out', $kid );
 
 	# Now wait for the result
@@ -1676,16 +1673,13 @@ sub wait_for_capture {
 sub wait_for_pid_status {
 	my ( $pid, $fork_data, $status ) = @_;
 
-	log_debug( 'Fork Status %d / %d', ( defined $fork_data->{PIDs}{$pid}{status} ) ? $fork_data->{PIDs}{$pid}{status} : -1, $status );
+	log_debug( 'Fork Status %d / %d', get_pid_status( $fork_data, $pid ), $status );
 
 	usleep(1);  ## A little "yield()" simulation
-	lock_data($fork_data);
-	while ( defined($fork_data) && ( $status != $fork_data->{PIDs}{$pid}{status} ) ) {
-		unlock_data($fork_data);
+	while ( $status != get_pid_status( $fork_data, $pid ) ) {
 		usleep(500);  # poll each half millisecond
-		lock_data($fork_data) and log_debug( 'Fork Status %d / %d', $fork_data->{PIDs}{$pid}{status}, $status );
+		log_debug( 'Fork Status %d / %d', get_pid_status( $fork_data, $pid ), $status );
 	}
-	unlock_data($fork_data);
 
 	return 1;
 } ## end sub wait_for_pid_status
@@ -1702,8 +1696,8 @@ sub wait_for_startup {
 	}
 
 	# Now we can tell the world that we are created
-	set_fork_status( $fork_data, $pid, $FF_CREATED );
-	( defined $fork_data ) and log_debug( 'Have data? yes (Status %d)', $fork_data->{PIDs}{$pid}{status} );
+	set_pid_status( $fork_data, $pid, $FF_CREATED );
+	log_debug( 'Have data? yes (Status %d)', get_pid_status( $fork_data, $pid ) );
 	usleep(1);
 
 	# Wait until we got started
