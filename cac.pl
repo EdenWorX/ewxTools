@@ -639,6 +639,18 @@ sub check_output_existence {
 	return 1;
 } ## end sub check_output_existence
 
+sub check_pid {
+	my ($pid) = @_;
+
+	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
+	  or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
+	  and confess('FATAL BUG!');
+
+	( defined $work_data->{PIDs}{$pid} ) or return 0;
+
+	return 1;
+} ## end sub check_pid
+
 sub check_source_and_target {
 	my ( $errCount, $have_source, $have_target ) = @_;
 
@@ -991,6 +1003,25 @@ sub get_time_now {
 	return sprintf '%04d-%02d-%02d %02d:%02d:%02d', $tLocalTime[5] + 1900, $tLocalTime[4] + 1, $tLocalTime[3], $tLocalTime[2], $tLocalTime[1], $tLocalTime[0];
 }
 
+sub handle_eval_result {
+	my ( $res, $eval_err, $child_error, $p_exit_code, $p_exit_message ) = @_;
+
+	if ( length($eval_err) > 0 ) {
+		${$p_exit_code}    = -1;
+		${$p_exit_message} = $eval_err;
+	} elsif ( -1 != $child_error ) {
+		if ( $child_error & 0x7F ) {
+			${$p_exit_code}    = $child_error;
+			${$p_exit_message} = 'Killed by signal ' . ( $child_error & 0x7F );
+		} elsif ( $child_error >> 8 ) {
+			${$p_exit_code}    = $child_error >> 8;
+			${$p_exit_message} = 'Exited with error ' . ( $child_error >> 8 );
+		}
+	} ## end elsif ( -1 != $child_error)
+
+	return $res ? $res : $child_error;
+} ## end sub handle_eval_result
+
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout, $fork_strikes ) = @_;
 	my $result = 1;
@@ -1270,12 +1301,9 @@ sub reaper {
 
 sub remove_pid {
 	my ( $pid, $do_cleanup ) = @_;
-	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
-	  or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
-	  and confess('FATAL BUG!');
-	( defined $work_data->{PIDs}{$pid} ) or return 1;
-
 	my $result = 1;
+
+	check_pid($pid) or return 1;
 
 	while ( 0 == reap_pid($pid) ) {
 		usleep(50);
@@ -1494,14 +1522,17 @@ sub start_capture {
 	# Now we can run the command as desired
 	log_debug( '%s', join $SPACE, @{$cmd} );
 	my @stdout;
-	run3( $cmd, \undef, \@stdout, \&log_error, { return_if_system_error => 1 } );
+	my $exc = 0;
+	my $exm = $EMPTY;
+	my $res = eval { run3 $cmd, \undef, \@stdout, \&log_error };
+	$res = handle_eval_result( $res, $@, $?, \$exc, \$exm );
 
 	# We only have to "transport" the results:
 	if ( lock_data($fork_data) ) {
 		chomp @stdout;
 		$fork_data->{PIDs}{$pid}{result}    = join "\n", @stdout;
-		$fork_data->{PIDs}{$pid}{exit_code} = $?;
-		$fork_data->{PIDs}{$pid}{error_msg} = ( $? == -1 ) ? $! : $EMPTY;
+		$fork_data->{PIDs}{$pid}{exit_code} = $exc;
+		$fork_data->{PIDs}{$pid}{error_msg} = $exm;
 		unlock_data($fork_data);
 	} ## end if ( lock_data($fork_data...))
 
@@ -1512,7 +1543,7 @@ sub start_capture {
 } ## end sub start_capture
 
 sub start_forked {
-	my @cmd = @_;
+	my ($cmd) = @_;
 	my $pid = $$;
 
 	close_standard_io();
@@ -1526,15 +1557,18 @@ sub start_forked {
 	# Now we can run the command as desired
 	my @stdout;
 	my @stderr;
-	run3( \@cmd, \undef, \@stdout, \@stderr, { return_if_system_error => 1 } );
+	my $exc = 0;
+	my $exm = $EMPTY;
+	my $res = eval { run3 $cmd, \undef, \@stdout, \@stderr };
+	$res = handle_eval_result( $res, $@, $?, \$exc, \$exm );
 
 	# We only have to "transport" the results:
 	if ( lock_data($fork_data) ) {
 		chomp @stderr;
 		if ( defined $fork_data ) {
 			$fork_data->{PIDs}{$pid}{result}    = join "\n", @stdout;
-			$fork_data->{PIDs}{$pid}{exit_code} = $?;
-			$fork_data->{PIDs}{$pid}{error_msg} = ( $? == -1 ) ? $! : ( join "\n", @stderr );
+			$fork_data->{PIDs}{$pid}{exit_code} = $exc;
+			$fork_data->{PIDs}{$pid}{error_msg} = ( scalar @stderr > 0 ) ? ( join "\n", @stderr ) : $exm;
 		}
 		unlock_data($fork_data);
 	} ## end if ( lock_data($fork_data...))
@@ -1556,7 +1590,7 @@ sub start_work {
 	# Handle being the fork first
 	# =======================================
 	if ( 0 == $kid ) {
-		start_forked(@cmd);
+		start_forked( \@cmd );
 		POSIX::_exit(0);  ## Regular exit() would call main::END block
 	}
 
