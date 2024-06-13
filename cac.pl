@@ -135,8 +135,8 @@ my @FF_ARGS_CODEC_h264 = qw(
 my @FF_ARGS_CODEC_UTV  = qw( -codec:v utvideo -pred median );
 my @FF_ARGS_FILTER     = qw( -ignore_unknown -vf );
 my @FF_ARGS_FORMAT     = qw( -colorspace bt709 -color_range pc -pix_fmt yuv444p -f matroska -write_crc32 0 );
-my @FF_ARGS_INPUT_CUDA = qw( -loglevel level+warning -nostats -init_hw_device cuda:0 -colorspace bt709 -color_range pc -f concat -safe 0 -i );
-my @FF_ARGS_INPUT_VULK = qw( -loglevel level+warning -nostats -init_hw_device vulkan:0 -colorspace bt709 -color_range pc -i );
+my @FF_ARGS_INPUT_CUDA = qw( -loglevel level+warning -nostats -init_hw_device cuda -colorspace bt709 -color_range pc -f concat -safe 0 -i );
+my @FF_ARGS_INPUT_VULK = qw( -loglevel level+warning -nostats -init_hw_device vulkan -colorspace bt709 -color_range pc -i );
 my @FF_ARGS_START      = qw( -hide_banner -loglevel level+info -y );
 my @FF_CONCAT_BEGIN    = qw( -loglevel level+warning -nostats -f concat -safe 0 -i );
 my @FF_CONCAT_END      = qw( -map 0 -c copy );
@@ -255,6 +255,8 @@ END {
 	# Let's clean up and remove all temporary files, if this is "release" mode,
 	# or at least list all "orphaned" files if this is debug mode
 	if ( $work_done > 0 ) {
+		wait_for_all_forks();
+
 		foreach my $gid ( sort { $a <=> $b } keys %source_groups ) {
 			if ( -f $source_groups{$gid}{lst} ) {
 				( $do_debug > 0 ) and log_debug( 'See: %s', $source_groups{$gid}{lst} ) or unlink $source_groups{$gid}{lst};
@@ -643,7 +645,7 @@ sub check_pid {
 	my ($pid) = @_;
 
 	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
-	  or log_error( "remove_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
+	  or log_error( "BUG! '%s' is not a valid pid!", $pid // 'undef' )
 	  and confess('FATAL BUG!');
 
 	( defined $work_data->{PIDs}{$pid} ) or return 0;
@@ -1760,6 +1762,8 @@ sub warnHandler {
 }
 
 sub wait_for_all_forks {
+	my $result = 1;
+
 	lock_data( $work_data, LOCK_SH );
 	my @PIDs = ( sort keys %{ $work_data->{PIDs} } );
 	unlock_data($work_data);
@@ -1775,13 +1779,13 @@ sub wait_for_all_forks {
 			( 3000 == ++$msecs ) and terminator( $pid, 'TERM' ) or ( 6000 == $msecs ) and terminator( $pid, 'KILL' );
 		}
 
-		remove_pid( $pid, 1 );
+		remove_pid( $pid, 1 ) or $result = 0;
 
 	} ## end foreach my $pid (@PIDs)
 
 	log_debug('All PIDs ended.');
 
-	return 1;
+	return $result;
 } ## end sub wait_for_all_forks
 
 sub wait_for_capture {
