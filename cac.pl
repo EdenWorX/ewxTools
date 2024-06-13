@@ -60,8 +60,9 @@ my $work_data = IPC::Shareable->new( key => 'WORK_DATA', create => 1 );
 $work_data->{cnt}  = 0;
 $work_data->{PIDs} = {};
 
-Readonly my $EMPTY => q{};
-Readonly my $SPACE => q{ };
+Readonly my $EMPTY      => q{};
+Readonly my $SPACE      => q{ };
+Readonly my $EIGHTSPACE => q{        };  ## to blank the space for PID display
 
 # ---------------------------------------------------------
 # Logging facilities
@@ -900,17 +901,24 @@ sub get_info_from_ffprobe {
 } ## end sub get_info_from_ffprobe
 
 sub get_location {
-	my ( $caller, undef, undef, $lineno, $logger ) = @_;
+	my ( $caller, $lineno, $logger, $pid ) = @_;
 
 	( defined $lineno ) or $lineno = -1;
-	( defined $logger ) and $logger =~ m/^main::log_(info|warning|error|status|debug)$/xms
-	  or confess("get_location(): logMsg() called from wrong sub $logger");
+	if ( defined $logger ) {
+		$logger =~ m/^main::log_(info|warning|error|status|debug)$/xms or confess("get_location(): logMsg() called from wrong sub $logger");
+	}
 
 	my $subname = $caller // 'main';
 	$subname =~ s/^.*::([^:]+)$/$1/xms;
 	$subname =~ m/__ANON__/xmsi and $subname = 'AnonSub';
 
-	return ( $lineno > -1 ) ? ( sprintf '%d:%s()', $lineno, $subname ) : ( sprintf '%s', $subname );
+	my $fmt  = ( defined($pid) ? '[%5d] ' : $EIGHTSPACE ) . ( ( $lineno > -1 ) ? '%4d:%24s' : '%29s' );
+	my @args = ();
+	( defined $pid ) and push @args, $pid;
+	( $lineno > -1 ) and push @args, $lineno;
+	push @args, $subname;
+
+	return sprintf $fmt, @args;
 } ## end sub get_location
 
 sub get_log_level {
@@ -1076,9 +1084,12 @@ sub lock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	log_debug( '%s() try lock ...', ( caller 1 )[3] );
+	my @loginfo = caller 1;
+	my $stLoc   = get_location( $loginfo[3], $loginfo[2], undef, $$ );
+
+	log_debug( '%s try lock ...', $stLoc );
 	( defined $lock ) and $lock->lock or $result = 0;
-	log_debug( '%s() ==> LOCK [%d]', ( caller 1 )[3], $result );
+	log_debug( '%s ==> LOCK [%d]', $stLoc, $result );
 
 	return $result;
 } ## end sub lock_data
@@ -1094,8 +1105,8 @@ sub logMsg {
 	my $stLevel = get_log_level($lvl);
 	my $caller  = ( caller 2 )[3];
 	my @loginfo = caller 1;
-	my $stLoc   = get_location( $caller, @loginfo );
-	my $stMsg   = sprintf "[%5d]|%s|%s|%s|$fmt", $$, $stTime, $stLevel, $stLoc, @args;
+	my $stLoc   = get_location( $caller, $loginfo[2], $loginfo[3], $$ );
+	my $stMsg   = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, $stLoc, @args;
 
 	( 0 < ( length $logfile ) ) and write_to_log($stMsg);
 	( $LOG_DEBUG != $lvl ) and write_to_console($stMsg);
@@ -1637,7 +1648,10 @@ sub unlock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	log_debug( '%s() <== unlock', ( caller 1 )[3] );
+	my @loginfo = caller 1;
+	my $stLoc   = get_location( $loginfo[3], $loginfo[2], undef, $$ );
+
+	log_debug( '%s <== unlock', $stLoc );
 	( defined $lock ) and $lock->unlock or return 0;
 
 	return 1;
