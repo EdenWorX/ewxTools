@@ -5,7 +5,7 @@ use warnings FATAL => 'all';
 use PerlIO;
 use POSIX qw( _exit floor :sys_wait_h );
 use IPC::Run3;
-use IPC::Shareable qw( LOCK_SH );
+use IPC::Shareable qw( LOCK_EX LOCK_SH );
 use Carp;
 use Data::Dumper;
 use File::Basename;
@@ -912,7 +912,7 @@ sub get_location {
 	$subname =~ s/^.*::([^:]+)$/$1/xms;
 	$subname =~ m/__ANON__/xmsi and $subname = 'AnonSub';
 
-	my $fmt  = ( defined($pid) ? '[%5d] ' : $EIGHTSPACE ) . ( ( $lineno > -1 ) ? '%4d:%24s' : '%29s' );
+	my $fmt  = ( defined($pid) ? '[%5d] ' : $EIGHTSPACE ) . ( ( $lineno > -1 ) ? '%4d:%-24s' : '%-29s' );
 	my @args = ();
 	( defined $pid ) and push @args, $pid;
 	( $lineno > -1 ) and push @args, $lineno;
@@ -1081,7 +1081,7 @@ sub lock_data {
 	my $result = 1;
 
 	( defined $data ) or return 0;
-	( defined $flags ) or $flags = 0;
+	( defined $flags ) or $flags = LOCK_EX;
 
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
