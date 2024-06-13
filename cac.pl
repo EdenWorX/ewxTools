@@ -611,6 +611,15 @@ sub check_input_files {
 	return 1;
 } ## end sub check_input_files
 
+sub check_logger {
+	my ($logger) = @_;
+	if ( defined $logger ) {
+		$logger =~ m/^main::log_(info|warning|error|status|debug)$/xms
+		  or confess("get_location(): logMsg() called from wrong sub $logger");
+	}
+	return 1;
+} ## end sub check_logger
+
 sub check_output_existence {
 	my ($errCount) = @_;
 
@@ -849,6 +858,13 @@ sub format_bitrate {
 	return lc( human_readable_size($float) ) . 'bits/s';
 }
 
+sub format_caller {
+	my ($caller) = @_;
+	$caller =~ s/^.*::([^:]+)$/$1/xms;
+	$caller =~ m/__ANON__/xmsi and $caller = 'AnonSub';
+	return $caller;
+} ## end sub format_caller
+
 sub format_out_time {
 	my ($ms) = @_;
 	my $sec  = floor( $ms / 1_000_000 );
@@ -901,24 +917,42 @@ sub get_info_from_ffprobe {
 } ## end sub get_info_from_ffprobe
 
 sub get_location {
-	my ( $caller, $lineno, $logger, $pid ) = @_;
+	my ( $process_id, $log_trace_info, $call_trace_info, $prev_trace_info ) = @_;
 
-	( defined $lineno ) or $lineno = -1;
-	if ( defined $logger ) {
-		$logger =~ m/^main::log_(info|warning|error|status|debug)$/xms or confess("get_location(): logMsg() called from wrong sub $logger");
-	}
+	my $call_trace_line = -1;
+	my $call_trace_name;
+	my $prev_trace_line = -1;
+	my $prev_trace_name;
 
-	my $subname = $caller // 'main';
-	$subname =~ s/^.*::([^:]+)$/$1/xms;
-	$subname =~ m/__ANON__/xmsi and $subname = 'AnonSub';
+	( defined $call_trace_info ) or confess('get_location(): Called without callinfo!');
+	( defined $log_trace_info ) and check_logger( $log_trace_info->[3] );
 
-	my $fmt  = ( defined($pid) ? '[%5d] ' : $EIGHTSPACE ) . ( ( $lineno > -1 ) ? '%4d:%-24s' : '%-29s' );
+	( defined $call_trace_info )
+	  and ( $call_trace_name = format_caller( $call_trace_info->[3] // 'main' ) )
+	  and ( $call_trace_line = $call_trace_info->[2] // -1 );
+
+	( defined $prev_trace_info )
+	  and ( $prev_trace_name = format_caller( $prev_trace_info->[3] // 'main' ) )
+	  and ( $prev_trace_line = $prev_trace_info->[2] // -1 );
+
+	my $pid_format       = ( defined($process_id)      ? '[%5d] '    : $EIGHTSPACE );
+	my $line_format      = ( ( $call_trace_line > -1 ) ? '%4d:%-24s' : '%-29s' );
+	my $prev_info_format = (
+		defined($prev_trace_info)
+		? ( ( $prev_trace_line > -1 ) ? ' (From %4d:%s)' : ' (From %s)' )
+		: $EMPTY
+	);
+
+	my $format_string = $pid_format . $line_format . $prev_info_format;
+
 	my @args = ();
-	( defined $pid ) and push @args, $pid;
-	( $lineno > -1 ) and push @args, $lineno;
-	push @args, $subname;
+	( defined $process_id )   and push @args, $process_id;
+	( $call_trace_line > -1 ) and push @args, $call_trace_line;
+	push @args, $call_trace_name;
+	( $prev_trace_line > -1 )    and push @args, $prev_trace_line;
+	( defined $prev_trace_name ) and push @args, $prev_trace_name;
 
-	return sprintf $fmt, @args;
+	return sprintf $format_string, @args;
 } ## end sub get_location
 
 sub get_log_level {
@@ -1086,8 +1120,9 @@ sub lock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	my @loginfo = caller 1;
-	my $stLoc   = get_location( $loginfo[3], $loginfo[2], undef, $$ );
+	my @callinfo = caller 1;
+	my @preinfo  = caller 2;
+	my $stLoc    = get_location( undef, undef, \@callinfo, \@preinfo );
 
 	log_debug( '%s try lock ...', $stLoc );
 	( defined $lock ) and ( $result = $lock->lock($flags) ) or $result = 0;
@@ -1103,12 +1138,12 @@ sub logMsg {
 
 	( $LOG_DEBUG == $lvl ) and ( 0 == $do_debug ) and return 1;
 
-	my $stTime  = get_time_now();
-	my $stLevel = get_log_level($lvl);
-	my $caller  = ( caller 2 )[3];
-	my @loginfo = caller 1;
-	my $stLoc   = get_location( $caller, $loginfo[2], $loginfo[3], $$ );
-	my $stMsg   = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, $stLoc, @args;
+	my $stTime   = get_time_now();
+	my $stLevel  = get_log_level($lvl);
+	my @loginfo  = caller 1;
+	my @callinfo = caller 2;
+	my $stLoc    = get_location( $$, \@loginfo, \@callinfo );
+	my $stMsg    = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, $stLoc, @args;
 
 	( 0 < ( length $logfile ) ) and write_to_log($stMsg);
 	( $LOG_DEBUG != $lvl ) and write_to_console($stMsg);
@@ -1650,8 +1685,9 @@ sub unlock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	my @loginfo = caller 1;
-	my $stLoc   = get_location( $loginfo[3], $loginfo[2], undef, $$ );
+	my @callinfo = caller 1;
+	my @preinfo  = caller 2;
+	my $stLoc    = get_location( undef, undef, \@callinfo, \@preinfo );
 
 	log_debug( '%s <== unlock', $stLoc );
 	( defined $lock ) and $lock->unlock or return 0;
