@@ -548,7 +548,7 @@ sub capture_cmd {
 	# Handle being the fork first
 	# =======================================
 	if ( 0 == $kid ) {
-		start_capture(@cmd);
+		start_capture( \@cmd );
 		POSIX::_exit(0);  ## Regular exit() would call main::END block
 	}
 
@@ -930,9 +930,9 @@ sub get_pid_status {
 
 	( defined $data ) and ( defined $pid ) or return $FF_REAPED;
 
-	lock_data($data);
-	my $status = $data->{PIDs}{$pid}{status} // $FF_REAPED;
-	unlock_data($data);
+	my $is_locked = lock_data($data);
+	my $status    = $data->{PIDs}{$pid}{status} // $FF_REAPED;
+	( 1 == $is_locked ) and unlock_data($data);
 
 	return $status;
 } ## end sub get_pid_status
@@ -1069,15 +1069,18 @@ sub lock_data {
 		#@type IPC::Shareable
 		$data
 	) = @_;
+	my $result = 1;
 
 	( defined $data ) or return 0;
 
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	( defined $lock ) and $lock->lock or return 0;
+	log_debug( '%s() try lock ...', ( caller 1 )[3] );
+	( defined $lock ) and $lock->lock or $result = 0;
+	log_debug( '%s() ==> LOCK [%d]', ( caller 1 )[3], $result );
 
-	return 1;
+	return $result;
 } ## end sub lock_data
 
 sub logMsg {
@@ -1092,7 +1095,7 @@ sub logMsg {
 	my $caller  = ( caller 2 )[3];
 	my @loginfo = caller 1;
 	my $stLoc   = get_location( $caller, @loginfo );
-	my $stMsg   = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, $stLoc, @args;
+	my $stMsg   = sprintf "[%5d]|%s|%s|%s|$fmt", $$, $stTime, $stLevel, $stLoc, @args;
 
 	( 0 < ( length $logfile ) ) and write_to_log($stMsg);
 	( $LOG_DEBUG != $lvl ) and write_to_console($stMsg);
@@ -1160,6 +1163,17 @@ sub pid_exists {
 	return $exists;
 } ## end sub pid_exists
 
+sub pid_status_to_str {
+	my ($status) = @_;
+
+	return
+	    ( $FF_REAPED == $status )   ? 'REAPED'
+	  : ( $FF_FINISHED == $status ) ? 'finished'
+	  : ( $FF_RUNNING == $status )  ? 'running'
+	  : ( $FF_CREATED == $status )  ? 'created'
+	  :                               '***unknown***';
+} ## end sub pid_status_to_str
+
 sub reap_pid {
 	my ($pid) = @_;
 
@@ -1171,9 +1185,9 @@ sub reap_pid {
 
 	( 0 == ( waitpid $pid, POSIX::WNOHANG ) ) and return 0;  ## PID is still busy!
 
-	log_debug( '(reap_pid) PID %d finished', $pid );
-
+	log_debug( '(reap_pid) KID %d finished', $pid );
 	set_pid_status( $work_data, $pid, $FF_REAPED );
+	log_debug( '(reap_pid) KID %d status set to %s', $pid, pid_status_to_str( get_pid_status( $work_data, $pid ) ) );
 
 	return 1;
 } ## end sub reap_pid
@@ -1187,6 +1201,7 @@ sub reaper {
 	while ( ( my $pid = ( waitpid -1, POSIX::WNOHANG ) ) > 0 ) {
 		log_debug( '(reaper) KID %d finished [%s]', $pid, ( join q{,}, @args ) );
 		set_pid_status( $work_data, $pid, $FF_REAPED );
+		log_debug( '(reaper) KID %d status set to %s', $pid, pid_status_to_str( get_pid_status( $work_data, $pid ) ) );
 	}
 
 	$SIG{CHLD} = \&reaper;
@@ -1356,10 +1371,10 @@ sub set_pid_status {
 
 	( defined $data ) and ( defined $pid ) or return 1;
 
-	if ( lock_data($data) ) {
-		$data->{PIDs}{$pid}{status} = $status;
-		unlock_data($work_data);
-	}
+	lock_data($data);
+	( defined $data ) and $data->{PIDs}{$pid}{status} = $status;
+	log_debug( 'PID %5d = %s', $pid, pid_status_to_str($status) );
+	unlock_data($work_data);
 
 	return 1;
 } ## end sub set_pid_status
@@ -1396,7 +1411,7 @@ sub show_progress {
 } ## end sub show_progress
 
 sub start_capture {
-	my @cmd = @_;
+	my ($cmd) = @_;
 	my $pid = $$;
 
 	close_standard_io();
@@ -1408,8 +1423,9 @@ sub start_capture {
 	wait_for_startup( $pid, $fork_data );
 
 	# Now we can run the command as desired
+	log_debug( '%s', join $SPACE, @{$cmd} );
 	my @stdout;
-	run3( \@cmd, \undef, \@stdout, \&log_error, { return_if_system_error => 1 } );
+	run3( $cmd, \undef, \@stdout, \&log_error, { return_if_system_error => 1 } );
 
 	# We only have to "transport" the results:
 	if ( lock_data($fork_data) ) {
@@ -1621,6 +1637,7 @@ sub unlock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
+	log_debug( '%s() <== unlock', ( caller 1 )[3] );
 	( defined $lock ) and $lock->unlock or return 0;
 
 	return 1;
@@ -1673,13 +1690,14 @@ sub wait_for_capture {
 sub wait_for_pid_status {
 	my ( $pid, $fork_data, $status ) = @_;
 
-	log_debug( 'Fork Status %d / %d', get_pid_status( $fork_data, $pid ), $status );
+	log_debug( '%s() === Fork Status %d / %d', ( caller 1 )[3], get_pid_status( $fork_data, $pid ), $status );
 
 	usleep(1);  ## A little "yield()" simulation
-	while ( $status != get_pid_status( $fork_data, $pid ) ) {
+	while ( $status > get_pid_status( $fork_data, $pid ) ) {
 		usleep(500);  # poll each half millisecond
-		log_debug( 'Fork Status %d / %d', get_pid_status( $fork_data, $pid ), $status );
+		log_debug( '%s() === Fork Status %d / %d', ( caller 1 )[3], get_pid_status( $fork_data, $pid ), $status );
 	}
+	log_debug( '%s() === Fork Status %d / %d reached -> ending wait', ( caller 1 )[3], get_pid_status( $fork_data, $pid ), $status );
 
 	return 1;
 } ## end sub wait_for_pid_status
