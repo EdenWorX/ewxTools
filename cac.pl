@@ -51,7 +51,8 @@ my $ret_global = 0;
 
 Readonly my $FF_CREATED  => 1;
 Readonly my $FF_RUNNING  => 2;
-Readonly my $FF_FINISHED => 3;
+Readonly my $FF_KILLED   => 3;
+Readonly my $FF_FINISHED => 4;
 Readonly my $FF_REAPED   => 5;
 
 #@type IPC::Shareable
@@ -216,7 +217,7 @@ analyze_all_inputs();
 
 # ---
 # --- 2) All input files per temp directory have to be grouped. Each group is then segmented
-# ---    Into four parts, so that four threads can do the interpolation in parallel per group.
+# ---    Into four parts, so that four forks can do the interpolation in parallel per group.
 # ---
 build_source_groups() or declare_single_source() or exit 7;
 segment_all_groups();
@@ -810,7 +811,7 @@ sub create_target_file {
 		@metaAudio = qw( -map_metadata 0 -metadata:s:a:0 title=Surround -metadata:s:a:0 language=eng -metadata:s:a:1 title=Stereo -metadata:s:a:1 language=eng );
 	}
 
-	# Building the four worker threads is quite trivial
+	# Building the worker fork is quite trivial
 	can_work() or return 1;
 	my @ffargs = (
 		$FF,                 @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
@@ -1053,7 +1054,9 @@ sub handle_fork_strikes {
 	defined( $fork_timeout->{$pid} ) or $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
 	defined( $fork_strikes->{$pid} ) or $fork_strikes->{$pid} = 0;
 
-	if ( ( $fork_timeout->{$pid} <= 0 ) and ( $FF_RUNNING == get_pid_status( $work_data, $pid ) ) ) {
+	if (   ( $fork_timeout->{$pid} <= 0 )
+		&& ( pid_shall_restart( $work_data, $pid ) || ( get_pid_status( $work_data, $pid ) < $FF_FINISHED ) ) )
+	{
 		++$fork_strikes->{$pid};
 		$fork_strikes->{$pid} =
 		    ( $fork_strikes->{$pid} == 13 ) ? strike_fork_reap($pid)
@@ -1064,7 +1067,7 @@ sub handle_fork_strikes {
 			my $kid = strike_fork_restart($pid);
 			$fork_timeout->{$kid} = $TIMEOUT_INTERVALS;
 			$fork_strikes->{$kid} = 0;
-			log_debug( 'Worker PID %d substituted PID %d', $kid, $pid );
+			log_warning( 'Worker PID %d substituted PID %d', $kid, $pid );
 		} ## end if ( $fork_strikes->{$pid...})
 	} ## end if ( ( $fork_timeout->...))
 
@@ -1097,7 +1100,7 @@ sub interpolate_source_group {
 	( defined $filter_string ) or confess('interpolate_source_group() called with undef filter string. Really???');
 	can_work()                 or return 1;
 
-	# Building the four worker threads is quite trivial
+	# Building the worker fork is quite trivial
 	can_work() or return 1;
 	for ( 0 .. 3 ) {
 		start_worker_fork( $gid, $_, $tmp_from, $tmp_to, "${B_in}${filter_string}${B_out}" ) or return 0;
@@ -1236,6 +1239,19 @@ sub make_filter_string {
 	  . "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}";
 } ## end sub make_filter_string
 
+sub mark_pid_restart {
+	my ( $data, $pid ) = @_;
+
+	( defined $data ) and ( defined $pid ) or return 1;
+
+	lock_data($data);
+	( defined $data ) and $work_data->{RESTART}{$pid} = 1;
+	log_debug( 'PID %5d marked for restart', $pid );
+	unlock_data($work_data);
+
+	return 1;
+} ## end sub mark_pid_restart
+
 sub parse_progress_data {
 	my ( $line, $property_name, $data ) = @_;
 	if ( $line =~ m/^${property_name}="?([.0-9]+)"?\s*$/xms ) {
@@ -1254,12 +1270,25 @@ sub pid_exists {
 	return $exists;
 } ## end sub pid_exists
 
+sub pid_shall_restart {
+	my ( $data, $pid ) = @_;
+
+	( defined $data ) and ( defined $pid ) or return 1;
+
+	my $is_locked = lock_data( $data, LOCK_SH );
+	my $result    = $work_data->{RESTART}{$pid} // 0;
+	( 1 == $is_locked ) and unlock_data($data);
+
+	return $result;
+} ## end sub pid_shall_restart
+
 sub pid_status_to_str {
 	my ($status) = @_;
 
 	return
 	    ( $FF_REAPED == $status )   ? 'REAPED'
 	  : ( $FF_FINISHED == $status ) ? 'finished'
+	  : ( $FF_KILLED == $status )   ? 'KILLED'
 	  : ( $FF_RUNNING == $status )  ? 'running'
 	  : ( $FF_CREATED == $status )  ? 'created'
 	  :                               '***unknown***';
@@ -1356,6 +1385,7 @@ sub remove_pid {
 	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;  ## shortcut including (defined check)
 	( length($prgfile) > 0 ) and ( -f $prgfile ) and unlink $prgfile;
 
+	delete( $work_data->{RESTART}{$pid} );
 	delete( $work_data->{PIDs}{$pid} );
 	--$work_data->{cnt};
 
@@ -1640,11 +1670,12 @@ sub start_worker_fork {
 sub strike_fork_kill {
 	my ($pid) = @_;
 
-	if ( $FF_RUNNING == get_pid_status( $work_data, $pid ) ) {
-		log_warning( 'Sending SIGKILL to fork PID %d', $pid );
+	if ( 0 == reap_pid($pid) ) {
 		terminator( $pid, 'KILL' );
+		( get_pid_status( $work_data, $pid ) < $FF_KILLED ) and set_pid_status( $work_data, $pid, $FF_KILLED );
+		mark_pid_restart( $work_data, $pid );
 		return 7;
-	}
+	} ## end if ( 0 == reap_pid($pid...))
 
 	log_info( 'Fork PID %d is gone! Will restart...', $pid );
 
@@ -1659,6 +1690,8 @@ sub strike_fork_reap {
 	while ( can_work && ( 0 == reap_pid($pid) ) ) {
 		usleep(50);
 	}
+
+	mark_pid_restart( $work_data, $pid );
 
 	return 13;
 } ## end sub strike_fork_reap
@@ -1692,11 +1725,12 @@ sub strike_fork_restart {
 sub strike_fork_term {
 	my ($pid) = @_;
 
-	if ( $FF_RUNNING == get_pid_status( $work_data, $pid ) ) {
-		log_warning( 'Sending SIGTERM to frozen fork PID %d', $pid );
+	if ( 0 == reap_pid($pid) ) {
 		terminator( $pid, 'TERM' );
+		( get_pid_status( $work_data, $pid ) < $FF_KILLED ) and set_pid_status( $work_data, $pid, $FF_KILLED );
+		mark_pid_restart( $work_data, $pid );
 		return 1;
-	}
+	} ## end if ( 0 == reap_pid($pid...))
 
 	log_info( 'Fork PID %d is gone! Will restart...', $pid );
 
@@ -1870,8 +1904,8 @@ sub watch_my_forks {
 		unlock_data($work_data);
 
 		foreach my $pid (@PIDs) {
-			can_work                       or last;
-			pid_exists( $work_data, $pid ) or next;
+			can_work or last;
+			pid_exists( $work_data, $pid ) or pid_shall_restart( $work_data, $pid ) or next;
 			handle_fork_strikes( $pid, \%fork_timeout, \%fork_strikes );
 		}
 
