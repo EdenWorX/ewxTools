@@ -999,7 +999,7 @@ sub handle_fork_progress {
 	defined( $prgData->{dup_frames} )  or $prgData->{dup_frames}  = 0;
 	defined( $prgData->{fps} )         or $prgData->{fps}         = 0.0;
 	defined( $prgData->{frames} )      or $prgData->{frames}      = 0;
-	defined( $prgData->{out_time} )    or $prgData->{out_time}    = 0;    ## "00:00:00.000000" in the file, but we read out_time_ms
+	defined( $prgData->{out_time_ms} ) or $prgData->{out_time_ms} = 0;    ## "00:00:00.000000" in the file, but we read out_time_ms
 	defined( $prgData->{total_size} )  or $prgData->{total_size}  = 0;
 
 	load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS or --$fork_timeout->{$pid};
@@ -1087,13 +1087,15 @@ sub load_progress {
 	my $i              = 0;
 	while ( ( $progress_count < 1 ) && ( $i < $lines_count ) ) {
 		chomp $last_20_lines[$i];
+		log_debug( "[RAW % 2d] Check '%s'", $i, $last_20_lines[$i] );
 		is_progress_line( $last_20_lines[$i] ) and ++$progress_count;
 		$i++;
-	}
+	} ## end while ( ( $progress_count...))
 
 	my @progress_field_names = qw( bitrate drop_frames dup_frames fps frame out_time_ms total_size );
 	while ( ( $progress_count < 2 ) && ( $i < $lines_count ) ) {
 		chomp $last_20_lines[$i];
+		log_debug( "[RAW % 2d] Check '%s'", $i, $last_20_lines[$i] );
 		if ( is_progress_line( $last_20_lines[$i] ) ) {
 			$progress_count++;
 		} else {
@@ -1197,6 +1199,7 @@ sub make_filter_string {
 sub parse_progress_data {
 	my ( $line, $property_name, $data ) = @_;
 	if ( $line =~ m/^${property_name}="?([.0-9]+)"?\s*$/xms ) {
+		log_debug( "${EIGHTSPACE}==> %s=%f", $property_name, $1 );
 		$data->{$property_name} += ( 1 * $1 );
 		return 1;
 	}
@@ -1248,9 +1251,10 @@ sub reaper {
 
 	while ( ( my $pid = ( waitpid -1, POSIX::WNOHANG ) ) > 0 ) {
 		log_debug( '(reaper) KID %d finished [%s]', $pid, ( join q{,}, @args ) );
-		set_pid_status( $work_data, $pid, $FF_REAPED );
-		log_debug( '(reaper) KID %d status set to %s', $pid, pid_status_to_str( get_pid_status( $work_data, $pid ) ) );
-	}
+		( defined $work_data ) and $work_data->{PIDs}{$pid}{status} = $FF_REAPED;
+		log_debug( '(reaper) KID %d status set to %s', $pid, pid_status_to_str( $work_data->{PIDs}{$pid}{status} // -1 ) );
+		## Note: Do not try to lock within a signal handler!
+	} ## end while ( ( my $pid = ( waitpid...)))
 
 	$SIG{CHLD} = \&reaper;
 
@@ -1433,7 +1437,7 @@ sub show_progress {
 
 	# Formualate the progress line
 	my $size_str     = human_readable_size( $prgData->{total_size} // 0 );
-	my $time_str     = format_out_time( $prgData->{out_time}       // 0 );
+	my $time_str     = format_out_time( $prgData->{out_time_ms}    // 0 );
 	my $bitrate_str  = format_bitrate( ( $prgData->{bitrate} // 0.0 ) / $thr_count );                               ## Average, not the sum.
 	my $progress_str = sprintf '[%d/%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ',
 	  $thr_active, $thr_count,
