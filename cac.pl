@@ -5,7 +5,7 @@ use warnings FATAL => 'all';
 use PerlIO;
 use POSIX qw( _exit floor :sys_wait_h );
 use IPC::Run3;
-use IPC::Shareable qw( :lock );
+use IPC::Shareable qw( LOCK_SH );
 use Carp;
 use Data::Dumper;
 use File::Basename;
@@ -562,7 +562,7 @@ sub capture_cmd {
 	wait_for_capture($kid);
 
 	# Handle result:
-	lock_data($work_data);
+	lock_data( $work_data, LOCK_SH );
 	if ( 0 != $work_data->{PIDs}{$kid}{exit_code} ) {
 		log_error( q{Command '%s' FAILED [%d] : %s}, join( $SPACE, @cmd ), $work_data->{PIDs}{$kid}{exit_code}, $work_data->{PIDs}{$kid}{result} );
 		unlock_data($work_data);
@@ -938,7 +938,7 @@ sub get_pid_status {
 
 	( defined $data ) and ( defined $pid ) or return $FF_REAPED;
 
-	my $is_locked = lock_data($data);
+	my $is_locked = lock_data( $data, LOCK_SH );
 	my $status    = $data->{PIDs}{$pid}{status} // $FF_REAPED;
 	( 1 == $is_locked ) and unlock_data($data);
 
@@ -1075,11 +1075,13 @@ sub load_progress {
 sub lock_data {
 	my (
 		#@type IPC::Shareable
-		$data
+		$data,
+		$flags
 	) = @_;
 	my $result = 1;
 
 	( defined $data ) or return 0;
+	( defined $flags ) or $flags = 0;
 
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
@@ -1088,10 +1090,10 @@ sub lock_data {
 	my $stLoc   = get_location( $loginfo[3], $loginfo[2], undef, $$ );
 
 	log_debug( '%s try lock ...', $stLoc );
-	( defined $lock ) and $lock->lock or $result = 0;
-	log_debug( '%s ==> LOCK [%d]', $stLoc, $result );
+	( defined $lock ) and ( $result = $lock->lock($flags) ) or $result = 0;
+	log_debug( '%s ==> LOCK [%d]', $stLoc, $result // 'undef' );
 
-	return $result;
+	return $result // 0;
 } ## end sub lock_data
 
 sub logMsg {
@@ -1168,7 +1170,7 @@ sub parse_progress_data {
 
 sub pid_exists {
 	my ( $data, $pid ) = @_;
-	lock_data($data);
+	lock_data( $data, LOCK_SH );
 	my $exists = defined( $data->{PIDs}{$pid} );
 	unlock_data($data);
 	return $exists;
@@ -1355,7 +1357,7 @@ sub segment_source_group {
 } ## end sub segment_source_group
 
 sub send_forks_the_kill() {
-	lock_data($work_data);
+	lock_data( $work_data, LOCK_SH );
 	my @PIDs = keys %{ $work_data->{PIDs} };
 	unlock_data($work_data);
 
@@ -1572,7 +1574,7 @@ sub strike_fork_restart {
 	my ($pid) = @_;
 	log_warning( 'Re-starting frozen Fork %d', $pid );
 
-	lock_data($work_data);
+	lock_data( $work_data, LOCK_SH );
 	my @args = @{ $work_data->{PIDs}{$pid}{args} };
 	unlock_data($work_data);
 
@@ -1664,7 +1666,7 @@ sub warnHandler {
 }
 
 sub wait_for_all_forks {
-	lock_data($work_data);
+	lock_data( $work_data, LOCK_SH );
 	my @PIDs = ( sort keys %{ $work_data->{PIDs} } );
 	unlock_data($work_data);
 
@@ -1738,7 +1740,7 @@ sub wait_for_startup {
 
 # This is a watchdog function that displays progress and joins all threads nicely if needed
 sub watch_my_forks {
-	lock_data($work_data);
+	lock_data( $work_data, LOCK_SH );
 	my $result       = 1;
 	my $forks_active = $work_data->{cnt};
 	my %fork_timeout = ();
@@ -1748,7 +1750,7 @@ sub watch_my_forks {
 
 	while ( $forks_active > 0 ) {
 		my %prgData;
-		lock_data($work_data);
+		lock_data( $work_data, LOCK_SH );
 		my @PIDs     = sort keys %{ $work_data->{PIDs} };
 		my $fork_cnt = $work_data->{cnt};
 		unlock_data($work_data);
@@ -1765,7 +1767,7 @@ sub watch_my_forks {
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
 		( $death_note > 0 ) and send_forks_the_kill();
 
-		lock_data($work_data);
+		lock_data( $work_data, LOCK_SH );
 		@PIDs = sort keys %{ $work_data->{PIDs} };
 		unlock_data($work_data);
 
