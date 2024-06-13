@@ -294,6 +294,7 @@ sub add_pid {
 	$work_data->{PIDs}{$pid} = {
 		args      => [],     ## Shall be added by the caller as a reference
 		exit_code => 0,
+		error_msg => $EMPTY,
 		id        => 0,
 		prgfile   => $EMPTY,
 		result    => $EMPTY,
@@ -564,10 +565,16 @@ sub capture_cmd {
 	# Handle result:
 	lock_data( $work_data, LOCK_SH );
 	if ( 0 != $work_data->{PIDs}{$kid}{exit_code} ) {
-		log_error( q{Command '%s' FAILED [%d] : %s}, join( $SPACE, @cmd ), $work_data->{PIDs}{$kid}{exit_code}, $work_data->{PIDs}{$kid}{result} );
+		log_error(
+			"Command '%s' FAILED [%d] :\nSTDOUT: %s\nSTDERR: %s",
+			join( $SPACE, @cmd ),
+			$work_data->{PIDs}{$kid}{exit_code},
+			$work_data->{PIDs}{$kid}{result},
+			$work_data->{PIDs}{$kid}{error_msg}
+		);
 		unlock_data($work_data);
 		croak('capture_cmd() crashed');
-	}
+	} ## end if ( 0 != $work_data->...)
 
 	my $result = $work_data->{PIDs}{$kid}{result};
 	unlock_data($work_data);
@@ -1054,13 +1061,13 @@ sub interpolate_source_group {
 		return 0;
 	}
 
-	( defined $filter_string ) or $filter_string = $EMPTY;
-	can_work() or return 1;
+	( defined $filter_string ) or confess('interpolate_source_group() called with undef filter string. Really???');
+	can_work()                 or return 1;
 
 	# Building the four worker threads is quite trivial
 	can_work() or return 1;
 	for ( 0 .. 3 ) {
-		start_worker_fork( $gid, $_, $tmp_from, $tmp_to, $filter_string ) or return 0;
+		start_worker_fork( $gid, $_, $tmp_from, $tmp_to, "${B_in}${filter_string}${B_out}" ) or return 0;
 	}
 
 	# Watch and join
@@ -1191,9 +1198,9 @@ sub make_filter_string {
 	my $F_out_scale   = "scale='flags=accurate_rnd+full_chroma_inp+full_chroma_int:in_range=full:out_range=full'";
 	my $F_interpolate = "libplacebo='extra_opts=preset=high_quality:frame_mixer=" . ( ( 'iup' eq $tmp_to ) ? 'mitchell_clamp' : 'oversample' ) . ":fps=${tgt_fps}'";
 	return
-	    "${B_in}${F_in_scale}"
+	    "${F_in_scale}"
 	  . ( ( 'iup' eq $tmp_to ) ? "${B_FPS}${F_scale_FPS}" : $EMPTY )
-	  . "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}${B_out}";
+	  . "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}";
 } ## end sub make_filter_string
 
 sub parse_progress_data {
@@ -1279,14 +1286,23 @@ sub remove_pid {
 	# If we shall clean up source and maybe target files, do so now
 	if ( 1 == $do_cleanup ) {
 		log_debug( 'args      => %d', scalar @{ $work_data->{PIDs}{$pid}{args} // [] } );
-		log_debug( 'exit_code => %d', $work_data->{PIDs}{$pid}{exit_code} // -1 );
+		log_debug( 'exit_code => %d', $work_data->{PIDs}{$pid}{exit_code} // 0 );
 		log_debug( 'id        => %d', $work_data->{PIDs}{$pid}{id}        // -1 );
 		log_debug( 'prgfile   => %s', $work_data->{PIDs}{$pid}{prgfile}   // 'undef' );
-		log_debug( 'result    => %s', $work_data->{PIDs}{$pid}{result}    // 'undef' );
 		log_debug( 'source    => %s', $work_data->{PIDs}{$pid}{source}    // 'undef' );
 		log_debug( 'target    => %s', $work_data->{PIDs}{$pid}{target}    // 'undef' );
-		if ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) {
-			log_error( 'Worker PID %d FAILED [%d] %s', $pid, $work_data->{PIDs}{$pid}{exit_code}, $work_data->{PIDs}{$pid}{result} );
+		log_debug( 'STDOUT    => %s', $work_data->{PIDs}{$pid}{result}    // 'undef' );
+		log_debug( 'STDERR    => %s', $work_data->{PIDs}{$pid}{error_msg} // 'undef' );
+
+		if (   ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) )
+			|| ( defined( $work_data->{PIDs}{$pid}{error_msg} ) && ( length( $work_data->{PIDs}{$pid}{error_msg} ) > 0 ) ) )
+		{
+			log_error(
+				"Worker PID %d FAILED [%d]:\n%s",
+				$pid,
+				$work_data->{PIDs}{$pid}{exit_code},
+				( length( $work_data->{PIDs}{$pid}{error_msg} ) > 0 ) ? $work_data->{PIDs}{$pid}{error_msg} : $work_data->{PIDs}{$pid}{result}
+			);
 
 			# We do not need the target file any more, the thread failed! (if an fmt is set)
 			if ( ( 0 == $do_debug ) && ( length( $work_data->{PIDs}{$pid}{target} ) > 0 ) ) {
@@ -1295,7 +1311,7 @@ sub remove_pid {
 				-f $f and unlink $f;
 			}
 			$result = 0;  ## We _did_ fail!
-		} ## end if ( defined( $work_data...))
+		} ## end if ( ( defined( $work_data...)))
 
 		# We do not need the source file any more (if an fmt is set)
 		if ( ( 0 == $do_debug ) && defined( $work_data->{PIDs}{$pid}{source} ) && ( length( $work_data->{PIDs}{$pid}{source} ) > 0 ) ) {
@@ -1450,6 +1466,7 @@ sub show_progress {
 	if ( 0 < $log_as_info ) {
 
 		# Write into log file
+		$have_progress_msg = 0;  ## ( We already deleted the line above, leaving it at 1 would add a useless empty line. )
 		log_info( '%s', $progress_str );
 	} else {
 
@@ -1483,7 +1500,8 @@ sub start_capture {
 	if ( lock_data($fork_data) ) {
 		chomp @stdout;
 		$fork_data->{PIDs}{$pid}{result}    = join "\n", @stdout;
-		$fork_data->{PIDs}{$pid}{exit_code} = 0 + ( $? == -1 ? $! : $? );
+		$fork_data->{PIDs}{$pid}{exit_code} = $?;
+		$fork_data->{PIDs}{$pid}{error_msg} = ( $? == -1 ) ? $! : $EMPTY;
 		unlock_data($fork_data);
 	} ## end if ( lock_data($fork_data...))
 
@@ -1506,15 +1524,17 @@ sub start_forked {
 	wait_for_startup( $pid, $fork_data );
 
 	# Now we can run the command as desired
+	my @stdout;
 	my @stderr;
-	run3( \@cmd, \undef, \undef, \@stderr, { return_if_system_error => 1 } );
+	run3( \@cmd, \undef, \@stdout, \@stderr, { return_if_system_error => 1 } );
 
 	# We only have to "transport" the results:
 	if ( lock_data($fork_data) ) {
 		chomp @stderr;
 		if ( defined $fork_data ) {
-			$fork_data->{PIDs}{$pid}{result}    = join "\n", @stderr;
-			$fork_data->{PIDs}{$pid}{exit_code} = 0 + ( $? == -1 ? $! : $? );
+			$fork_data->{PIDs}{$pid}{result}    = join "\n", @stdout;
+			$fork_data->{PIDs}{$pid}{exit_code} = $?;
+			$fork_data->{PIDs}{$pid}{error_msg} = ( $? == -1 ) ? $! : ( join "\n", @stderr );
 		}
 		unlock_data($fork_data);
 	} ## end if ( lock_data($fork_data...))
