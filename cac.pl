@@ -629,7 +629,7 @@ sub capture_cmd {
 
 	# Handle result:
 	lock_data( $work_data, LOCK_SH );
-	if ( 0 != $work_data->{PIDs}{$kid}{exit_code} ) {
+	if ( defined( $work_data->{PIDs}{$kid}{exit_code} ) && ( 0 != $work_data->{PIDs}{$kid}{exit_code} ) ) {
 		log_error(
 			$work_data,
 			"Command '%s' FAILED [%d] :\nSTDOUT: %s\nSTDERR: %s",
@@ -640,7 +640,7 @@ sub capture_cmd {
 		);
 		unlock_data($work_data);
 		croak('capture_cmd() crashed');
-	} ## end if ( 0 != $work_data->...)
+	} ## end if ( defined( $work_data...))
 
 	my $result = $work_data->{PIDs}{$kid}{result};
 	unlock_data($work_data);
@@ -935,8 +935,9 @@ sub declare_single_source {
 sub dieHandler {
 	my ($err) = @_;
 	$ret_global = 42;
-	return log_error( undef, '%s', $err );
-}
+	log_error( undef, '%s', $err );
+	confess('Program died');
+} ## end sub dieHandler
 
 sub file_exists {
 	my ($file) = @_;
@@ -1827,8 +1828,8 @@ sub strike_fork_restart {
 
 		lock_data( $work_data, LOCK_SH );
 		my $prgLog        = $work_data->{PIDs}{$pid}{prgfile};
-		my $file_from     = $work_data->{PIDs}{$pid}{source};
-		my $file_to       = $work_data->{PIDs}{$pid}{target};
+		my $file_from     = sprintf $work_data->{PIDs}{$pid}{source}, $tid;
+		my $file_to       = sprintf $work_data->{PIDs}{$pid}{target}, $tid;
 		my $filter_string = make_filter_string($inter_opts);
 		my $ffargs        = [
 			$FF,                 @FF_ARGS_START, '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
