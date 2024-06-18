@@ -505,8 +505,8 @@ sub analyze_stream_info {
 
 sub assemble_output {
 	can_work() or return 1;
-	my $lstfile = sprintf '%s/temp_%d_src.lst', dirname($path_target), $tmp_pid;
-	my $prgfile = sprintf '%s/temp_%d_prg.log', dirname($path_target), $tmp_pid;
+	my $lstfile = sprintf 'temp_%d_src.lst', $tmp_pid;
+	my $prgfile = sprintf 'temp_%d_prg.log', $tmp_pid;
 	my $mapfile = $path_target;
 	$mapfile =~ s/[.]mkv$/.wav/ms;
 
