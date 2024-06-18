@@ -149,6 +149,11 @@ my @FF_ARGS_START      = qw( -hide_banner -loglevel level+info -y );
 my @FF_CONCAT_BEGIN    = qw( -loglevel level+warning -nostats -f concat -safe 0 -i );
 my @FF_CONCAT_END      = qw( -map 0 -c copy );
 my @FP_ARGS            = qw( -hide_banner -loglevel error -v quiet -show_format -of flat=s=_ -show_entries );
+my %FF_INTERPOLATE_fmt = (
+	'iup' => [ "libplacebo='extra_opts=preset=high_quality:frame_mixer=none:fps=%d'", "minterpolate='fps=%d:mi_mode=dup:scd=none'" ],
+	'idn' =>
+	  [ "libplacebo='extra_opts=preset=high_quality:frame_mixer=mitchell_clamp:fps=%d'", "minterpolate='fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'" ]
+);
 
 my %dir_stats        = ();                ## <dir> => { has_space => <what df says>, need_space => wll inputs in there x 50, srcs => @src }
 my $do_print_help    = 0;
@@ -236,9 +241,16 @@ check_target_fps();
 can_work() and log_info( $work_data, 'Interpolating segments up to %d FPS...', $max_fps );
 foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	can_work() or last;
-	my $filter_string = make_filter_string( 'iup', 7, 0.5, $max_fps );
-	interpolate_source_group( $groupID, 'tmp', 'iup', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 9;
-}
+	my $inter_opts = {
+		'src'      => 'tmp',
+		'tgt'      => 'iup',
+		'dec_max'  => 7,
+		'dec_frac' => 0.5,
+		'fps'      => $max_fps,
+		'do_alt'   => 0
+	};
+	interpolate_source_group( $groupID, $inter_opts ) or exit 9;
+} ## end foreach my $groupID ( sort ...)
 
 # ---
 # --- 4) Then all groups segments have to be decimated and interpolated down to target fps (round 2)
@@ -246,9 +258,16 @@ foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 can_work() and log_info( $work_data, 'Interpolating segments down to %d FPS...', $target_fps );
 foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	can_work() or last;
-	my $filter_string = make_filter_string( 'iup', 3, 0.667, $target_fps );
-	interpolate_source_group( $groupID, 'iup', 'idn', "pad=ceil(iw/2)*2:ceil(ih/2)*2,${filter_string}" ) or exit 10;
-}
+	my $inter_opts = {
+		'src'      => 'iup',
+		'tgt'      => 'idn',
+		'dec_max'  => 3,
+		'dec_frac' => 0.667,
+		'fps'      => $target_fps,
+		'do_alt'   => 0
+	};
+	interpolate_source_group( $groupID, $inter_opts ) or exit 10;
+} ## end foreach my $groupID ( sort ...)
 
 # ---
 # --- 5) And finally we can put all the latest temp files together and create the target vid
@@ -294,6 +313,21 @@ exit $ret_global;
 # ================ FUNCTION IMPLEMENTATION ================
 # ---------------------------------------------------------
 
+##
+# @brief Add a process ID to work_data.
+#
+# @param $pid A valid process ID. This function will throw a confess() if an invalid PID is added.
+#
+# @return Always returns 1.
+#
+# @details This subroutine adds a process ID to the `work_data` hash.
+#          It initializes the process ID with some default data including args, exit code,
+#          error message, program file, result, status, source and target.
+#          It also increments the `work_data->{cnt}` by 1.
+#          If the process ID is already present in work_data, the subroutine will throw a confess().
+#
+# @warning This subroutine should be used cautiously as it does modify the global `work_data` structure.
+#
 sub add_pid {
 	my ($pid) = @_;
 	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
@@ -317,6 +351,27 @@ sub add_pid {
 	return 1;
 } ## end sub add_pid
 
+##
+#  @brief This subroutine analyzes all input data sources.
+#
+#  @details This routine starts by checking if the system can work using can_work() subroutine.
+#           If it can work, it will then loop over each source in @path_source array. For each source,
+#           it assesses its size and prepares source information including avg_frame_rate, dir, duration,
+#           etc.
+#           It also links each source id with its related source in the $source_ids hash.
+#           Each source is then analyzed using the analyze_input() subroutine.
+#
+#  @return Returns a flag (1) to indicate successful execution (standard Perl true). If the system can't
+#          work, the routine will terminate early, returning 1. If a source can't be analyzed, the routine
+#          will exit with status code 6.
+#
+#  @warning This subroutine exits the program with status code 6 in case of error during individual source
+#           analysis.
+#
+#  @note This subroutine uses a variety of Perl built-ins and external functions for its operation.
+#
+#  @param None.
+#
 sub analyze_all_inputs {
 	can_work() or return 1;
 	my $pathID = 0;  ## Counter for the source id hash
@@ -1105,7 +1160,7 @@ sub human_readable_size {
 } ## end sub human_readable_size
 
 sub interpolate_source_group {
-	my ( $gid, $tmp_from, $tmp_to, $filter_string ) = @_;
+	my ( $gid, $inter_opts ) = @_;
 	can_work() or return 1;
 
 	if ( !( defined $source_groups{$gid} ) ) {
@@ -1113,13 +1168,10 @@ sub interpolate_source_group {
 		return 0;
 	}
 
-	( defined $filter_string ) or confess('interpolate_source_group() called with undef filter string. Really???');
-	can_work()                 or return 1;
-
 	# Building the worker fork is quite trivial
-	can_work() or return 1;
 	for ( 0 .. 3 ) {
-		start_worker_fork( $gid, $_, $tmp_from, $tmp_to, "${B_in}${filter_string}${B_out}" ) or return 0;
+		can_work()                                 or return 1;
+		start_worker_fork( $gid, $_, $inter_opts ) or return 0;
 	}
 
 	# Watch and join
@@ -1256,18 +1308,25 @@ sub log_debug {
 }
 
 sub make_filter_string {
-	my ( $tmp_to, $dec_max, $dec_frac, $tgt_fps ) = @_;
-	can_work() or return 1;
+	my ($inter_opts) = @_;
+	my $tgt          = $inter_opts->{'tgt'};
+	my $dec_max      = $inter_opts->{'dec_max'};
+	my $dec_frac     = $inter_opts->{'dec_frac'};
+	my $tgt_fps      = $inter_opts->{'fps'};
+	my $do_alt       = $inter_opts->{'do_alt'};
+	( defined $do_alt ) and ( ( 0 == $do_alt ) or ( 1 == $do_alt ) ) or confess("do_alt $do_alt out of range! (0/1)");
+	can_work()                                                       or return 1;
 
 	# Prepare filter components
 	my $F_in_scale    = "scale='in_range=full:out_range=full'";
 	my $F_scale_FPS   = "fps=${tgt_fps}:round=near";
 	my $F_mpdecimate  = "mpdecimate='max=${dec_max}:frac=${dec_frac}'";
 	my $F_out_scale   = "scale='flags=accurate_rnd+full_chroma_inp+full_chroma_int:in_range=full:out_range=full'";
-	my $F_interpolate = "libplacebo='extra_opts=preset=high_quality:frame_mixer=" . ( ( 'iup' eq $tmp_to ) ? 'mitchell_clamp' : 'oversample' ) . ":fps=${tgt_fps}'";
+	my $F_interpolate = sprintf $FF_INTERPOLATE_fmt{$tgt}[$do_alt], $tgt_fps;
+
 	return
-	    "${F_in_scale}"
-	  . ( ( 'iup' eq $tmp_to ) ? "${B_FPS}${F_scale_FPS}" : $EMPTY )
+	    "pad=ceil(iw/2)*2:ceil(ih/2)*2,${F_in_scale}"
+	  . ( ( 'iup' eq $tgt ) ? "${B_FPS}${F_scale_FPS}" : $EMPTY )
 	  . "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}";
 } ## end sub make_filter_string
 
@@ -1688,14 +1747,18 @@ sub start_work {
 } ## end sub start_work
 
 sub start_worker_fork {
-	my ( $gid, $i, $tmp_from, $tmp_to, $F_assembled ) = @_;
+	my ( $gid, $i, $inter_opts ) = @_;
 
-	my $prgLog    = sprintf $source_groups{$gid}{prg}, $i;
-	my $file_from = sprintf $source_groups{$gid}{$tmp_from}, $i;
-	my $file_to   = sprintf $source_groups{$gid}{$tmp_to},   $i;
-	my $ffargs    = [
-		$FF, @FF_ARGS_START, '-progress', $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-		@FF_ARGS_INPUT_VULK, $file_from, @FF_ARGS_ACOPY_FIL, $F_assembled, '-fps_mode', 'cfr', @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
+	my $source        = $inter_opts->{'src'};
+	my $target        = $inter_opts->{'tgt'};
+	my $prgLog        = sprintf $source_groups{$gid}{prg}, $i;
+	my $file_from     = sprintf $source_groups{$gid}{$source}, $i;
+	my $file_to       = sprintf $source_groups{$gid}{$target}, $i;
+	my $filter_string = make_filter_string($inter_opts);
+	my $ffargs        = [
+		$FF,                 @FF_ARGS_START, '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_ARGS_INPUT_VULK, $file_from,     @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
+		'-fps_mode',         'cfr',          @FF_ARGS_FORMAT,    @FF_ARGS_CODEC_UTV, $file_to
 	];
 
 	log_debug( $work_data, "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @{$ffargs} ) );
@@ -1704,9 +1767,10 @@ sub start_worker_fork {
 	lock_data($work_data);
 	$work_data->{PIDs}{$pid}{args}    = $ffargs;
 	$work_data->{PIDs}{$pid}{id}      = $i;
+	$work_data->{PIDs}{$pid}{interp}  = $inter_opts;
 	$work_data->{PIDs}{$pid}{prgfile} = $prgLog;
-	$work_data->{PIDs}{$pid}{source}  = $source_groups{$gid}{$tmp_from};
-	$work_data->{PIDs}{$pid}{target}  = $source_groups{$gid}{$tmp_to};
+	$work_data->{PIDs}{$pid}{source}  = $source_groups{$gid}{$source};
+	$work_data->{PIDs}{$pid}{target}  = $source_groups{$gid}{$target};
 	unlock_data($work_data);
 
 	return 1;
@@ -1750,10 +1814,34 @@ sub strike_fork_restart {
 	log_warning( $work_data, 'Re-starting frozen Fork %d', $pid );
 
 	lock_data( $work_data, LOCK_SH );
-	my @args = @{ $work_data->{PIDs}{$pid}{args} };
+	my @args       = @{ $work_data->{PIDs}{$pid}{args} };
+	my $inter_opts = $work_data->{PIDs}{$pid}{interp};
+	my $tid        = $work_data->{PIDs}{$pid}{id};
 	unlock_data($work_data);
 
-	my $kid = start_work( 1, @args );
+	# If we have interpolation data, this is an interpolating worker who has their
+	# filters to be redone if the 'do_alt' (do alternative interpolation) switches
+	# from 0 (libplacebo, might freeze ffmpeg) to 1 (use classic minterpolate)
+	if ( defined $inter_opts ) {
+		$inter_opts->{'do_alt'} = 1;
+
+		lock_data( $work_data, LOCK_SH );
+		my $prgLog        = $work_data->{PIDs}{$pid}{prgfile};
+		my $file_from     = $work_data->{PIDs}{$pid}{source};
+		my $file_to       = $work_data->{PIDs}{$pid}{target};
+		my $filter_string = make_filter_string($inter_opts);
+		my $ffargs        = [
+			$FF,                 @FF_ARGS_START, '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+			@FF_ARGS_INPUT_VULK, $file_from,     @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
+			'-fps_mode',         'cfr',          @FF_ARGS_FORMAT,    @FF_ARGS_CODEC_UTV, $file_to
+		];
+
+		$work_data->{PIDs}{$pid}{args} = $ffargs;
+		@args = @{ $work_data->{PIDs}{$pid}{args} };
+		unlock_data($work_data);
+	} ## end if ( defined $inter_opts)
+
+	my $kid = start_work( $tid, @args );
 	( defined $kid ) and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
 	$work_data->{PIDs}{$kid}{args}    = $work_data->{PIDs}{$pid}{args};

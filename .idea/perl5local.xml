@@ -3,16 +3,16 @@
   <component name="Perl5LocalSettings">
     <option name="externalLibrariesPaths">
       <list>
-        <option value="/usr/lib64/perl5/5.38" />
-        <option value="/usr/lib64/perl5/5.38/x86_64-linux-quadmath-thread-multi" />
-        <option value="/usr/lib64/perl5/vendor_perl/5.38" />
-        <option value="/usr/lib64/perl5/vendor_perl/5.38/x86_64-linux-quadmath-thread-multi" />
-        <option value="/usr/lib64/perl5/vendor_perl/5.36" />
+        <option value="/usr/lib64/perl5/5.40" />
+        <option value="/usr/lib64/perl5/5.40/x86_64-linux-quadmath-thread-multi" />
+        <option value="/usr/lib64/perl5/vendor_perl/5.40" />
+        <option value="/usr/lib64/perl5/vendor_perl/5.40/x86_64-linux-quadmath-thread-multi" />
       </list>
     </option>
-    <option name="perlInterpreter" value="Local, System: Perl 5.38.2" />
+    <option name="perlInterpreter" value="Local, System: Perl 5.40.0" />
   </component>
   <component name="Perl5XSubsState">
+    <option name="isActual" value="false" />
     <option name="myFilesMap">
       <map>
         <entry key="/usr/lib64/perl5/5.38/x86_64-linux-quadmath-thread-multi/auto/B/B.so" value="1717138215458" />
