@@ -681,7 +681,7 @@ sub check_output_existence {
 	-f $path_target and log_error( $work_data, 'Output file already exists!', $path_target ) and ++${$errCount};
 	foreach my $src (@path_source) {
 		$src eq $path_target and log_error( $work_data, 'Input file equals output file!', $src ) and ++${$errCount};
-		$path_target =~ m/[.]mkv$/ms or log_error('Output file does not have mkv ending!') and ++${$errCount};
+		$path_target =~ m/[.]mkv$/ms or log_error( $work_data, 'Output file does not have mkv ending!' ) and ++${$errCount};
 	}
 
 	return 1;
@@ -707,8 +707,8 @@ sub check_source_and_target {
 
 	${$have_target} and set_log_file() and ${$have_source} and return 1;
 
-	${$have_source} or log_error('No Input given!')  and ++${$errCount};
-	${$have_target} or log_error('No Output given!') and ++${$errCount};
+	${$have_source} or log_error( $work_data, 'No Input given!' )  and ++${$errCount};
+	${$have_target} or log_error( $work_data, 'No Output given!' ) and ++${$errCount};
 
 	return 0;
 } ## end sub check_source_and_target
@@ -977,7 +977,7 @@ sub get_info_from_ffprobe {
 
 				# If we do not have found the stream defining our average framerate, yet, not it down now.
 				( $avg_frame_rate_stream < 0 )
-				  and log_debug('    ==> Avg Frame Rate Stream found!')
+				  and log_debug( $work_data, '    ==> Avg Frame Rate Stream found!' )
 				  and $avg_frame_rate_stream = $s;
 
 				# If the framerate is noted as a fraction, calculate the numeric value
@@ -1432,7 +1432,7 @@ sub remove_pid {
 			|| ( defined( $work_data->{PIDs}{$pid}{error_msg} ) && ( length( $work_data->{PIDs}{$pid}{error_msg} ) > 0 ) ) )
 		{
 			log_error(
-				"Worker PID %d FAILED [%d]:\n%s",
+				$work_data, "Worker PID %d FAILED [%d]:\n%s",
 				$pid,
 				$work_data->{PIDs}{$pid}{exit_code},
 				( length( $work_data->{PIDs}{$pid}{error_msg} ) > 0 ) ? $work_data->{PIDs}{$pid}{error_msg} : $work_data->{PIDs}{$pid}{result}
@@ -1487,7 +1487,7 @@ sub sigHandler {
 sub segment_all_groups {
 	can_work() or return 1;
 
-	log_info('Segmenting source groups...');
+	log_info( $work_data, 'Segmenting source groups...' );
 
 	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 		can_work() or last;
@@ -1853,8 +1853,8 @@ sub strike_fork_term {
 sub terminator {
 	my ( $kid, $signal ) = @_;
 
-	( defined $kid )    or log_error('BUG! terminator() called with UNDEF kid argument!')    and return 0;
-	( defined $signal ) or log_error('BUG! terminator() called with UNDEF signal argument!') and return 0;
+	( defined $kid )    or log_error( $work_data, 'BUG! terminator() called with UNDEF kid argument!' )    and return 0;
+	( defined $signal ) or log_error( $work_data, 'BUG! terminator() called with UNDEF signal argument!' ) and return 0;
 
 	if ( !( ( 'TERM' eq $signal ) || ( 'KILL' eq $signal ) ) ) {
 		log_error( $work_data, q{Bug: terminator(%d, '%s') called, only TERM and KILL supported!}, $kid, $signal );
@@ -1886,7 +1886,7 @@ sub unlock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	log_debug( $work_data, '%s <== unlock', get_location($data) );
+	log_debug( $data, '%s <== unlock', get_location($data) );
 	( defined $lock ) and $lock->unlock or return 0;
 
 	return 1;
@@ -1935,7 +1935,7 @@ sub wait_for_all_forks {
 
 	} ## end foreach my $pid (@PIDs)
 
-	log_debug('All PIDs ended.');
+	log_debug( $work_data, 'All PIDs ended.' );
 
 	return $result;
 } ## end sub wait_for_all_forks
