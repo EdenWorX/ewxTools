@@ -873,7 +873,7 @@ sub create_target_file {
 		@FF_ARGS_CODEC_h264, $path_target,   @mapVoice
 	);
 
-	log_debug( $work_data, "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ) );
+	log_info( $work_data, "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ) );
 	my $pid = start_work( 1, @ffargs );
 	( defined $pid ) and ( $pid > 0 ) or confess('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
@@ -1106,6 +1106,8 @@ sub handle_fork_progress {
 	defined( $prgData->{total_size} )  or $prgData->{total_size}  = 0;
 
 	load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS or --$fork_timeout->{$pid};
+
+	( $fork_timeout->{$pid} < $TIMEOUT_INTERVALS ) and $result = 0;       # does not look like it is running atm
 
 	return $result;
 } ## end sub handle_fork_progress
@@ -1529,7 +1531,7 @@ sub segment_source_group {
 		"$seg_len",       $source_groups{$gid}{tmp}
 	);
 
-	log_debug( $work_data, "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ) );
+	log_info( $work_data, "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ) );
 	my $pid = start_work( 1, @ffargs );
 	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
@@ -1736,7 +1738,7 @@ sub start_worker_fork {
 		'-fps_mode',         'cfr',          @FF_ARGS_FORMAT,    @FF_ARGS_CODEC_UTV, $file_to
 	);
 
-	log_debug( $work_data, "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @ffargs ) );
+	log_info( $work_data, "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @ffargs ) );
 	my $pid = start_work( $i, @ffargs );
 	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
@@ -1816,6 +1818,7 @@ sub strike_fork_restart {
 		unlock_data($work_data);
 	} ## end if ( defined $inter_opts)
 
+	log_info( $work_data, "Starting Worker %d for:\n%s", $tid + 1, ( join $SPACE, @args ) );
 	my $kid = start_work( $tid, @args );
 	( defined $kid ) and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
@@ -1836,6 +1839,7 @@ sub strike_fork_term {
 	my ($pid) = @_;
 
 	if ( 0 == reap_pid($pid) ) {
+		log_warning( $work_data, 'Worker PID %d looks frozen...', $pid );
 		terminator( $pid, 'TERM' );
 		( get_pid_status( $work_data, $pid ) < $FF_KILLED ) and set_pid_status( $work_data, $pid, $FF_KILLED );
 		mark_pid_restart( $work_data, $pid );
