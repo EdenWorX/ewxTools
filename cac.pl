@@ -277,32 +277,16 @@ assemble_output();
 # END Handler
 # ---------------------------------------------------------
 END {
-	# Let's clean up and remove all temporary files, if this is "release" mode,
-	# or at least list all "orphaned" files if this is debug mode
-	if ( $work_done > 0 ) {
+	# The END is only of any importance if this is the main fork.
+	if ( $$ == $main_pid ) {
 		wait_for_all_forks();
 
-		foreach my $gid ( sort { $a <=> $b } keys %source_groups ) {
-			if ( -f $source_groups{$gid}{lst} ) {
-				( $do_debug > 0 ) and log_debug( $work_data, 'See: %s', $source_groups{$gid}{lst} ) or unlink $source_groups{$gid}{lst};
-			}
-			for my $area (qw( tmp idn iup prg )) {
-				for my $i ( 0 .. 3 ) {
-					my $f = sprintf $source_groups{$gid}{$area}, $i;
-					if ( -f $f ) {
-						( $do_debug > 0 ) and log_debug( $work_data, 'See: %s', $f ) or unlink $f;
-					}
-				} ## end for my $i ( 0 .. 3 )
-			} ## end for my $area (qw( tmp idn iup prg ))
-		} ## end foreach my $gid ( sort { $a...})
+		# Let's clean up and remove all temporary files, if this is "release" mode,
+		# or at least list all "orphaned" files if this is debug mode
+		( $work_done > 0 ) and cleanup_source_groups();
 
-		( $ret_global > 0 ) and log_error( $work_data, 'Processing %s FAILED!', $path_target ) or log_info( $work_data, 'Processing %s finished', $path_target );
-
-		( ( 0 < ( length $logfile ) ) && ( -f $logfile ) )
-		  and ( ( $ret_global > 0 ) || ( 1 == $do_debug ) )
-		  and printf "\nSee %s for details\n", $logfile;
-	} ## end if ( $work_done > 0 )
-	IPC::Shareable->clean_up;
+		IPC::Shareable->clean_up;
+	} ## end if ( $$ == $main_pid )
 }  ## End END
 
 exit $ret_global;
@@ -821,6 +805,30 @@ sub cleanint {
 	my $int = floor($float);
 	return commify($int);
 }
+
+sub cleanup_source_groups {
+	foreach my $gid ( sort { $a <=> $b } keys %source_groups ) {
+		if ( -f $source_groups{$gid}{lst} ) {
+			( $do_debug > 0 ) and log_debug( $work_data, 'See: %s', $source_groups{$gid}{lst} ) or unlink $source_groups{$gid}{lst};
+		}
+		for my $area (qw( tmp idn iup prg )) {
+			for my $i ( 0 .. 3 ) {
+				my $f = sprintf $source_groups{$gid}{$area}, $i;
+				if ( -f $f ) {
+					( $do_debug > 0 ) and log_debug( $work_data, 'See: %s', $f ) or unlink $f;
+				}
+			} ## end for my $i ( 0 .. 3 )
+		} ## end for my $area (qw( tmp idn iup prg ))
+	} ## end foreach my $gid ( sort { $a...})
+
+	( $ret_global > 0 ) and log_error( $work_data, 'Processing %s FAILED!', $path_target ) or log_info( $work_data, 'Processing %s finished', $path_target );
+
+	( ( 0 < ( length $logfile ) ) && ( -f $logfile ) )
+	  and ( ( $ret_global > 0 ) || ( 1 == $do_debug ) )
+	  and printf "\nSee %s for details\n", $logfile;
+
+	return 1;
+} ## end sub cleanup_source_groups
 
 sub close_standard_io {
 	my $devnull = '/dev/null';
