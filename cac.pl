@@ -1055,11 +1055,11 @@ sub get_location {
 sub get_log_level {
 	my ($level) = @_;
 
-	     ( $LOG_INFO == $level )    and return ('Info   ')
-	  or ( $LOG_WARNING == $level ) and return ('Warning')
-	  or ( $LOG_ERROR == $level )   and return ('ERROR  ')
-	  or ( $LOG_STATUS == $level )
-	  and return ($EMPTY);
+	     ( $LOG_INFO == $level )    and return ('--Info--')
+	  or ( $LOG_WARNING == $level ) and return ('Warning!')
+	  or ( $LOG_ERROR == $level )   and return ('ERROR !!')
+	  or ( $LOG_STATUS == $level )  and return ('-status-')
+	  or return ($EMPTY);
 
 	return ('=DEBUG=');
 } ## end sub get_log_level
@@ -1458,9 +1458,12 @@ sub remove_pid {
 		log_debug( $work_data, 'STDOUT    => %s', $work_data->{PIDs}{$pid}{result}    // 'undef' );
 		log_debug( $work_data, 'STDERR    => %s', $work_data->{PIDs}{$pid}{error_msg} // 'undef' );
 
-		if (   ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) )
-			|| ( defined( $work_data->{PIDs}{$pid}{error_msg} ) && ( length( $work_data->{PIDs}{$pid}{error_msg} ) > 0 ) ) )
-		{
+		my $errmsg       = $work_data->{PIDs}{$pid}{error_msg} // $EMPTY;
+		my $have_error   = ( $errmsg =~ m/(error|critical)/ims ) ? 1 : 0;
+		my $have_warning = ( $errmsg =~ m/warning/ims )          ? 1 : 0;
+		my $have_info    = ( $errmsg =~ m/(info|status)/ims )    ? 1 : 0;
+
+		if ( ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) || $have_error ) {
 			log_error(
 				$work_data, "Worker PID %d FAILED [%d]:\n%s",
 				$pid,
@@ -1475,7 +1478,10 @@ sub remove_pid {
 				-f $f and unlink $f;
 			}
 			$result = 0;  ## We _did_ fail!
-		} ## end if ( ( defined( $work_data...)))
+		} else {
+			$have_warning   and log_warning( $work_data, $errmsg )
+			  or $have_info and log_info( $work_data, $errmsg );
+		}
 
 		# We do not need the source file any more (if an fmt is set)
 		if ( ( 0 == $do_debug ) && defined( $work_data->{PIDs}{$pid}{source} ) && ( length( $work_data->{PIDs}{$pid}{source} ) > 0 ) ) {
