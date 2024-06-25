@@ -948,7 +948,7 @@ sub file_exists {
 
 sub format_bitrate {
 	my ($float) = @_;
-	return lc( human_readable_size($float) ) . 'bits/s';
+	return human_readable_size( $float, 0 ) . 'bits/s';
 }
 
 sub format_caller {
@@ -1127,7 +1127,7 @@ sub handle_fork_progress {
 	defined( $prgData->{drop_frames} ) or $prgData->{drop_frames} = 0;
 	defined( $prgData->{dup_frames} )  or $prgData->{dup_frames}  = 0;
 	defined( $prgData->{fps} )         or $prgData->{fps}         = 0.0;
-	defined( $prgData->{frames} )      or $prgData->{frames}      = 0;
+	defined( $prgData->{frame} )       or $prgData->{frame}       = 0;
 	defined( $prgData->{out_time_ms} ) or $prgData->{out_time_ms} = 0;    ## "00:00:00.000000" in the file, but we read out_time_ms
 	defined( $prgData->{total_size} )  or $prgData->{total_size}  = 0;
 
@@ -1166,17 +1166,17 @@ sub handle_fork_strikes {
 } ## end sub handle_fork_strikes
 
 sub human_readable_size {
-	my ($number_string) = @_;
-	my $int             = floor($number_string);
-	my @exps            = qw( B K M G T P E Z );
-	my $exp             = 0;
+	my ( $num, $is_byte ) = @_;
+	my $int  = floor($num);
+	my @exps = qw( B K M G T P E Z );
+	my $exp  = 0;
 
 	while ( $int >= 1024 ) {
 		++$exp;
 		$int /= 1024;
 	}
 
-	return sprintf '%3.2f%s', floor( $int * 100. ) / 100., $exps[$exp];
+	return sprintf '%3.2f%s', floor( $int * 100. ) / 100., $is_byte ? $exps[$exp] : $exp > 0 ? lc $exps[$exp] : $EMPTY;
 } ## end sub human_readable_size
 
 sub interpolate_source_group {
@@ -1225,7 +1225,7 @@ sub load_progress {
 	my @progress_field_names = qw( bitrate drop_frames dup_frames fps frame out_time_ms total_size );
 	while ( ( $progress_count < 2 ) && ( $i < $lines_count ) ) {
 		chomp $last_20_lines[$i];
-		log_debug( $work_data, "[RAW % 2d] Check '%s'", $i, $last_20_lines[$i] );
+		log_debug( $work_data, "[RAW %-2d] Check '%s'", $i, $last_20_lines[$i] );
 		if ( is_progress_line( $last_20_lines[$i] ) ) {
 			$progress_count++;
 		} else {
@@ -1353,11 +1353,26 @@ sub mark_pid_restart {
 
 sub parse_progress_data {
 	my ( $line, $property_name, $data ) = @_;
+
+	# Attempt 1: Simple floating point value
 	if ( $line =~ m/^${property_name}="?([.0-9]+)"?\s*$/xms ) {
 		log_debug( $work_data, "${EIGHTSPACE}==> %s=%f", $property_name, $1 );
 		$data->{$property_name} += ( 1 * $1 );
 		return 1;
 	}
+
+	# Attempt 2: bitrate
+	if ( $line =~ m/^${property_name}="?([.0-9]+)(.)b?its?\/s"?\s*$/xms ) {
+		my $bits = 1 * $1;
+		my $exp  = lc $2;
+		log_debug( $work_data, "${EIGHTSPACE}==> %s=%f%sbits/s", $property_name, $bits, $exp );
+		( 'g' eq $exp ) and $bits *= 1024 and $exp = 'm';
+		( 'm' eq $exp ) and $bits *= 1024 and $exp = 'k';
+		( 'k' eq $exp ) and $bits *= 1024 and $exp = 'b';
+		$data->{$property_name} += ( 1 * $1 );
+		return 1;
+	} ## end if ( $line =~ m/^${property_name}="?([.0-9]+)(.)b?its?\/s"?\s*$/xms)
+
 	return 0;
 } ## end sub parse_progress_data
 
@@ -1626,13 +1641,15 @@ sub set_pid_status {
 sub show_progress {
 	my ( $thr_count, $thr_active, $prgData, $log_as_status ) = @_;
 
+	# qw( bitrate drop_frames dup_frames fps frame out_time_ms total_size )
+
 	# Formualate the progress line
-	my $size_str     = human_readable_size( $prgData->{total_size} // 0 );
+	my $size_str     = human_readable_size( $prgData->{total_size} // 0, 1 );
 	my $time_str     = format_out_time( $prgData->{out_time_ms}    // 0 );
 	my $bitrate_str  = format_bitrate( ( $prgData->{bitrate} // 0.0 ) / $thr_count );                               ## Average, not the sum.
 	my $progress_str = sprintf '[%d/%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ',
 	  $thr_active, $thr_count,
-	  $prgData->{frames}, $prgData->{drop_frames}, $prgData->{dup_frames},
+	  $prgData->{frame}, $prgData->{drop_frames}, $prgData->{dup_frames},
 	  $time_str, $prgData->{fps}, $bitrate_str, $size_str;
 
 	# Clear a previous progress line
@@ -1644,7 +1661,7 @@ sub show_progress {
 		$have_progress_msg = 0;  ## ( We already deleted the line above, leaving it at 1 would add a useless empty line. )
 		log_status(
 			$work_data, "%d forks finished %d frames (%d dropped, %d dup'd); Duration: %s; FPS: %03.2f; %s; File Size: %s",
-			$thr_count, $prgData->{frames},
+			$thr_count, $prgData->{frame},
 			$prgData->{drop_frames},
 			$prgData->{dup_frames},
 			$time_str, $prgData->{fps}, $bitrate_str, $size_str
