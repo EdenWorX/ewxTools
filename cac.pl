@@ -1100,6 +1100,20 @@ sub handle_eval_result {
 	return $res ? $res : $child_error;
 } ## end sub handle_eval_result
 
+sub handle_fork_message {
+	my ($errmsg) = @_;
+
+	my $have_error   = ( $errmsg =~ m/(error|critical)/ims ) ? 1 : 0;
+	my $have_warning = ( $errmsg =~ m/warning/ims )          ? 1 : 0;
+	my $have_info    = ( $errmsg =~ m/(info|status)/ims )    ? 1 : 0;
+
+	$have_error        and log_error( $work_data, $errmsg )
+	  or $have_warning and log_warning( $work_data, $errmsg )
+	  or $have_info    and log_info( $work_data, $errmsg );
+
+	return $have_error;
+} ## end sub handle_fork_message
+
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout, $fork_strikes ) = @_;
 	my $result = 1;
@@ -1458,18 +1472,10 @@ sub remove_pid {
 		log_debug( $work_data, 'STDOUT    => %s', $work_data->{PIDs}{$pid}{result}    // 'undef' );
 		log_debug( $work_data, 'STDERR    => %s', $work_data->{PIDs}{$pid}{error_msg} // 'undef' );
 
-		my $errmsg       = $work_data->{PIDs}{$pid}{error_msg} // $EMPTY;
-		my $have_error   = ( $errmsg =~ m/(error|critical)/ims ) ? 1 : 0;
-		my $have_warning = ( $errmsg =~ m/warning/ims )          ? 1 : 0;
-		my $have_info    = ( $errmsg =~ m/(info|status)/ims )    ? 1 : 0;
+		my $have_error = handle_fork_message( $work_data->{PIDs}{$pid}{error_msg} // $EMPTY );
 
 		if ( ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) || $have_error ) {
-			log_error(
-				$work_data, "Worker PID %d FAILED [%d]:\n%s",
-				$pid,
-				$work_data->{PIDs}{$pid}{exit_code},
-				( length( $work_data->{PIDs}{$pid}{error_msg} ) > 0 ) ? $work_data->{PIDs}{$pid}{error_msg} : $work_data->{PIDs}{$pid}{result}
-			);
+			log_error( $work_data, "Worker PID %d FAILED [%d]!\n%s", $pid, $work_data->{PIDs}{$pid}{exit_code}, $work_data->{PIDs}{$pid}{result} );
 
 			# We do not need the target file any more, the thread failed! (if an fmt is set)
 			if ( ( 0 == $do_debug ) && ( length( $work_data->{PIDs}{$pid}{target} ) > 0 ) ) {
@@ -1478,10 +1484,7 @@ sub remove_pid {
 				-f $f and unlink $f;
 			}
 			$result = 0;  ## We _did_ fail!
-		} else {
-			$have_warning   and log_warning( $work_data, $errmsg )
-			  or $have_info and log_info( $work_data, $errmsg );
-		}
+		} ## end if ( ( defined( $work_data...)))
 
 		# We do not need the source file any more (if an fmt is set)
 		if ( ( 0 == $do_debug ) && defined( $work_data->{PIDs}{$pid}{source} ) && ( length( $work_data->{PIDs}{$pid}{source} ) > 0 ) ) {
