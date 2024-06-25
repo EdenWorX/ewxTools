@@ -7,6 +7,7 @@ use POSIX qw( _exit floor :sys_wait_h );
 use IPC::Run3;
 use IPC::Shareable qw( LOCK_EX );
 use Carp;
+use Cwd qw( abs_path );
 use Data::Dumper;
 use File::Basename;
 use Filesys::Df;
@@ -79,8 +80,8 @@ my $have_progress_msg = 0;
 my $logfile           = $EMPTY;
 
 Readonly my $LOG_DEBUG   => 1;
-Readonly my $LOG_STATUS  => 2;
-Readonly my $LOG_INFO    => 3;
+Readonly my $LOG_INFO    => 2;
+Readonly my $LOG_STATUS  => 3;
 Readonly my $LOG_WARNING => 4;
 Readonly my $LOG_ERROR   => 5;
 
@@ -149,7 +150,7 @@ my @FF_CONCAT_BEGIN    = qw( -loglevel level+warning -nostats -f concat -safe 0 
 my @FF_CONCAT_END      = qw( -map 0 -c copy );
 my @FP_ARGS            = qw( -hide_banner -loglevel error -v quiet -show_format -of flat=s=_ -show_entries );
 my %FF_INTERPOLATE_fmt = (
-	'iup' => [ "libplacebo='extra_opts=preset=high_quality:frame_mixer=none:fps=%d'", "minterpolate='fps=%d:mi_mode=dup:scd=none'" ],
+	'iup' => [ "minterpolate='fps=%d:mi_mode=dup:scd=none'", "libplacebo='extra_opts=preset=high_quality:frame_mixer=none:fps=%d'" ],
 	'idn' =>
 	  [ "libplacebo='extra_opts=preset=high_quality:frame_mixer=mitchell_clamp:fps=%d'", "minterpolate='fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'" ]
 );
@@ -218,7 +219,7 @@ check_arguments() > 0 and pod2usage( { -message => $podmsg, -exitval => 1, -verb
 # ================	  MAIN  PROGRAM	  ================
 # ---------------------------------------------------------
 $work_done = 1;  # From now on we consider this program as at work
-log_info( $work_data, 'Processing %s start', $path_target );
+log_status( $work_data, 'Processing %s start', $path_target );
 
 # ---
 # --- 1) we need information about each source file
@@ -236,7 +237,7 @@ check_target_fps();
 # ---
 # --- 3) Now each groups segments can be decimated and interpolated up to max fps (round 1)
 # ---
-can_work() and log_info( $work_data, 'Interpolating segments up to %d FPS...', $max_fps );
+can_work() and log_status( $work_data, 'Interpolating segments up to %d FPS...', $max_fps );
 foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	can_work() or last;
 	my $inter_opts = {
@@ -253,7 +254,7 @@ foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 # ---
 # --- 4) Then all groups segments have to be decimated and interpolated down to target fps (round 2)
 # ---
-can_work() and log_info( $work_data, 'Interpolating segments down to %d FPS...', $target_fps );
+can_work() and log_status( $work_data, 'Interpolating segments down to %d FPS...', $target_fps );
 foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	can_work() or last;
 	my $inter_opts = {
@@ -270,7 +271,7 @@ foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 # ---
 # --- 5) And finally we can put all the latest temp files together and create the target vid
 # ---
-can_work() and log_info( $work_data, 'Creating %s ...', $path_target );
+can_work() and log_status( $work_data, 'Creating %s ...', $path_target );
 assemble_output();
 
 # ---------------------------------------------------------
@@ -285,9 +286,12 @@ END {
 		# or at least list all "orphaned" files if this is debug mode
 		( $work_done > 0 ) and cleanup_source_groups();
 
+		log_status( $work_data, 'Program %s', ( 0 == $ret_global ) ? 'finished' : 'FAILED!' );
+
 		IPC::Shareable->clean_up;
+
 	} ## end if ( $$ == $main_pid )
-}  ## End END
+} ## end END
 
 exit $ret_global;
 
@@ -495,7 +499,7 @@ sub assemble_output {
 	if ( open my $fOut, '>', $lstfile ) {
 		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 			for my $i ( 0 .. 3 ) {
-				printf {$fOut} "file '%s'\n", ( sprintf $source_groups{$groupID}{idn}, $i );
+				printf {$fOut} "file '%s'\n", abs_path( sprintf $source_groups{$groupID}{idn}, $i );
 			}
 		}
 		close $fOut or croak("Closing listfile '$lstfile' FAILED!");
@@ -557,7 +561,7 @@ sub build_source_groups {
 		if ( ( $dir_changed + $ch_changed + $codec_changed ) > 0 ) {
 			## no critic (ProhibitParensWithBuiltins)
 			$source_groups{ ++$group_id } = {
-				dir  => $last_dir,
+				dir  => abs_path($last_dir),
 				dur  => 0,
 				fps  => 0,
 				idn  => sprintf( '%s/temp_%d_inter_dn_%d_%%d.mkv', $last_dir, $main_pid, ++$tmp_count ),
@@ -575,7 +579,7 @@ sub build_source_groups {
 		$data->{sourceFPS} > $source_groups{$group_id}{fps}
 		  and $source_groups{$group_id}{fps} = $data->{sourceFPS};
 		push @{ $source_groups{$group_id}{ids} },  $fileID;
-		push @{ $source_groups{$group_id}{srcs} }, $src;
+		push @{ $source_groups{$group_id}{srcs} }, abs_path($src);
 	}  ## End of grouping input files
 
 	return 1;
@@ -1107,7 +1111,8 @@ sub handle_fork_progress {
 
 	load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS or --$fork_timeout->{$pid};
 
-	( $fork_timeout->{$pid} < $TIMEOUT_INTERVALS ) and $result = 0;       # does not look like it is running atm
+	# Warn if a fork looks like it is freezing...
+	( ( $TIMEOUT_INTERVALS / 2 ) == $fork_timeout->{$pid} ) and log_warning( $work_data, 'Fork PID %d seems to be frozen...', $pid );
 
 	return $result;
 } ## end sub handle_fork_progress
@@ -1246,7 +1251,7 @@ sub logMsg {
 	my $stMsg   = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, get_location($data), @args;
 
 	( 0 < ( length $logfile ) ) and write_to_log($stMsg);
-	( $LOG_DEBUG != $lvl ) and write_to_console($stMsg);
+	( $LOG_INFO < $lvl ) and write_to_console($stMsg);
 
 	return 1;
 } ## end sub logMsg
@@ -1489,7 +1494,7 @@ sub sigHandler {
 sub segment_all_groups {
 	can_work() or return 1;
 
-	log_info( $work_data, 'Segmenting source groups...' );
+	log_status( $work_data, 'Segmenting source groups...' );
 
 	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 		can_work() or last;
@@ -1515,7 +1520,7 @@ sub segment_source_group {
 	# Luckily we can concat and segment in one go, but we need the concat demuxer for that, which requires an input file
 	if ( open my $fOut, '>', $source_groups{$gid}{lst} ) {
 		foreach my $fid ( sort { $a <=> $b } @{ $source_groups{$gid}{ids} } ) {
-			printf {$fOut} "file '%s'\n", $source_ids{$fid};
+			printf {$fOut} "file '%s'\n", abs_path( $source_ids{$fid} );
 		}
 		close $fOut or confess("Closing listfile '$source_groups{$gid}{lst}' FAILED!");
 	} else {
@@ -1765,7 +1770,7 @@ sub strike_fork_kill {
 		return 7;
 	} ## end if ( 0 == reap_pid($pid...))
 
-	log_info( $work_data, 'Fork PID %d is gone! Will restart...', $pid );
+	log_warning( $work_data, 'Fork PID %d is gone! Will restart...', $pid );
 
 	return 13;  # Thread is already gone, start a new one.
 } ## end sub strike_fork_kill
@@ -1846,7 +1851,7 @@ sub strike_fork_term {
 		return 1;
 	} ## end if ( 0 == reap_pid($pid...))
 
-	log_info( $work_data, 'Fork PID %d is gone! Will restart...', $pid );
+	log_warning( $work_data, 'Fork PID %d is gone! Will restart...', $pid );
 
 	return 13;  # Thread is already gone, start a new one.
 } ## end sub strike_fork_term
