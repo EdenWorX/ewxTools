@@ -10,6 +10,7 @@ use Carp;
 use Cwd qw( abs_path );
 use Data::Dumper;
 use File::Basename;
+use File::ReadBackwards;
 use Filesys::Df;
 use Getopt::Long;
 use List::MoreUtils qw( firstidx );
@@ -1188,8 +1189,7 @@ sub load_progress {
 
 	file_exists($progress_log) or return 0;
 
-	my @args          = ( 'tail', '-n', '20', $progress_log );
-	my @last_20_lines = reverse split /\n/ms, capture_cmd(@args);
+	my @last_20_lines = read_and_reverse_last_lines( $progress_log, 20 );
 	my $lines_count   = scalar @last_20_lines;
 
 	my $progress_count = 0;
@@ -1375,6 +1375,21 @@ sub pid_status_to_str {
 	  : ( $FF_CREATED == $status )  ? 'created'
 	  :                               '***unknown***';
 } ## end sub pid_status_to_str
+
+sub read_and_reverse_last_lines {
+	my ( $filename, $linecount ) = @_;
+
+	my $file   = File::ReadBackwards->new($filename) or croak("Cannot open $filename: $!");
+	my @lines  = ();
+	my $lineno = 0;
+
+	while ( ( $lineno++ < $linecount ) && ( my $line = $file->readline() ) ) {
+		chomp $line;
+		push @lines, $line;
+	}
+
+	return @lines;
+} ## end sub read_and_reverse_last_lines
 
 sub reap_pid {
 	my ($pid) = @_;
