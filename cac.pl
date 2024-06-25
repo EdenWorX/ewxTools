@@ -120,7 +120,6 @@ $SIG{CHLD} = \&reaper;
 # ---------------------------------------------------------
 # Global Constants
 # ---------------------------------------------------------
-Readonly my $B_FPS             => '[fps];[fps]';
 Readonly my $B_decimate        => '[decim];[decim]';
 Readonly my $B_in              => '[in]';
 Readonly my $B_interp          => '[interp];[interp]';
@@ -142,20 +141,20 @@ my @FF_ARGS_CODEC_h264 = qw(
   -rc:v        vbr        -rgb_mode yuv444 -cq         4  -qmin        1        -qmax      16
   -temporal_aq 1          -b_adapt  0      -b_ref_mode 0  -zerolatency 1        -multipass 2
   -forced-idr  1 );
-my @FF_ARGS_CODEC_UTV  = qw( -codec:v utvideo -pred median );
-my @FF_ARGS_FILTER     = qw( -ignore_unknown -vf );
-my @FF_ARGS_FORMAT     = qw( -colorspace bt709 -color_range pc -pix_fmt yuv444p -f matroska -write_crc32 0 );
-my @FF_ARGS_INPUT_CUDA = qw( -loglevel level+warning -nostats -init_hw_device cuda -colorspace bt709 -color_range pc -f concat -safe 0 -i );
-my @FF_ARGS_INPUT_VULK = qw( -loglevel level+warning -nostats -init_hw_device vulkan -colorspace bt709 -color_range pc -i );
-my @FF_ARGS_START      = qw( -hide_banner -loglevel level+info -y );
-my @FF_CONCAT_BEGIN    = qw( -loglevel level+warning -nostats -f concat -safe 0 -i );
-my @FF_CONCAT_END      = qw( -map 0 -c copy );
-my @FP_ARGS            = qw( -hide_banner -loglevel error -v quiet -show_format -of flat=s=_ -show_entries );
-my %FF_INTERPOLATE_fmt = (
-	'iup' => [ "minterpolate='fps=%d:mi_mode=dup:scd=none'", "libplacebo='extra_opts=preset=high_quality:frame_mixer=none:fps=%d'" ],
-	'idn' =>
-	  [ "libplacebo='extra_opts=preset=high_quality:frame_mixer=mitchell_clamp:fps=%d'", "minterpolate='fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'" ]
-);
+my @FF_ARGS_CODEC_UTV   = qw( -codec:v utvideo -pred median );
+my @FF_ARGS_FILTER      = qw( -ignore_unknown -vf );
+my @FF_ARGS_FORMAT      = qw( -colorspace bt709 -color_range pc -pix_fmt yuv444p -f matroska -write_crc32 0 );
+my @FF_ARGS_INPUT_CUDA  = qw( -loglevel level+warning -nostats -init_hw_device cuda -colorspace bt709 -color_range pc -f concat -safe 0 -i );
+my @FF_ARGS_INPUT_VULK  = qw( -loglevel level+warning -nostats -init_hw_device vulkan -colorspace bt709 -color_range pc -i );
+my @FF_ARGS_START       = qw( -hide_banner -loglevel level+info -y );
+my @FF_CONCAT_BEGIN     = qw( -loglevel level+warning -nostats -f concat -safe 0 -i );
+my @FF_CONCAT_END       = qw( -map 0 -c copy );
+my @FP_ARGS             = qw( -hide_banner -loglevel error -v quiet -show_format -of flat=s=_ -show_entries );
+my $ff_interp_libp_none = "libplacebo='extra_opts=preset=high_quality:frame_mixer=none:fps=%d'";
+my $ff_interp_libp_high = "libplacebo='extra_opts=preset=high_quality:frame_mixer=mitchell_clamp:fps=%d'";
+my $ff_interp_mint_none = "minterpolate='fps=%d:mi_mode=dup:scd=none'";
+my $ff_interp_mint_high = "minterpolate='fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'";
+my %FF_INTERPOLATE_fmt  = ( 'iup' => [ $ff_interp_libp_high, $ff_interp_mint_none ], 'idn' => [ $ff_interp_libp_none, $ff_interp_mint_high ] );
 
 my %dir_stats        = ();                ## <dir> => { has_space => <what df says>, need_space => all inputs in there x 80, srcs => @src }
 my $do_print_help    = 0;
@@ -880,10 +879,10 @@ sub create_target_file {
 
 	# Building the worker fork is quite trivial
 	can_work() or return 1;
-	my @ffargs = (
-		$FF,                 @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-		@FF_ARGS_INPUT_CUDA, $lstfile,       @mapAudio,   @metaAudio, @FF_ARGS_FILTER, $F_assembled, '-fps_mode', 'vfr', @FF_ARGS_FORMAT,
-		@FF_ARGS_CODEC_h264, $path_target,   @mapVoice
+	my @fps_opts = ( '-r', $target_fps, '-fps_mode', 'cfr' );
+	my @ffargs   = (
+		$FF, @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_ARGS_INPUT_CUDA, $lstfile, @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled, @fps_opts, @FF_ARGS_FORMAT, @FF_ARGS_CODEC_h264, $path_target, @mapVoice
 	);
 
 	log_info( $work_data, "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ) );
@@ -1317,15 +1316,11 @@ sub make_filter_string {
 
 	# Prepare filter components
 	my $F_in_scale    = "scale='in_range=full:out_range=full'";
-	my $F_scale_FPS   = "fps=${tgt_fps}:round=near";
 	my $F_mpdecimate  = "mpdecimate='max=${dec_max}:frac=${dec_frac}'";
 	my $F_out_scale   = "scale='flags=accurate_rnd+full_chroma_inp+full_chroma_int:in_range=full:out_range=full'";
 	my $F_interpolate = sprintf $FF_INTERPOLATE_fmt{$tgt}[$do_alt], $tgt_fps;
 
-	return
-	    "pad=ceil(iw/2)*2:ceil(ih/2)*2,${F_in_scale}"
-	  . ( ( 'iup' eq $tgt ) ? "${B_FPS}${F_scale_FPS}" : $EMPTY )
-	  . "${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}";
+	return "pad=ceil(iw/2)*2:ceil(ih/2)*2,${F_in_scale}${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}";
 } ## end sub make_filter_string
 
 sub make_location_fmt {
@@ -1336,7 +1331,7 @@ sub make_location_fmt {
 		( $name_len < $data->{MLEN}[$idx] ) and ( ++$data->{ULEN}[$idx] ) or $data->{ULEN}[$idx] = 0;
 		( $data->{ULEN}[$idx] >= 10 )       and ( $data->{MLEN}[$idx]-- ) and $data->{ULEN}[$idx] = 0;
 	}
-	my $len = ( ( defined $data ) ? $data->{MLEN}[$idx] : $name_len ) + ( ( $lineno > -1 ) ? 5 : 0 );
+	my $len = ( ( defined $data ) ? $data->{MLEN}[$idx] : $name_len ) + ( ( $lineno > -1 ) ? 0 : 5 );
 
 	my $fmtfmt = ( $lineno > -1 ) ? '%%4d:%%-%ds' : '%%-%ds';
 
@@ -1629,7 +1624,7 @@ sub set_pid_status {
 
 # Show data from between the last two "progress=<state>" lines in the given log file
 sub show_progress {
-	my ( $thr_count, $thr_active, $prgData, $log_as_info ) = @_;
+	my ( $thr_count, $thr_active, $prgData, $log_as_status ) = @_;
 
 	# Formualate the progress line
 	my $size_str     = human_readable_size( $prgData->{total_size} // 0 );
@@ -1643,18 +1638,24 @@ sub show_progress {
 	# Clear a previous progress line
 	( $have_progress_msg > 0 ) and print "\r" . ( $SPACE x length $progress_str ) . "\r";
 
-	if ( 0 < $log_as_info ) {
+	if ( 0 < $log_as_status ) {
 
 		# Write into log file
 		$have_progress_msg = 0;  ## ( We already deleted the line above, leaving it at 1 would add a useless empty line. )
-		log_info( $work_data, '%s', $progress_str );
+		log_status(
+			$work_data, "%d forks finished %d frames (%d dropped, %d dup'd); Duration: %s; FPS: %03.2f; %s; File Size: %s",
+			$thr_count, $prgData->{frames},
+			$prgData->{drop_frames},
+			$prgData->{dup_frames},
+			$time_str, $prgData->{fps}, $bitrate_str, $size_str
+		);
 	} else {
 
 		# Output on console
 		$have_progress_msg = 1;
 		local $| = 1;
 		print "\r${progress_str}";
-	} ## end else [ if ( 0 < $log_as_info )]
+	} ## end else [ if ( 0 < $log_as_status)]
 
 	return 1;
 } ## end sub show_progress
@@ -1769,10 +1770,11 @@ sub start_worker_fork {
 	my $file_from     = sprintf $source_groups{$gid}{$source}, $i;
 	my $file_to       = sprintf $source_groups{$gid}{$target}, $i;
 	my $filter_string = make_filter_string($inter_opts);
+	my @fps_opts      = ( 'idn' eq $target ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
 	my @ffargs        = (
-		$FF,                 @FF_ARGS_START, '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-		@FF_ARGS_INPUT_VULK, $file_from,     @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
-		'-fps_mode',         'cfr',          @FF_ARGS_FORMAT,    @FF_ARGS_CODEC_UTV, $file_to
+		$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_ARGS_INPUT_VULK, $file_from,      @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
+		@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
 	);
 
 	log_info( $work_data, "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @ffargs ) );
@@ -1844,10 +1846,11 @@ sub strike_fork_restart {
 		my $file_from     = sprintf $work_data->{PIDs}{$pid}{source}, $tid;
 		my $file_to       = sprintf $work_data->{PIDs}{$pid}{target}, $tid;
 		my $filter_string = make_filter_string($inter_opts);
+		my @fps_opts      = ( 'idn' eq $inter_opts->{'tgt'} ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
 		my @ffargs        = (
-			$FF,                 @FF_ARGS_START, '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-			@FF_ARGS_INPUT_VULK, $file_from,     @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
-			'-fps_mode',         'cfr',          @FF_ARGS_FORMAT,    @FF_ARGS_CODEC_UTV, $file_to
+			$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+			@FF_ARGS_INPUT_VULK, $file_from,      @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
+			@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
 		);
 
 		@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
