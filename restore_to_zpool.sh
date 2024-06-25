@@ -13,10 +13,13 @@ if [[ -z "${xBack}" || "-h" = "${xPool}" || "--help" = "${xPool}" ]]; then
 	echo
 	echo "Usage: $0 <zpool> <prefix> [--debug]"
 	echo
-	echo " zpool   Name of the zpool to check"
-	echo " prefix  Prefix of the backup. Only files that can be checked at and copied from"
-	echo "         <backup prefix>/file/reported/by/zpool are handled"
-	echo " --debug If added, the script only prints copy commands and does not do them"
+	echo "Check files listed by 'zpool status -v' as defect against a backup, and"
+	echo "copy those files back which have a different md5sum or can't be read."
+	echo
+	echo " zpool    Name of the zpool to check"
+	echo " prefix   Prefix of the backup. Only files that can be checked at and copied from"
+	echo "          <backup prefix>/file/reported/by/zpool are handled"
+	echo " --debug  If added, the script only prints the copy commands it would perform"
 	exit 1
 fi
 
