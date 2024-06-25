@@ -77,6 +77,7 @@ Readonly my $EIGHTSPACE => q{        };  ## to blank the space for PID display
 # Logging facilities
 # ---------------------------------------------------------
 my $do_debug          = 0;
+my $do_lock_debug     = 0;      ## Split out, as [un]lock debugging is _very_ noisy!
 my $have_progress_msg = 0;
 my $logfile           = $EMPTY;
 
@@ -198,6 +199,7 @@ my %program_options = (
 	'help|h'        => \$do_print_help,
 	'debug|D'       => \$do_debug,
 	'input|i=s'     => \@path_source,
+	'lock-debug'    => \$do_lock_debug,
 	'output|o=s'    => \$path_target,
 	'splitaudio|s!' => \$do_split_audio,
 	'tempdir|t:s'   => \$path_temp,
@@ -1228,9 +1230,9 @@ sub lock_data {
 
 	my $stLoc = get_location($data);
 
-	log_debug( $work_data, '%s try lock ...', $stLoc );
+	( $do_lock_debug > 0 ) and log_debug( $work_data, '%s try lock ...', $stLoc );
 	( defined $lock ) and ( $result = $lock->lock(LOCK_EX) ) or $result = 0;
-	log_debug( $work_data, '%s ==> LOCK [%d]', $stLoc, $result // 'undef' );
+	( $do_lock_debug > 0 ) and log_debug( $work_data, '%s ==> LOCK [%d]', $stLoc, $result // 'undef' );
 
 	return $result // 0;
 } ## end sub lock_data
@@ -1910,7 +1912,7 @@ sub unlock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	log_debug( $data, '%s <== unlock', get_location($data) );
+	( $do_lock_debug > 0 ) and log_debug( $data, '%s <== unlock', get_location($data) );
 	( defined $lock ) and $lock->unlock or return 0;
 
 	return 1;
@@ -2192,6 +2194,13 @@ be used. Please be warned, though, that the program becomes **very** chatty!
 
 Displays extra information on all the steps of the way.
 IMPORTANT: _ALL_ temporary files are kept! Use with caution!
+
+=item B<--lock-debug>
+
+If --debug is used, this switch enables lock messages whenever the central data
+structure is un-/locked. This produces an enormous amount of lines in the log
+file, so use it with care!
+This switch is ignored unless -D/--debug is also used.
 
 =back
 
