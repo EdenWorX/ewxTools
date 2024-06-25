@@ -48,6 +48,10 @@ this program. If not, see https://www.gnu.org/licenses/.
 * cac_all.sh
 
     Little helper script to run all videos in a folder through cac.
+* restore_to_zpool.sh
+
+    Simple script to recover files which have been reported as broken by
+    `zpool status -v` from a backup. Checks md5 sums first.
 * spacefader
 
     Tool to overwrite free space on devices you can not just dd over.
@@ -136,9 +140,10 @@ like my voice, so I take the liberty to "enhance" those recordings using the
 marvelous [Audacity](https://www.audacityteam.org/) software.
 
 ````
-        cac ; HurryKane's [c]leanup [a]nd [c]onvert
+NAME
+    Cleanup And Convert - cac
 
-SYNOPSIS
+USAGE
     cac [-h|OPTIONS] <-i INPUT [-i INPUT2...]> <-o OUTPUT>
 
 ARGUMENTS
@@ -158,7 +163,7 @@ OPTIONS
     -t | --tempdir
             Path to the directory where the temporary files are written.
             Defaults to the directory of the input file(s). Ensure to have
-            50x the space of the input!
+            80x the space of the input!
 
     -s | --splitaudio
             If set, split a second channel (if found) out into a separate
@@ -171,14 +176,9 @@ OPTIONS
     -V | --version
             Print version and exit.
 
-  DEBUG MODE
-    -D | --debug
-            Displays extra information on all the steps of the way.
-            IMPORTANT: _ALL_ temporary files are kept! Use with caution!
-
 DESCRIPTION
-    [c]leanup [a]nd [c]onvert: HurryKane's tool for overhauling gaming
-    clips. ( See: @HurryKane76 yt channel )
+    Cleanup And Convert: HurryKane's tool for overhauling gaming clips. (
+    See: @HurryKane76 yt channel )
 
     The program uses ffmpeg to remove duplicate frames and to interpolate
     the video to twice the target FPS in a first step, then do another
@@ -188,6 +188,66 @@ DESCRIPTION
     FPS. For sources with less than 50 FPS in average, the target is set to
     30 FPS. You can use the -u/--upgrade option to force the target to be 60
     FPS, no matter the source average.
+````
+
+
+### cac_all.sh
+
+When called from within a folder with video files, all files that fit a given
+prefix will be run through `cac.pl`. There are not many optins, I use it to
+quickly upgrade groups of videos for specific game sessions.
+
+Once the upgrading is complete, the completed video files can optionaly moved
+to an archive location. If anything goes wrong, the file stays in place.
+
+The script tries to lock a lockfile first, so you can run it in parallel on the
+same video folder. However, since `cac` itself does certain parallelization, it
+is no longer recommended to start more than one instance of `cac_all.sh`.
+
+````
+Usage: ./cac_all.sh <-h|--help>
+Usage: ./cac_all.sh [OPTIONS] <-p|--prefix prefix> <-t|--target target> [-a|--archive archive]
+
+[c]leanup [a]nd [c]onvert all <prefix>*.[avi|mkv|mp4|mpg|mpeg|webm] into <target> and
+move all that succeeded to [archive] if set
+
+Checks <target> for existence of each video and works with lock files to ensure
+to not produce any double conversions.
+
+OPTIONS:
+  -a --archive <archive> : Videos are moved there after processing
+  -h --help              : Show this help and exit.
+  -s --splitaudio        : Split the second channel, if it exists, into its own wav
+  -T --tempdir <path>    : Declare an alternative temporary directory for the processing
+  -U --upgrade           : Force 60 FPS when 30 FPS would be the target (source < 50 FPS)
+````
+
+
+### restore_to_zpool.sh
+
+Whenever `zpool status -v` show broken files, I'd like to check each of them
+and restore the truly broken ones from my backup drive.
+
+To do this I generate the md5 sums of both files, the seemingly broken one and
+its backup. If either the original can not be hashed, or the two hashes differ,
+the backup is then copied over the original.
+
+This script simply automates it. Please be aware, that it is a rather crude
+tool, and that you should do your own checks first. The script only automates
+the "copy what has to be copied" step.
+
+````
+ --- restore_to_zpool Version 1.0 (EdenWorX, sed) ---
+
+Usage: ./restore_to_zpool.sh <zpool> <prefix> [--debug]
+
+Check files listed by 'zpool status -v' as defect against a backup, and
+copy those files back which have a different md5sum or can't be read.
+
+ zpool    Name of the zpool to check
+ prefix   Prefix of the backup. Only files that can be checked at and copied from
+          <backup prefix>/file/reported/by/zpool are handled
+ --debug  If added, the script only prints the copy commands it would perform
 ````
 
 
