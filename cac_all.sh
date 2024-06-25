@@ -78,25 +78,25 @@ do
 done
 
 
-if [[ "x" = "x${xPREFIX}" ]]; then
+if [[ -z "${xPREFIX}" && "yes" != "${xSHOWUSAGE}" ]]; then
     echo "ERROR: Prefix was not set!"
     xSHOWUSAGE="yes"
     xEXIT=2
 fi
 
 
-if [[ "x" = "x${xTARGET}" ]]; then
+if [[ -z "${xTARGET}" && "yes" != "${xSHOWUSAGE}" ]]; then
     echo "ERROR: Target was not set!"
     xSHOWUSAGE="yes"
     xEXIT=3
 fi
 
 
-if [[ "xyes" = "x${xSHOWUSAGE}" ]]; then
+if [[ "yes" = "${xSHOWUSAGE}" ]]; then
 	echo "Usage: $0 <-h|--help>"
 	echo "Usage: $0 [OPTIONS] <-p|--prefix prefix> <-t|--target target> [-a|--archive archive]"
 	echo
-	echo "[c]leanup [a]nd [c]onvert all <prefix>*.[mkv|mp4|webm] into <target> and"
+	echo "[c]leanup [a]nd [c]onvert all <prefix>*.[avi|mkv|mp4|mpg|mpeg|webm] into <target> and"
 	echo "move all that succeeded to [archive] if set"
 	echo
 	echo "Checks <target> for existence of each video and works with lock files to ensure"
@@ -121,7 +121,7 @@ if [[ ! -d "${xTARGET}" ]]; then
 fi
 
 
-if [[ "xyes" = "x${xHaveArchive}" && ! -d "${xARCHIVE}" ]]; then
+if [[ "yes" = "${xHaveArchive}" && ! -d "${xARCHIVE}" ]]; then
 	mkdir -p "${xARCHIVE}"
 	res=$?
 	if [[ 0 -ne $res ]]; then
@@ -142,7 +142,7 @@ mapfile -t xInputFiles < <( \
 	\) -printf "%f\n" 2>/dev/null | sort -h )
 
 for mkv in "${xInputFiles[@]}"; do
-	if [[ "x" = "x$mkv" ]]; then
+	if [[ -z "$mkv" ]]; then
 		continue 1
 	fi
 
@@ -151,10 +151,7 @@ for mkv in "${xInputFiles[@]}"; do
 	hasl=0
 
 	if [[ ! -f "${dest}" ]]; then
-		lockfile -r0 "$lock" 1>/dev/null 2>&1
-		if [[ 0 -eq $? ]]; then
-				hasl=1
-		fi
+		lockfile -r0 "$lock" 1>/dev/null 2>&1 && hasl=1
 	fi
 
 	if [[ $hasl -eq 1 ]]; then
@@ -163,7 +160,7 @@ for mkv in "${xInputFiles[@]}"; do
 		rm -f "${lock}"
 		
 		if [[ 0 -eq $res ]]; then
-			if [[ "xyes" = "x${xHaveArchive}" ]]; then
+			if [[ "yes" = "${xHaveArchive}" ]]; then
 				echo -n "Moving \"$mkv\" ..."
 				mv "${mkv}" "${xARCHIVE}/"
 				echo " done"
