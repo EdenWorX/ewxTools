@@ -157,7 +157,7 @@ my %FF_INTERPOLATE_fmt = (
 	  [ "libplacebo='extra_opts=preset=high_quality:frame_mixer=mitchell_clamp:fps=%d'", "minterpolate='fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'" ]
 );
 
-my %dir_stats        = ();                ## <dir> => { has_space => <what df says>, need_space => wll inputs in there x 50, srcs => @src }
+my %dir_stats        = ();                ## <dir> => { has_space => <what df says>, need_space => all inputs in there x 80, srcs => @src }
 my $do_print_help    = 0;
 my $do_print_version = 0;
 my $do_split_audio   = 0;
@@ -733,8 +733,11 @@ sub check_multi_temp_dir {
 			push @{ $dir_stats{$dir}{srcs} }, $src;
 			my $ref = df($dir);
 			if ( ( defined $ref ) ) {
-				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;      ## again count in M not K
-				$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024;  ## also in M now.
+
+				# The temporary UT Video files will need roughly 70-75 times the input
+				# Plus a probably 3 times bigger output than input and we end at x80.
+				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;           ## df returns 1K blocks, but we calculate in M.
+				$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024 * 80;  ## also in M now, 80 times the source size.
 			} else {
 
 				# =) df() failed? WTF?
@@ -767,16 +770,19 @@ sub check_single_temp_dir {
 		foreach my $src (@path_source) {
 			push @{ $dir_stats{$path_temp}{srcs} }, $src;
 		}
-		if ( ( defined $ref ) ) {
+		if ( defined $ref ) {
 
-			# The temporary UT Video files will need roughly 42-47 times the input
-			# Plus a probably 3 times bigger output than input and we end at x50.
-			my $needed_space = $total_size * 50;
-			my $have_space   = $ref->{bavail} / 1024;  # df returns 1K blocks, but we calculate in M.
-			if ( $have_space < $needed_space ) {
-				log_error( $work_data, "Not enough space! '%s' has only %s / %s M free!", $path_temp, cleanint($have_space), cleanint($needed_space) )
-				  and ++${$errCount};
-			}
+			# Note: See check_multi_temp_dir() about tghe sizes.
+			$dir_stats{$path_temp}{has_space}  = $ref->{bavail} / 1024;
+			$dir_stats{$path_temp}{need_space} = $total_size * 80;
+			if ( $dir_stats{$path_temp}{has_space} < $dir_stats{$path_temp}{need_space} ) {
+				log_error(
+					$work_data, "Not enough space! '%s' has only %s / %s M free!",
+					$path_temp,
+					cleanint( $dir_stats{$path_temp}{has_space} ),
+					cleanint( $dir_stats{$path_temp}{need_space} )
+				) and ++${$errCount};
+			} ## end if ( $dir_stats{$path_temp...})
 		} else {
 
 			# =) df() failed? WTH?
@@ -2125,7 +2131,7 @@ This help message
 =item B<-t | --tempdir>
 
 Path to the directory where the temporary files are written. Defaults to the
-directory of the input file(s). Ensure to have 50x the space of the input!
+directory of the input file(s). Ensure to have 80x the space of the input!
 
 =item B<-s | --splitaudio>
 
