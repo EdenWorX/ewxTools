@@ -1659,13 +1659,15 @@ sub show_progress {
 
 		# Write into log file
 		$have_progress_msg = 0;  ## ( We already deleted the line above, leaving it at 1 would add a useless empty line. )
-		log_status(
-			$work_data, "%d forks finished %d frames (%d dropped, %d dup'd); Duration: %s; FPS: %03.2f; %s; File Size: %s",
-			$thr_count, $prgData->{frame},
+		( $prgData->{frame} > 0 ) and log_status(
+			$work_data,
+			"%d fork%s finished after %d frames, duration %s, FPS %03.2f, %s, file size %s\n"
+			  . '    (%d frames dropped, %d frames duplicated)',
+			$thr_count, $thr_count > 1 ? 's' : $EMPTY,
+			$prgData->{frame}, $time_str, $prgData->{fps}, $bitrate_str, $size_str,
 			$prgData->{drop_frames},
-			$prgData->{dup_frames},
-			$time_str, $prgData->{fps}, $bitrate_str, $size_str
-		);
+			$prgData->{dup_frames}
+		) or log_status( $work_data, '%d fork%s finished, total duration is: %s', $thr_count, $thr_count > 1 ? 's' : $EMPTY, $time_str );
 	} else {
 
 		# Output on console
