@@ -57,7 +57,7 @@ this program. If not, see https://www.gnu.org/licenses/.
     Tool to overwrite free space on devices you can not just dd over.
 
 
-### backup_dir.sh
+## backup_dir.sh
 
 This is just a little script to make using rsync for backup purposes, including
 the deletion of files which have been deleted in the souce, more convenient.
@@ -83,7 +83,7 @@ OPTIONS:
 ````
 
 
-### cac[.pl]
+## cac[.pl]
 
 *Note: `cac` is just a symlink on `cac.pl`.*
 
@@ -191,7 +191,7 @@ DESCRIPTION
 ````
 
 
-### cac_all.sh
+## cac_all.sh
 
 When called from within a folder with video files, all files that fit a given
 prefix will be run through `cac.pl`. There are not many optins, I use it to
@@ -223,7 +223,7 @@ OPTIONS:
 ````
 
 
-### restore_to_zpool.sh
+## restore_to_zpool.sh
 
 Whenever `zpool status -v` show broken files, I'd like to check each of them
 and restore the truly broken ones from my backup drive.
@@ -251,7 +251,7 @@ copy those files back which have a different md5sum or can't be read.
 ````
 
 
-### spacefader
+## spacefader
 
 This is a very simple tool that fills up free space on any mounted device until
 the device is full, and deletes those dummy files thereafter.
