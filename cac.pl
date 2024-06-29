@@ -38,7 +38,7 @@ our $VERSION = '1.0.4';
 
 # =======================================================================================
 # Workflow:
-# Phase 1: Get Values via ffprobe and determine minimum seconds to split into 5 segments.
+# Phase 1: Get Values via ffprobe and determine minimum seconds to split into 4 segments.
 # Phase 2: Split the source into 4 segments, streamcopy, length from Phase 1.
 # Phase 3: 1 Thread per Segment does mpdecimate(7)+libplacebo(120|60) into UTVideo.
 # Phase 4: 1 Thread per Segment does mpdecimate(2)+libplacebo(60|30) into UTVideo.
@@ -1058,7 +1058,7 @@ sub get_log_level {
 	  or ( $LOG_WARNING == $level ) and return ('Warning!')
 	  or ( $LOG_ERROR == $level )   and return ('ERROR !!')
 	  or ( $LOG_STATUS == $level )  and return ('-status-')
-	  or return ($EMPTY);
+	  or return ('_DEBUG!_');
 
 	return ('=DEBUG=');
 } ## end sub get_log_level
