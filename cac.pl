@@ -972,7 +972,7 @@ sub get_info_from_ffprobe {
 	my $avg_frame_rate_stream = -1;
 	my @fpcmd                 = ( $FP, @FP_ARGS, "stream=$stream_fields", split( $SPACE, $source_info{$src}{probeStrings} ), $src );
 
-	log_debug( $work_data, 'Calling: %s', ( join $SPACE, @fpcmd ) );
+	log_info( $work_data, 'Calling: %s', ( join $SPACE, @fpcmd ) );
 
 	my @fplines = split /\n/ms, capture_cmd(@fpcmd);
 	can_work or return 0;
@@ -1114,23 +1114,12 @@ sub handle_fork_message {
 } ## end sub handle_fork_message
 
 sub handle_fork_progress {
-	my ( $pid, $prgData, $fork_timeout, $fork_strikes ) = @_;
+	my ( $pid, $prgData, $fork_timeout ) = @_;
 	my $result = 1;
-
-	defined( $fork_timeout->{$pid} ) or $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
-	defined( $fork_strikes->{$pid} ) or $fork_strikes->{$pid} = 0;
 
 	reap_pid($pid) and $result = 0;  # the PID will give no progress any more
 
-	# Check/Initialize the progress hash
-	defined( $prgData->{bitrate} )     or $prgData->{bitrate}     = 0.0;  ## "0.0kbits/s" in the file
-	defined( $prgData->{drop_frames} ) or $prgData->{drop_frames} = 0;
-	defined( $prgData->{dup_frames} )  or $prgData->{dup_frames}  = 0;
-	defined( $prgData->{fps} )         or $prgData->{fps}         = 0.0;
-	defined( $prgData->{frame} )       or $prgData->{frame}       = 0;
-	defined( $prgData->{out_time_ms} ) or $prgData->{out_time_ms} = 0;    ## "00:00:00.000000" in the file, but we read out_time_ms
-	defined( $prgData->{total_size} )  or $prgData->{total_size}  = 0;
-
+	log_debug( $work_data, "Loading Progress PID %d, File '%s'", $pid, $work_data->{PIDs}{$pid}{prgfile} );
 	load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS or --$fork_timeout->{$pid};
 
 	# Warn if a fork looks like it is freezing...
@@ -2061,13 +2050,29 @@ sub watch_my_forks {
 	my $forks_active = $work_data->{cnt};
 	my %fork_timeout = ();
 	my %fork_strikes = ();
+	my @PIDs         = sort keys %{ $work_data->{PIDs} };
 	log_debug( $work_data, 'Forks : %s', ( join ', ', keys %{ $work_data->{PIDs} } ) );
 	unlock_data($work_data);
 
+	# Initialize timeout and strike data
+	foreach my $pid (@PIDs) {
+		$fork_timeout{$pid} = $TIMEOUT_INTERVALS;
+		$fork_strikes{$pid} = 0;
+	}
+
+	# Now check on all forks periodically until all are gone
 	while ( $forks_active > 0 ) {
-		my %prgData;
+		my %prgData = (
+			bitrate     => 0.0,
+			drop_frames => 0,
+			dup_frames  => 0,
+			fps         => 0.0,
+			frame       => 0,
+			out_time_ms => 0,
+			total_size  => 0
+		);
+
 		lock_data($work_data);
-		my @PIDs     = sort keys %{ $work_data->{PIDs} };
 		my $fork_cnt = $work_data->{cnt};
 		unlock_data($work_data);
 		$forks_active = 0;
@@ -2076,7 +2081,7 @@ sub watch_my_forks {
 
 		foreach my $pid (@PIDs) {
 			pid_exists( $work_data, $pid ) or next;
-			$forks_active += handle_fork_progress( $pid, \%prgData, \%fork_timeout, \%fork_strikes );
+			$forks_active += handle_fork_progress( $pid, \%prgData, \%fork_timeout );
 			usleep(0);
 		}
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
@@ -2095,7 +2100,9 @@ sub watch_my_forks {
 
 		usleep(500_000);
 	} ## end while ( $forks_active > 0)
+
 	$result = wait_for_all_forks();
+
 	return $result;
 } ## end sub watch_my_forks
 
