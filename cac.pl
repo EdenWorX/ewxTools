@@ -588,7 +588,7 @@ sub build_source_groups {
 } ## end sub build_source_groups
 
 sub can_work {
-	return 0 == $death_note;
+	return ( ( 0 == $death_note ) && ( 0 == $ret_global ) );
 }
 
 # ----------------------------------------------------------------
