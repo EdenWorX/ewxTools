@@ -2086,7 +2086,7 @@ sub watch_my_forks {
 		}
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
-		( $death_note > 0 ) and send_forks_the_kill();
+		can_work or send_forks_the_kill();
 
 		lock_data($work_data);
 		@PIDs = sort keys %{ $work_data->{PIDs} };
