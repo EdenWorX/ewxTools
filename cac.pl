@@ -34,7 +34,7 @@ my $work_done = 0;            # Needed to know whether to log anything on END{}
 #                                     restart it using minterpolate instead. Better be slow than break.
 #
 # Please keep this current:
-our $VERSION = '1.0.4';
+Readonly our $VERSION => '1.0.4';
 
 # =======================================================================================
 # Workflow:
