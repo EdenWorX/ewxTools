@@ -55,11 +55,17 @@ my $death_note = 0;
 # Global return value, is set to 1 by log_error()
 my $ret_global = 0;
 
+# Fork status values
 Readonly my $FF_CREATED  => 1;
 Readonly my $FF_RUNNING  => 2;
 Readonly my $FF_KILLED   => 3;
 Readonly my $FF_FINISHED => 4;
 Readonly my $FF_REAPED   => 5;
+
+# ffmpeg progress values
+Readonly my $PROGRESS_NONE     => 1;
+Readonly my $PROGRESS_CONTINUE => 2;
+Readonly my $PROGRESS_ENDED    => 3;
 
 #@type IPC::Shareable
 my $work_data = IPC::Shareable->new( key => 'WORK_DATA', create => 1 );
@@ -1113,14 +1119,29 @@ sub handle_fork_message {
 	return $have_error;
 } ## end sub handle_fork_message
 
+##
+# @brief    Handles the progress of a fork, loading its current values into @a $prgData
+# @details  This function is used to handle the progress of a particular fork referred by its PID.
+#           It also resets the timeout counter based on the load progress. If a fork appears to be frozen,
+#           a warning message is triggered.
+#
+# @param    $pid The PID of the fork.
+# @param    $prgData The progress file last block is loaded into this hashref.
+# @param    $fork_timeout Timeout object for forks.
+# @return   Returns -1 if the PID is gone without any progress, 0 if progress has ended successfully and 1 if it is still running.
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout ) = @_;
 	my $result = 1;
 
-	reap_pid($pid) and $result = 0;  # the PID will give no progress any more
+	pid_exists( $work_data, $pid ) and !reap_pid($pid) or $result = -1;  # the PID is finished or already gone
 
 	log_debug( $work_data, "Loading Progress PID %d, File '%s'", $pid, $work_data->{PIDs}{$pid}{prgfile} );
-	load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS or --$fork_timeout->{$pid};
+
+	my $progress_state = load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData );
+
+	( $PROGRESS_NONE == $progress_state ) and ( $result > 0 ) and --$fork_timeout->{$pid};
+	( $PROGRESS_CONTINUE == $progress_state ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
+	( $PROGRESS_ENDED == $progress_state ) and $result = 0;
 
 	# Warn if a fork looks like it is freezing...
 	( ( $TIMEOUT_INTERVALS / 2 ) == $fork_timeout->{$pid} ) and log_warning( $work_data, 'Fork PID %d seems to be frozen...', $pid );
@@ -1197,17 +1218,23 @@ sub is_progress_line {
 sub load_progress {
 	my ( $progress_log, $progress_data ) = @_;
 
-	file_exists($progress_log) or return 0;
+	file_exists($progress_log) or return $PROGRESS_NONE;
 
 	my @last_20_lines = read_and_reverse_last_lines( $progress_log, 20 );
 	my $lines_count   = scalar @last_20_lines;
 
 	my $progress_count = 0;
+	my $progress_state = $PROGRESS_NONE;
 	my $i              = 0;
 	while ( ( $progress_count < 1 ) && ( $i < $lines_count ) ) {
 		chomp $last_20_lines[$i];
 		log_debug( $work_data, "[RAW % 2d] Check '%s'", $i, $last_20_lines[$i] );
-		is_progress_line( $last_20_lines[$i] ) and ++$progress_count;
+		if ( $last_20_lines[$i] =~ m/^progress=(\S+)/xms ) {
+
+			# As we parse backwards, this is the actual state of the process
+			++$progress_count;
+			$progress_state = ( 'continue' eq $1 ) ? $PROGRESS_CONTINUE : ( 'end' eq $1 ) ? $PROGRESS_ENDED : $PROGRESS_NONE;
+		} ## end if ( $last_20_lines[$i...])
 		$i++;
 	} ## end while ( ( $progress_count...))
 
@@ -1224,7 +1251,7 @@ sub load_progress {
 		}
 		$i++;
 	} ## end while ( ( $progress_count...))
-	return $progress_count == 2 ? 1 : 0;
+	return $progress_state;
 } ## end sub load_progress
 
 sub lock_data {
@@ -2080,10 +2107,11 @@ sub watch_my_forks {
 		can_work or last;
 
 		foreach my $pid (@PIDs) {
-			pid_exists( $work_data, $pid ) or next;
-			$forks_active += handle_fork_progress( $pid, \%prgData, \%fork_timeout );
+			my $fork_status = handle_fork_progress( $pid, \%prgData, \%fork_timeout );
+			( $fork_status < 0 ) and $ret_global = 23      # The fork has crashed or broken off with an error
+			  or ( $fork_status > 0 ) and ++$forks_active;  # The fork is still running
 			usleep(0);
-		}
+		} ## end foreach my $pid (@PIDs)
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
 		can_work or send_forks_the_kill();
