@@ -1133,7 +1133,7 @@ sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout ) = @_;
 	my $result = 1;
 
-	pid_exists( $work_data, $pid ) and !reap_pid($pid) or $result = -1;  # the PID is finished or already gone
+	pid_exists( $work_data, $pid ) and ( !reap_pid($pid) ) or $result = -1;  # the PID is finished or already gone
 
 	log_debug( $work_data, "Loading Progress PID %d, File '%s'", $pid, $work_data->{PIDs}{$pid}{prgfile} );
 
@@ -2108,7 +2108,7 @@ sub watch_my_forks {
 
 		foreach my $pid (@PIDs) {
 			my $fork_status = handle_fork_progress( $pid, \%prgData, \%fork_timeout );
-			( $fork_status < 0 ) and $ret_global = 23      # The fork has crashed or broken off with an error
+			( $fork_status < 0 ) and $ret_global = 23       # The fork has crashed or broken off with an error
 			  or ( $fork_status > 0 ) and ++$forks_active;  # The fork is still running
 			usleep(0);
 		} ## end foreach my $pid (@PIDs)
