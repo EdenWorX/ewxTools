@@ -160,7 +160,6 @@ my $ff_interp_libp_none = "libplacebo='extra_opts=preset=high_quality:frame_mixe
 my $ff_interp_libp_high = "libplacebo='extra_opts=preset=high_quality:frame_mixer=mitchell_clamp:fps=%d'";
 my $ff_interp_mint_none = "minterpolate='fps=%d:mi_mode=dup:scd=none'";
 my $ff_interp_mint_high = "minterpolate='fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'";
-my %FF_INTERPOLATE_fmt  = ( 'iup' => [ $ff_interp_libp_high, $ff_interp_mint_none ], 'idn' => [ $ff_interp_libp_none, $ff_interp_mint_high ] );
 
 my %dir_stats        = ();                ## <dir> => { has_space => <what df says>, need_space => all inputs in there x 80, srcs => @src }
 my $do_print_help    = 0;
@@ -1321,20 +1320,34 @@ sub log_debug {
 }
 
 sub make_filter_string {
-	my ($inter_opts) = @_;
-	my $tgt          = $inter_opts->{'tgt'};
-	my $dec_max      = $inter_opts->{'dec_max'};
-	my $dec_frac     = $inter_opts->{'dec_frac'};
-	my $tgt_fps      = $inter_opts->{'fps'};
-	my $do_alt       = $inter_opts->{'do_alt'};
+	my ( $gid, $inter_opts ) = @_;
+	my $do_alt   = $inter_opts->{'do_alt'};
+	my $dropdups = $source_groups{$gid}{dropdups} // 0;
+	my $dec_max  = $inter_opts->{'dec_max'};
+	my $dec_frac = $inter_opts->{'dec_frac'};
+	my $src_fps  = $source_groups{$gid}{fps} // $target_fps;
+	my $tgt      = $inter_opts->{'tgt'};
+	my $tgt_fps  = $inter_opts->{'fps'};
 	( defined $do_alt ) and ( ( 0 == $do_alt ) or ( 1 == $do_alt ) ) or confess("do_alt $do_alt out of range! (0/1)");
 	can_work()                                                       or return 1;
 
 	# Prepare filter components
-	my $F_in_scale    = "scale='in_range=full:out_range=full'";
-	my $F_mpdecimate  = "mpdecimate='max=${dec_max}:frac=${dec_frac}'";
-	my $F_out_scale   = "scale='flags=accurate_rnd+full_chroma_inp+full_chroma_int:in_range=full:out_range=full'";
-	my $F_interpolate = sprintf $FF_INTERPOLATE_fmt{$tgt}[$do_alt], $tgt_fps;
+	my $F_in_scale   = "scale='in_range=full:out_range=full'";
+	my $F_mpdecimate = "mpdecimate='max=${dec_max}:frac=${dec_frac}'";
+	my $F_out_scale  = "scale='flags=accurate_rnd+full_chroma_inp+full_chroma_int:in_range=full:out_range=full'";
+	my $F_interpolate;
+
+	if ( 'iup' eq $tgt ) {
+
+		# If we have a source with more FPS than our max_fps, libplacebo must interpolate to get the timings right.
+		# Otherwise libplacebo can use a none interpolation. minterpolate is always using simple dup, no matter what.
+		$F_interpolate = sprintf 0 == $do_alt ? ( $src_fps > $tgt_fps ? $ff_interp_libp_high : $ff_interp_libp_none ) : $ff_interp_mint_none, $tgt_fps;
+	} elsif ( 'idn' eq $tgt ) {
+
+		# When calculating down to the target FPS, we always use high libplacebo interpolation.
+		# But on alternative interpolation we only use high minterpolate if there actually are dropped/dupped frames
+		$F_interpolate = sprintf 0 == $do_alt ? $ff_interp_libp_high : ( 0 == $dropdups ? $ff_interp_mint_none : $ff_interp_mint_high ), $tgt_fps;
+	} ## end elsif ( 'idn' eq $tgt )
 
 	return "pad=ceil(iw/2)*2:ceil(ih/2)*2,${F_in_scale}${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}";
 } ## end sub make_filter_string
@@ -1804,7 +1817,7 @@ sub start_worker_fork {
 	my $prgLog        = sprintf $source_groups{$gid}{prg}, $i;
 	my $file_from     = sprintf $source_groups{$gid}{$source}, $i;
 	my $file_to       = sprintf $source_groups{$gid}{$target}, $i;
-	my $filter_string = make_filter_string($inter_opts);
+	my $filter_string = make_filter_string( $gid, $inter_opts );
 	my @fps_opts      = ( 'idn' eq $target ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
 	my @ffargs        = (
 		$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
@@ -1817,7 +1830,8 @@ sub start_worker_fork {
 	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
 	@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
-	$work_data->{PIDs}{$pid}{id} = $i;
+	$work_data->{PIDs}{$pid}{gid} = $gid;
+	$work_data->{PIDs}{$pid}{id}  = $i;
 	%{ $work_data->{PIDs}{$pid}{interp} } = %{$inter_opts};
 	$work_data->{PIDs}{$pid}{prgfile} = $prgLog;
 	$work_data->{PIDs}{$pid}{source}  = $source_groups{$gid}{$source};
@@ -1877,10 +1891,11 @@ sub strike_fork_restart {
 		$inter_opts->{'do_alt'} = 1;
 
 		lock_data($work_data);
+		my $gid           = $work_data->{PIDs}{$pid}{gid};
 		my $prgLog        = $work_data->{PIDs}{$pid}{prgfile};
 		my $file_from     = sprintf $work_data->{PIDs}{$pid}{source}, $tid;
 		my $file_to       = sprintf $work_data->{PIDs}{$pid}{target}, $tid;
-		my $filter_string = make_filter_string($inter_opts);
+		my $filter_string = make_filter_string( $gid, $inter_opts );
 		my @fps_opts      = ( 'idn' eq $inter_opts->{'tgt'} ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
 		my @ffargs        = (
 			$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
@@ -2111,6 +2126,11 @@ sub watch_my_forks {
 			( $fork_status < 0 ) and $ret_global = 23       # The fork has crashed or broken off with an error
 			  or ( $fork_status > 0 ) and ++$forks_active;  # The fork is still running
 			usleep(0);
+
+			# Make sure we later know how many frames got dropped/dup'd.
+			my $dropdups = $prgData{drop_frames} + $prgData{dup_frames};
+			my $gid      = $work_data->{PIDs}{$pid}{gid};
+			( defined $source_groups{$gid}{dropdups} ) and ( $source_groups{$gid}{dropdups} >= $dropdups ) or $source_groups{$gid}{dropdups} = $dropdups;
 		} ## end foreach my $pid (@PIDs)
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
