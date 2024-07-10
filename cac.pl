@@ -1185,7 +1185,9 @@ sub handle_io_operations {
 
 	while ( my @ready = $io_selector->can_read(1) ) {
 		for my $handle (@ready) {
-			if ( my $line = <$handle> ) {
+			( defined $handle ) or next;
+			my $line = <$handle>;
+			if ( defined $line ) {
 				chomp $line;
 				( $handle == $fh_err ) and ( push @{$msg_err_p}, $line ) or ( push @{$msg_out_p}, $line );
 			}
