@@ -4,8 +4,11 @@ use warnings FATAL => 'all';
 
 use PerlIO;
 use POSIX qw( _exit floor :sys_wait_h );
+use Symbol 'gensym';
+use IPC::Open3;
 use IPC::Run3;
 use IPC::Shareable qw( LOCK_EX );
+use IO::Select;
 use Carp;
 use Cwd qw( abs_path );
 use Data::Dumper;
@@ -1089,14 +1092,14 @@ sub handle_eval_result {
 	my ( $res, $eval_err, $child_error, $p_exit_code, $p_exit_message ) = @_;
 
 	if ( length($eval_err) > 0 ) {
-		${$p_exit_code}    = -1;
+		( 0 == ${$p_exit_code} ) and ${$p_exit_code} = -1;
 		${$p_exit_message} = $eval_err;
 	} elsif ( -1 != $child_error ) {
 		if ( $child_error & 0x7F ) {
-			${$p_exit_code}    = $child_error;
+			( 0 == ${$p_exit_code} ) and ${$p_exit_code} = $child_error;
 			${$p_exit_message} = 'Killed by signal ' . ( $child_error & 0x7F );
 		} elsif ( $child_error >> 8 ) {
-			${$p_exit_code}    = $child_error >> 8;
+			( 0 == ${$p_exit_code} ) and ${$p_exit_code} = $child_error >> 8;
 			${$p_exit_message} = 'Exited with error ' . ( $child_error >> 8 );
 		}
 	} ## end elsif ( -1 != $child_error)
@@ -1452,6 +1455,20 @@ sub read_and_reverse_last_lines {
 	return @lines;
 } ## end sub read_and_reverse_last_lines
 
+##
+# @brief Reap a child process by its process ID (PID).
+#
+# @details The reap_pid subroutine checks if a child process related to
+# the provided PID has finished its job or not. If finished, it sets the
+# status of the process to 'reaped'. If still busy, it returns 0.
+#
+# @param[in] $pid The Process ID of child process to be reaped.
+#
+# @return Returns 1 if the PID is defined and child process has finished
+# or was not found in PIDs. 0 is returned if the PID is still busy.
+#
+# @note It also reports an error and aborts if the provided PID is not
+# valid or not defined.
 sub reap_pid {
 	my ($pid) = @_;
 
@@ -1758,9 +1775,40 @@ sub start_forked {
 	# Now we can run the command as desired
 	my @stdout;
 	my @stderr;
+	my $err = gensym;
 	my $exc = 0;
 	my $exm = $EMPTY;
-	my $res = eval { run3 $cmd, \undef, \@stdout, \@stderr };
+	my $res = eval {
+		local $SIG{CHLD} = 'IGNORE';
+		my $cmd_pid = open3( undef, \@stdout, $err, @{$cmd} );
+		my $sel     = IO::Select->new();
+		$sel->add($err);
+		log_debug( "Started '%s' with PID %d", $cmd->[0], $cmd_pid );
+		while ( 0 == ( waitpid $cmd_pid, POSIX::WNOHANG ) ) {
+			while ( my @ready = $sel->can_read(1) ) {
+				for my $fh (@ready) {
+					if ( my $line = <$fh> ) {
+						push @stderr, $line;
+					}
+				}
+				usleep(5_000);
+			} ## end while ( my @ready = $sel->...)
+
+			# React on external whishes to end this fork
+			( 1 == $death_note ) and ( kill 'TERM', $cmd_pid );
+			( 4 == $death_note ) and ( kill 'KILL', $cmd_pid );  # react on 4, 5 will kill this fork (See terminator();
+			usleep(20_000);
+		} ## end while ( 0 == ( waitpid $cmd_pid...))
+		$sel->remove($err);
+		( 0 != ( waitpid $cmd_pid, 0 ) )
+		  and log_debug(
+			"'%s' PID %d %s", $cmd->[0], $cmd_pid,
+			( $death_note < 1 )   ? 'ended'
+			: ( $death_note < 4 ) ? 'terminated'
+			:                       'killed'
+		  );
+		$exc = $? >> 8;
+	};
 	$res = handle_eval_result( $res, $@, $?, \$exc, \$exm );
 
 	# We only have to "transport" the results:
