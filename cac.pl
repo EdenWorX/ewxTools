@@ -1088,22 +1088,30 @@ sub get_time_now {
 }
 
 sub handle_eval_result {
-	my ( $res, $eval_err, $child_error, $p_exit_code, $p_exit_message ) = @_;
+	my ( $fork_data, $res, $eval_err, $child_error, $p_exit_code, $p_exit_message ) = @_;
+
+	log_debug( $fork_data, "Handling eval result res %d, err '%s', chld %d, exc %d, exm '%s'", $res, $eval_err, $child_error, $p_exit_code, $p_exit_message );
 
 	if ( length($eval_err) > 0 ) {
 		( 0 == ${$p_exit_code} ) and ${$p_exit_code} = -1;
 		${$p_exit_message} = $eval_err;
+		log_debug( $fork_data, "eval failed with error message '%s' [-1]", $eval_err );
+		$res = 0;
 	} elsif ( -1 != $child_error ) {
 		if ( $child_error & 0x7F ) {
 			( 0 == ${$p_exit_code} ) and ${$p_exit_code} = $child_error;
 			${$p_exit_message} = 'Killed by signal ' . ( $child_error & 0x7F );
+			$res = 0;
+			log_debug( $fork_data, 'eval killed by signal %d [%d]', ( $child_error & 0x7F ), $child_error );
 		} elsif ( $child_error >> 8 ) {
 			( 0 == ${$p_exit_code} ) and ${$p_exit_code} = $child_error >> 8;
 			${$p_exit_message} = 'Exited with error ' . ( $child_error >> 8 );
-		}
+			$res = 0;
+			log_debug( $fork_data, 'eval exited with error %d [%d]', ( $child_error >> 8 ), $child_error );
+		} ## end elsif ( $child_error >> 8)
 	} ## end elsif ( -1 != $child_error)
 
-	return $res ? $res : $child_error;
+	return $res;
 } ## end sub handle_eval_result
 
 sub handle_fork_message {
@@ -1605,7 +1613,8 @@ sub remove_pid {
 } ## end sub remove_pid
 
 sub run_cmd_from_fork {
-	my ( $fork_data, $cmd, $msg_out_p, $msg_err_p, $exc_p ) = @_;
+	my ( $fork_data, $cmd, $msg_out_p, $msg_err_p, $exc_p, $exm_p ) = @_;
+	my $chld_error = 0;
 
 	my $res = eval {
 		local $SIG{CHLD} = 'IGNORE';
@@ -1632,8 +1641,10 @@ sub run_cmd_from_fork {
 		$io_selector->remove($stdout);
 
 		( 0 != ( waitpid $cmd_pid, 0 ) ) and log_debug( $fork_data, "'%s' PID %d '%s", $cmd->[0], $cmd_pid, select_termination_message() );
-		${$exc_p} = $? >> 8;
+		$chld_error = ( $? > 0 ) ? $? : 0;  ## -1 means, that waitpid has not have had a process to reap. Not an error!
+		${$exc_p} = $chld_error >> 8;
 	};
+	$res = handle_eval_result( $fork_data, $res, $@, $chld_error, $exc_p, $exm_p );
 
 	return $res;
 } ## end sub run_cmd_from_fork
@@ -1825,8 +1836,7 @@ sub start_capture {
 	my @stderr;
 	my $exc = 0;
 	my $exm = $EMPTY;
-	my $res = run_cmd_from_fork( $fork_data, $cmd, \@stdout, \@stderr, \$exc );
-	$res = handle_eval_result( $res, $@, $?, \$exc, \$exm );
+	my $res = run_cmd_from_fork( $fork_data, $cmd, \@stdout, \@stderr, \$exc, \$exm );
 
 	# We only have to "transport" the results:
 	if ( lock_data($fork_data) ) {
@@ -1846,7 +1856,7 @@ sub start_capture {
 	# This fork is finished now
 	set_pid_status( $fork_data, $pid, $FF_FINISHED );
 
-	return 1;
+	return $res;
 } ## end sub start_capture
 
 sub start_forked {
@@ -1868,8 +1878,7 @@ sub start_forked {
 	my $exm = $EMPTY;
 
 	# Running the command is split out
-	my $res = run_cmd_from_fork( $fork_data, $cmd, \@stdout, \@stderr, \$exc );
-	$res = handle_eval_result( $res, $@, $?, \$exc, \$exm );
+	my $res = run_cmd_from_fork( $fork_data, $cmd, \@stdout, \@stderr, \$exc, \$exm );
 
 	# We only have to "transport" the results:
 	if ( lock_data($fork_data) ) {
@@ -1885,7 +1894,7 @@ sub start_forked {
 	# This fork is finished now
 	set_pid_status( $fork_data, $pid, $FF_FINISHED );
 
-	return 1;
+	return $res;
 } ## end sub start_forked
 
 # ---------------------------------------------------------
