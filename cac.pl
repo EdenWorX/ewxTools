@@ -1183,26 +1183,36 @@ sub handle_io_operations {
 		$fh_err, $msg_out_p, $msg_err_p
 	) = @_;
 
-	while ( my @ready = $io_selector->can_read(1) ) {
+	my $are_ready  = 1;
+	my $have_lines = 1;
+
+	while ( ( $are_ready > 0 ) && ( $have_lines > 0 ) && ( my @ready = $io_selector->can_read(0.1) ) ) {
+		$are_ready  = scalar @ready;
+		$have_lines = 0;
+
 		for my $handle (@ready) {
 			( defined $handle ) or next;
 			my $line = <$handle>;
+
 			if ( defined $line ) {
 				chomp $line;
 				( $handle == $fh_err ) and ( push @{$msg_err_p}, $line ) or ( push @{$msg_out_p}, $line );
+				++$have_lines;
 			}
 		} ## end for my $handle (@ready)
 		usleep(5_000);
-	} ## end while ( my @ready = $io_selector...)
+	} ## end while ( ( $are_ready > 0 ...))
 
 	return 1;
 } ## end sub handle_io_operations
 
 sub handle_termination_request {
-	my ($cmd_pid) = @_;
+	my ( $fork_data, $cmd_pid ) = @_;
 
-	( 1 == $death_note ) and ( kill 'TERM', $cmd_pid );
-	( 4 == $death_note ) and ( kill 'KILL', $cmd_pid );  # react on 4, 5 will kill this fork (See terminator();
+	( 1 == $death_note ) and log_debug( $fork_data, "Sending 'TERM' to PID %d", $cmd_pid ) and ( kill 'TERM', $cmd_pid );
+
+	# react on 4, 5 will kill this fork (See terminator();
+	( 4 == $death_note ) and log_debug( $fork_data, "Sending 'KILL' to PID %d", $cmd_pid ) and ( kill 'KILL', $cmd_pid );
 
 	return 1;
 } ## end sub handle_termination_request
@@ -1595,7 +1605,7 @@ sub remove_pid {
 } ## end sub remove_pid
 
 sub run_cmd_from_fork {
-	my ( $cmd, $msg_out_p, $msg_err_p, $exc_p ) = @_;
+	my ( $fork_data, $cmd, $msg_out_p, $msg_err_p, $exc_p ) = @_;
 
 	my $res = eval {
 		local $SIG{CHLD} = 'IGNORE';
@@ -1606,7 +1616,7 @@ sub run_cmd_from_fork {
 		$io_selector->add($stdout);
 		$io_selector->add($stderr);
 
-		log_debug( "Started '%s' with PID %d", $cmd->[0], $cmd_pid );
+		log_debug( $fork_data, "Started '%s' with PID %d", $cmd->[0], $cmd_pid );
 
 		while ( 0 == ( waitpid $cmd_pid, POSIX::WNOHANG ) ) {
 
@@ -1614,14 +1624,14 @@ sub run_cmd_from_fork {
 			handle_io_operations( $io_selector, $stderr, $msg_out_p, $msg_err_p );
 
 			# React on external wishes to end this fork
-			handle_termination_request($cmd_pid);
+			handle_termination_request( $fork_data, $cmd_pid );
 			usleep(20_000);
 		} ## end while ( 0 == ( waitpid $cmd_pid...))
 
 		$io_selector->remove($stderr);
 		$io_selector->remove($stdout);
 
-		( 0 != ( waitpid $cmd_pid, 0 ) ) and log_debug( "'%s' PID %d '%s", $cmd->[0], $cmd_pid, select_termination_message() );
+		( 0 != ( waitpid $cmd_pid, 0 ) ) and log_debug( $fork_data, "'%s' PID %d '%s", $cmd->[0], $cmd_pid, select_termination_message() );
 		${$exc_p} = $? >> 8;
 	};
 
@@ -1815,7 +1825,7 @@ sub start_capture {
 	my @stderr;
 	my $exc = 0;
 	my $exm = $EMPTY;
-	my $res = run_cmd_from_fork( $cmd, \@stdout, \@stderr, \$exc );
+	my $res = run_cmd_from_fork( $fork_data, $cmd, \@stdout, \@stderr, \$exc );
 	$res = handle_eval_result( $res, $@, $?, \$exc, \$exm );
 
 	# We only have to "transport" the results:
@@ -1858,7 +1868,7 @@ sub start_forked {
 	my $exm = $EMPTY;
 
 	# Running the command is split out
-	my $res = run_cmd_from_fork( $cmd, \@stdout, \@stderr, \$exc );
+	my $res = run_cmd_from_fork( $fork_data, $cmd, \@stdout, \@stderr, \$exc );
 	$res = handle_eval_result( $res, $@, $?, \$exc, \$exm );
 
 	# We only have to "transport" the results:
