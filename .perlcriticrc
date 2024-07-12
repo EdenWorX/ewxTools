@@ -49,6 +49,10 @@ allow_if_string_contains_single_quote = 1
 # it may lead to many false positives according to its POD.
 [-RegularExpressions::ProhibitEnumeratedClasses]
 
+# Defaults to 5, but that is too few. Allow at least one more.
+[Subroutines::ProhibitManyArgs]
+max_arguments = 6
+
 # This one brings too many false positives
 [-ValuesAndExpressions::ProhibitAccessOfPrivateData]
 
