@@ -72,10 +72,11 @@ Readonly my $PROGRESS_ENDED    => 3;
 #@type IPC::Shareable
 my $work_data = IPC::Shareable->new( key => 'WORK_DATA', create => 1 );
 
-$work_data->{cnt}  = 0;
-$work_data->{MLEN} = [ 0, 0, 0, 0 ];
-$work_data->{PIDs} = {};
-$work_data->{ULEN} = [ 0, 0, 0, 0 ];
+$work_data->{cnt}   = 0;
+$work_data->{DEATH} = 0;              ## transports the death note after forking
+$work_data->{MLEN}  = [ 0, 0, 0, 0 ];
+$work_data->{PIDs}  = {};
+$work_data->{ULEN}  = [ 0, 0, 0, 0 ];
 
 Readonly my $EMPTY      => q{};
 Readonly my $SPACE      => q{ };
@@ -98,20 +99,7 @@ Readonly my $LOG_ERROR   => 5;
 # ---------------------------------------------------------
 # Signal Handlers
 # ---------------------------------------------------------
-my %signalHandlers = (
-	'INT' => sub {
-		$death_note = 1;
-		log_warning( undef, 'Caught Interrupt Signal - Ending Tasks...' );
-	},
-	'QUIT' => sub {
-		$death_note = 1;
-		log_warning( undef, 'Caught Quit Signal - Ending Tasks...' );
-	},
-	'TERM' => sub {
-		$death_note = 1;
-		log_warning( undef, 'Caught Terminate Signal - Ending Tasks...' );
-	}
-);
+Readonly my %SIGS_CAUGHT = ( 'INT' => 1, 'QUIT' => 1, 'TERM' => 1 );
 local $SIG{INT}  = \&sigHandler;
 local $SIG{QUIT} = \&sigHandler;
 local $SIG{TERM} = \&sigHandler;
@@ -1603,10 +1591,12 @@ sub remove_pid {
 		}
 	} ## end if ( 1 == $do_cleanup )
 
-	# Progress files are already removed, because the only part where they are used
+	# Progress files are always removed, because the only part where they are used
 	# will no longer pick them up once the PID was removed from %work_data (See watch_my_forks())
 	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;  ## shortcut including (defined check)
-	( length($prgfile) > 0 ) and ( -f $prgfile ) and unlink $prgfile;
+	if ( ( length($prgfile) > 0 ) && ( -f $prgfile ) ) {
+		( $do_debug > 0 ) and log_debug( $work_data, 'See: %s', $prgfile ) or unlink $prgfile;
+	}
 
 	delete( $work_data->{RESTART}{$pid} );
 	delete( $work_data->{PIDs}{$pid} );
@@ -1670,8 +1660,13 @@ sub select_termination_message {
 # ---------------------------------------------------------
 sub sigHandler {
 	my ($sig) = @_;
-	if ( exists $signalHandlers{$sig} ) {
-		$signalHandlers{$sig}->();
+	if ( exists %$SIGS_CAUGHT{$sig} ) {
+		if ( ++$death_note > 4 ) {
+			log_error( undef, 'Caught %s Signal %d times - breaking all off!', $sig, $death_note );
+			kill 'KILL', $$ or croak('KILL failed');
+		} else {
+			log_warning( undef, 'Caught %s Signal - Ending Tasks...', $sig );
+		}
 	} else {
 		log_warning( $work_data, 'Caught Unknown Signal [%s] ... ignoring Signal!', $sig );
 	}
