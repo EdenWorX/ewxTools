@@ -312,6 +312,7 @@ exit $ret_global;
 # @brief Add a process ID to work_data.
 #
 # @param $pid A valid process ID. This function will throw a confess() if an invalid PID is added.
+# @param $gid The source group id the file processed by this PID belongs to.
 #
 # @return Always returns 1.
 #
@@ -324,9 +325,12 @@ exit $ret_global;
 # @warning This subroutine should be used cautiously as it does modify the global `work_data` structure.
 #
 sub add_pid {
-	my ($pid) = @_;
+	my ( $pid, $gid ) = @_;
 	( defined $pid ) and ( $pid =~ m/^\d+$/ms )
 	  or log_error( $work_data, "add_pid(): BUG! '%s' is not a valid pid!", $pid // 'undef' )
+	  and confess('FATAL BUG!');
+	( defined $gid ) and ( $gid =~ m/^\d+$/ms )
+	  or log_error( $work_data, "add_pid(): BUG! '%s' is not a valid gid!", $gid // 'undef' )
 	  and confess('FATAL BUG!');
 	defined( $work_data->{PIDs}{$pid} ) and confess("add_pid($pid) called but work_data already defined!");
 	lock_data($work_data);
@@ -334,6 +338,7 @@ sub add_pid {
 		args      => [],     ## Shall be added by the caller as a reference
 		exit_code => 0,
 		error_msg => $EMPTY,
+		gid       => $gid,
 		id        => 0,
 		prgfile   => $EMPTY,
 		result    => $EMPTY,
@@ -387,20 +392,20 @@ sub analyze_all_inputs {
 		};
 		$source_ids{$pathID} = $src;
 
-		analyze_input($src) or exit 6;
+		analyze_input( 0, $src ) or exit 6;
 	} ## end foreach my $src (@path_source)
 
 	return 1;
 } ## end sub analyze_all_inputs
 
 sub analyze_input {
-	my ($src) = @_;
+	my ( $gid, $src ) = @_;
 
 	my $formats = $source_info{$src};  ## Shortcut
 
 	# Get basic duration
 	my $stream_fields = 'avg_frame_rate,duration';
-	my $frstream_no   = get_info_from_ffprobe( $src, $stream_fields );
+	my $frstream_no   = get_info_from_ffprobe( $gid, $src, $stream_fields );
 	( $frstream_no >= 0 ) or return 0;        ## Something went wrong
 	my $streams  = $formats->{streams};       ## shortcut, too
 	my $frstream = $streams->[$frstream_no];  ## shortcut, three
@@ -426,7 +431,7 @@ sub analyze_input {
 	# Now that we have good (and sane) values for probing sizes and durations, lets query ffprobe again to get the final value we need.
 	can_work() or return 0;
 	$stream_fields = 'avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration';
-	$frstream      = get_info_from_ffprobe( $src, $stream_fields );
+	$frstream      = get_info_from_ffprobe( $gid, $src, $stream_fields );
 	( $frstream_no >= 0 ) or return 0;                                ## Something went wrong this time
 	$frstream = $streams->[$frstream_no];                             ## shortcut, four...
 
@@ -602,7 +607,7 @@ sub can_work {
 # Simple Wrapper around IPC::Cmd to capture simple command outputs
 # ----------------------------------------------------------------
 sub capture_cmd {
-	my (@cmd) = @_;
+	my ( $gid, @cmd ) = @_;
 	my $kid = fork;
 
 	( defined $kid ) or croak("Cannot fork()! $!\n");
@@ -616,7 +621,7 @@ sub capture_cmd {
 
 	# === Do the bookkeeping before we wait
 	# =======================================
-	add_pid($kid);
+	add_pid( $kid, $gid );
 
 	# Wait on the fork to finish
 	# =======================================
@@ -893,7 +898,7 @@ sub create_target_file {
 	);
 
 	log_info( $work_data, "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ) );
-	my $pid = start_work( 1, @ffargs );
+	my $pid = start_work( 1, 0, @ffargs );
 	( defined $pid ) and ( $pid > 0 ) or confess('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
 	@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
@@ -975,13 +980,13 @@ sub format_out_time {
 } ## end sub format_out_time
 
 sub get_info_from_ffprobe {
-	my ( $src, $stream_fields ) = @_;
+	my ( $gid, $src, $stream_fields ) = @_;
 	my $avg_frame_rate_stream = -1;
 	my @fpcmd                 = ( $FP, @FP_ARGS, "stream=$stream_fields", split( $SPACE, $source_info{$src}{probeStrings} ), $src );
 
 	log_info( $work_data, 'Calling: %s', ( join $SPACE, @fpcmd ) );
 
-	my @fplines = split /\n/ms, capture_cmd(@fpcmd);
+	my @fplines = split /\n/ms, capture_cmd( $gid, @fpcmd );
 	can_work or return 0;
 
 	foreach my $line (@fplines) {
@@ -1251,7 +1256,7 @@ sub interpolate_source_group {
 	# Building the worker fork is quite trivial
 	for ( 0 .. 3 ) {
 		can_work()                                 or return 1;
-		start_worker_fork( $gid, $_, $inter_opts ) or return 0;
+		start_worker_fork( $_, $gid, $inter_opts ) or return 0;
 	}
 
 	# Watch and join
@@ -1719,7 +1724,7 @@ sub segment_source_group {
 	);
 
 	log_info( $work_data, "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ) );
-	my $pid = start_work( 1, @ffargs );
+	my $pid = start_work( 1, $gid, @ffargs );
 	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
 	@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
@@ -1902,7 +1907,7 @@ sub start_forked {
 # Start a command asynchronously
 # ---------------------------------------------------------
 sub start_work {
-	my ( $tid, @cmd ) = @_;
+	my ( $tid, $gid, @cmd ) = @_;
 	my $kid = fork;
 	( defined $kid ) or croak("Cannot fork()! $!\n");
 
@@ -1915,7 +1920,7 @@ sub start_work {
 
 	# === Do the bookkeeping before we return
 	# =======================================
-	add_pid($kid) and usleep(0);
+	add_pid( $kid, $gid ) and usleep(0);
 
 	# Wait for the fork to mark itself as "created"
 	wait_for_pid_status( $kid, $work_data, $FF_CREATED ) and usleep(0);
@@ -1928,13 +1933,13 @@ sub start_work {
 } ## end sub start_work
 
 sub start_worker_fork {
-	my ( $gid, $i, $inter_opts ) = @_;
+	my ( $tid, $gid, $inter_opts ) = @_;
 
 	my $source        = $inter_opts->{'src'};
 	my $target        = $inter_opts->{'tgt'};
-	my $prgLog        = sprintf $source_groups{$gid}{prg}, $i;
-	my $file_from     = sprintf $source_groups{$gid}{$source}, $i;
-	my $file_to       = sprintf $source_groups{$gid}{$target}, $i;
+	my $prgLog        = sprintf $source_groups{$gid}{prg}, $tid;
+	my $file_from     = sprintf $source_groups{$gid}{$source}, $tid;
+	my $file_to       = sprintf $source_groups{$gid}{$target}, $tid;
 	my $filter_string = make_filter_string( $gid, $inter_opts );
 	my @fps_opts      = ( 'idn' eq $target ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
 	my @ffargs        = (
@@ -1943,13 +1948,12 @@ sub start_worker_fork {
 		@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
 	);
 
-	log_info( $work_data, "Starting Worker %d for:\n%s", $i + 1, ( join $SPACE, @ffargs ) );
-	my $pid = start_work( $i, @ffargs );
+	log_info( $work_data, "Starting Worker %d for:\n%s", $tid + 1, ( join $SPACE, @ffargs ) );
+	my $pid = start_work( $tid, $gid, @ffargs );
 	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
 	@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
-	$work_data->{PIDs}{$pid}{gid} = $gid;
-	$work_data->{PIDs}{$pid}{id}  = $i;
+	$work_data->{PIDs}{$pid}{id} = $tid;
 	%{ $work_data->{PIDs}{$pid}{interp} } = %{$inter_opts};
 	$work_data->{PIDs}{$pid}{prgfile} = $prgLog;
 	$work_data->{PIDs}{$pid}{source}  = $source_groups{$gid}{$source};
@@ -2000,6 +2004,7 @@ sub strike_fork_restart {
 	my @args       = @{ $work_data->{PIDs}{$pid}{args} };
 	my $inter_opts = $work_data->{PIDs}{$pid}{interp};
 	my $tid        = $work_data->{PIDs}{$pid}{id};
+	my $gid        = $work_data->{PIDs}{$pid}{gid};
 	unlock_data($work_data);
 
 	# If we have interpolation data, this is an interpolating worker who has their
@@ -2009,7 +2014,6 @@ sub strike_fork_restart {
 		$inter_opts->{'do_alt'} = 1;
 
 		lock_data($work_data);
-		my $gid           = $work_data->{PIDs}{$pid}{gid};
 		my $prgLog        = $work_data->{PIDs}{$pid}{prgfile};
 		my $file_from     = sprintf $work_data->{PIDs}{$pid}{source}, $tid;
 		my $file_to       = sprintf $work_data->{PIDs}{$pid}{target}, $tid;
@@ -2027,7 +2031,7 @@ sub strike_fork_restart {
 	} ## end if ( defined $inter_opts)
 
 	log_info( $work_data, "Starting Worker %d for:\n%s", $tid + 1, ( join $SPACE, @args ) );
-	my $kid = start_work( $tid, @args );
+	my $kid = start_work( $tid, $gid, @args );
 	( defined $kid ) and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
 	@{ $work_data->{PIDs}{$kid}{args} } = @{ $work_data->{PIDs}{$pid}{args} };
@@ -2248,7 +2252,8 @@ sub watch_my_forks {
 			# Make sure we later know how many frames got dropped/dup'd.
 			my $dropdups = $prgData{drop_frames} + $prgData{dup_frames};
 			my $gid      = $work_data->{PIDs}{$pid}{gid};
-			( defined $source_groups{$gid}{dropdups} ) and ( $source_groups{$gid}{dropdups} >= $dropdups ) or $source_groups{$gid}{dropdups} = $dropdups;
+			( defined $source_groups{$gid}{dropdups} ) and ( $source_groups{$gid}{dropdups} >= $dropdups )
+			  or $source_groups{$gid}{dropdups} = $dropdups;
 		} ## end foreach my $pid (@PIDs)
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
