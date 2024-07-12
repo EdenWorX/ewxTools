@@ -933,7 +933,7 @@ sub declare_single_source {
 sub dieHandler {
 	my ($err) = @_;
 
-	$death_note = 1;
+	++$death_note;
 	$ret_global = 42;
 
 	log_error( undef, '%s', $err );
@@ -1210,10 +1210,18 @@ sub handle_io_operations {
 sub handle_termination_request {
 	my ( $fork_data, $cmd_pid ) = @_;
 
+	lock_data($fork_data);
+	( $fork_data->{DEATH} > $death_note ) and $death_note = $fork_data->{DEATH};
+	unlock_data($fork_data);
+
 	( 1 == $death_note ) and log_debug( $fork_data, "Sending 'TERM' to PID %d", $cmd_pid ) and ( kill 'TERM', $cmd_pid );
 
 	# react on 4, 5 will kill this fork (See terminator();
-	( 4 == $death_note ) and log_debug( $fork_data, "Sending 'KILL' to PID %d", $cmd_pid ) and ( kill 'KILL', $cmd_pid );
+	( 3 < $death_note ) and log_debug( $fork_data, "Sending 'KILL' to PID %d", $cmd_pid ) and ( kill 'KILL', $cmd_pid );
+
+	lock_data($fork_data);
+	( $fork_data->{DEATH} < $death_note ) and $fork_data->{DEATH} = $death_note;
+	unlock_data($fork_data);
 
 	return 1;
 } ## end sub handle_termination_request
@@ -1612,6 +1620,12 @@ sub run_cmd_from_fork {
 	my $chld_error = 0;
 
 	my $res = eval {
+		# Catch signals within the fork, too.
+		local $SIG{INT}  = \&sigHandler;
+		local $SIG{QUIT} = \&sigHandler;
+		local $SIG{TERM} = \&sigHandler;
+
+		# But ignore SIGCHLD, we have to reap the started process ourself
 		local $SIG{CHLD} = 'IGNORE';
 		my $cmd_pid = open3( undef, my $stdout, my $stderr = gensym, @{$cmd} );
 
@@ -1660,7 +1674,7 @@ sub select_termination_message {
 # ---------------------------------------------------------
 sub sigHandler {
 	my ($sig) = @_;
-	if ( exists %$SIGS_CAUGHT{$sig} ) {
+	if ( exists $SIGS_CAUGHT{$sig} ) {
 		if ( ++$death_note > 4 ) {
 			log_error( undef, 'Caught %s Signal %d times - breaking all off!', $sig, $death_note );
 			kill 'KILL', $$ or croak('KILL failed');
@@ -1738,6 +1752,7 @@ sub segment_source_group {
 sub send_forks_the_kill() {
 	lock_data($work_data);
 	my @PIDs = keys %{ $work_data->{PIDs} };
+	( $work_data->{DEATH} > $death_note ) and $death_note = $work_data->{DEATH};
 	unlock_data($work_data);
 
 	foreach my $pid (@PIDs) {
@@ -1747,13 +1762,17 @@ sub send_forks_the_kill() {
 		}
 
 		# Note: 5 is after 2 seconds
-		elsif ( ( 5 == $death_note ) && ( $FF_REAPED != get_pid_status( $work_data, $pid ) ) ) {
+		elsif ( ( 4 < $death_note ) && ( $FF_REAPED != get_pid_status( $work_data, $pid ) ) ) {
 			log_warning( $work_data, 'KILLing worker PID %d', $pid );
 			terminator( $pid, 'KILL' );
 		}
 	} ## end foreach my $pid (@PIDs)
 
 	++$death_note;
+
+	lock_data($work_data);
+	( $work_data->{DEATH} < $death_note ) and $work_data->{DEATH} = $death_note;
+	unlock_data($work_data);
 
 	return 1;
 } ## end sub send_forks_the_kill
