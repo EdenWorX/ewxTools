@@ -1637,12 +1637,13 @@ sub run_cmd_from_fork {
 			usleep(20_000);
 		} ## end while ( 0 == ( waitpid $cmd_pid...))
 
+		$chld_error = ( $? > 0 ) ? $? : 0;  ## -1 means, that waitpid has not have had a process to reap. Not an error!
+		${$exc_p} = $chld_error >> 8;
+
 		$io_selector->remove($stderr);
 		$io_selector->remove($stdout);
 
-		( 0 != ( waitpid $cmd_pid, 0 ) ) and log_debug( $fork_data, "'%s' PID %d '%s", $cmd->[0], $cmd_pid, select_termination_message() );
-		$chld_error = ( $? > 0 ) ? $? : 0;  ## -1 means, that waitpid has not have had a process to reap. Not an error!
-		${$exc_p} = $chld_error >> 8;
+		log_debug( $fork_data, "'%s' PID %d '%s", $cmd->[0], $cmd_pid, select_termination_message() );
 	};
 	$res = handle_eval_result( $fork_data, $res, $@, $chld_error, $exc_p, $exm_p );
 
