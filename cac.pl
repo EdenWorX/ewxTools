@@ -99,7 +99,7 @@ Readonly my $LOG_ERROR   => 5;
 # ---------------------------------------------------------
 # Signal Handlers
 # ---------------------------------------------------------
-Readonly my %SIGS_CAUGHT = ( 'INT' => 1, 'QUIT' => 1, 'TERM' => 1 );
+Readonly my %SIGS_CAUGHT => ( 'INT' => 1, 'QUIT' => 1, 'TERM' => 1 );
 local $SIG{INT}  = \&sigHandler;
 local $SIG{QUIT} = \&sigHandler;
 local $SIG{TERM} = \&sigHandler;
