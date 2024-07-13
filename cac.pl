@@ -130,7 +130,7 @@ Readonly my $B_out             => '[out]';
 Readonly my $defaultProbeSize  => 256 * 1_024 * 1_024;  # Max out probe size at 256 MB, all relevant stream info should be available from that size
 Readonly my $defaultProbeDura  => 30 * 1_000 * 1_000;   # Max out analyze duration at 30 seconds. This should be long enough for everything
 Readonly my $defaultProbeFPS   => 8 * 120;              # FPS probing is maxed at 8 seconds for 120 FPS recordings.
-Readonly my $TIMEOUT_INTERVALS => 60;                   # Timeout for forks to start working (60 interval = 30 seconds)
+Readonly my $TIMEOUT_INTERVALS => 240;                  # Timeout for forks to start working (240 interval = 120 seconds = 2 minutes)
 
 # ---------------------------------------------------------
 # Global variables
@@ -594,7 +594,7 @@ sub build_source_groups {
 } ## end sub build_source_groups
 
 sub can_work {
-	return ( ( 0 == $death_note ) && ( 0 == $ret_global ) );
+	return ( ( 0 <= $death_note ) && ( 0 == $ret_global ) );
 }
 
 # ----------------------------------------------------------------
@@ -940,7 +940,7 @@ sub declare_single_source {
 sub dieHandler {
 	my ($err) = @_;
 
-	++$death_note;
+	$death_note = -1;
 	$ret_global = 42;
 
 	log_error( undef, '%s', $err );
@@ -1117,13 +1117,19 @@ sub handle_eval_result {
 sub handle_fork_message {
 	my ($errmsg) = @_;
 
-	my $have_error   = ( $errmsg =~ m/(error|critical)/ims ) ? 1 : 0;
-	my $have_warning = ( $errmsg =~ m/warning/ims )          ? 1 : 0;
-	my $have_info    = ( $errmsg =~ m/(info|status)/ims )    ? 1 : 0;
+	my @messages   = split /\n/ms, $errmsg;
+	my $have_error = 0;
 
-	$have_error        and log_error( $work_data, $errmsg )
-	  or $have_warning and log_warning( $work_data, $errmsg )
-	  or $have_info    and log_info( $work_data, $errmsg );
+	for my $msg (@messages) {
+		chomp $msg;
+		my $is_error   = ( $msg =~ m/(error|critical)/ims ) ? 1 : 0;
+		my $is_warning = ( $msg =~ m/warning/ims )          ? 1 : 0;
+		my $is_info    = ( $msg =~ m/(info|status)/ims )    ? 1 : 0;
+
+		$is_error        and log_error( $work_data, $msg ) and ( $have_error = 1 )
+		  or $is_warning and log_warning( $work_data, $msg )
+		  or $is_info    and log_info( $work_data, $msg );
+	} ## end for my $msg (@messages)
 
 	return $have_error;
 } ## end sub handle_fork_message
@@ -1140,22 +1146,21 @@ sub handle_fork_message {
 # @return   Returns -1 if the PID is gone without any progress, 0 if progress has ended successfully and 1 if it is still running.
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout ) = @_;
-	my $result = 1;
+	my $pidstat = pid_exists( $work_data, $pid ) ? reap_pid($pid) : -1;
+	my $result  = $pidstat                       ? 0              : 1;  ## If $pidstat is 0, reap_pid($pid) returned it because the PID is still busy.
 
-	pid_exists( $work_data, $pid ) and ( !reap_pid($pid) ) or $result = -1;  # the PID is finished or already gone
+	log_debug( $work_data, "Loading Progress PID %d, File '%s' [%d/%d]", $pid, $work_data->{PIDs}{$pid}{prgfile}, $pidstat, $result );
 
-	log_debug( $work_data, "Loading Progress PID %d, File '%s'", $pid, $work_data->{PIDs}{$pid}{prgfile} );
+	my $progress_state = load_progress( $pid, $work_data->{PIDs}{$pid}{prgfile}, $prgData );
 
-	my $progress_state = load_progress( $work_data->{PIDs}{$pid}{prgfile}, $prgData );
-
-	( $PROGRESS_NONE == $progress_state ) and ( $result > 0 ) and --$fork_timeout->{$pid};
+	( $PROGRESS_NONE == $progress_state )     and ( $result > 0 ) and --$fork_timeout->{$pid};
 	( $PROGRESS_CONTINUE == $progress_state ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
-	( $PROGRESS_ENDED == $progress_state ) and $result = 0;
+	( $PROGRESS_ENDED == $progress_state )    and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS and $result = 0;
 
 	# Warn if a fork looks like it is freezing...
-	( ( $TIMEOUT_INTERVALS / 2 ) == $fork_timeout->{$pid} ) and log_warning( $work_data, 'Fork PID %d seems to be frozen...', $pid );
+	( $result > 0 ) and ( ( $TIMEOUT_INTERVALS / 2 ) == $fork_timeout->{$pid} ) and log_warning( $work_data, 'Fork PID %d seems to be frozen...', $pid );
 
-	return $result;
+	return ( $pidstat >= 0 ) ? $result : -1;
 } ## end sub handle_fork_progress
 
 sub handle_fork_strikes {
@@ -1218,16 +1223,18 @@ sub handle_termination_request {
 	my ( $fork_data, $cmd_pid ) = @_;
 
 	lock_data($fork_data);
+	( $death_note < 0 ) and $fork_data->{DEATH} = -1;
 	( $fork_data->{DEATH} > $death_note ) and $death_note = $fork_data->{DEATH};
+	( $fork_data->{DEATH} < 0 ) and ++$death_note;  ## < 0 means the main program is going to die
 	unlock_data($fork_data);
 
-	( 1 == $death_note ) and log_debug( $fork_data, "Sending 'TERM' to PID %d", $cmd_pid ) and ( kill 'TERM', $cmd_pid );
+	( $death_note > 0 ) and ( $death_note < 4 ) and log_debug( $fork_data, "Sending 'TERM' to PID %d", $cmd_pid ) and ( kill 'TERM', $cmd_pid );
 
 	# react on 4, 5 will kill this fork (See terminator();
 	( 3 < $death_note ) and log_debug( $fork_data, "Sending 'KILL' to PID %d", $cmd_pid ) and ( kill 'KILL', $cmd_pid );
 
 	lock_data($fork_data);
-	( $fork_data->{DEATH} < $death_note ) and $fork_data->{DEATH} = $death_note;
+	( $fork_data->{DEATH} >= 0 ) and ( $fork_data->{DEATH} < $death_note ) and $fork_data->{DEATH} = $death_note;
 	unlock_data($fork_data);
 
 	return 1;
@@ -1274,7 +1281,7 @@ sub is_progress_line {
 # Load data from between the last two "progress=<state>" lines in the given log file, and store it in the given hash
 # If the hash has values, progress data is added.
 sub load_progress {
-	my ( $progress_log, $progress_data ) = @_;
+	my ( $pid, $progress_log, $progress_data ) = @_;
 
 	file_exists($progress_log) or return $PROGRESS_NONE;
 
@@ -1286,7 +1293,7 @@ sub load_progress {
 	my $i              = 0;
 	while ( ( $progress_count < 1 ) && ( $i < $lines_count ) ) {
 		chomp $last_20_lines[$i];
-		log_debug( $work_data, "[RAW % 2d] Check '%s'", $i, $last_20_lines[$i] );
+		log_debug( $work_data, "[%d line % 2d] Check '%s'", $pid, $i, $last_20_lines[$i] );
 		if ( $last_20_lines[$i] =~ m/^progress=(\S+)/xms ) {
 
 			# As we parse backwards, this is the actual state of the process
@@ -1299,7 +1306,7 @@ sub load_progress {
 	my @progress_field_names = qw( bitrate drop_frames dup_frames fps frame out_time_ms total_size );
 	while ( ( $progress_count < 2 ) && ( $i < $lines_count ) ) {
 		chomp $last_20_lines[$i];
-		log_debug( $work_data, "[RAW %-2d] Check '%s'", $i, $last_20_lines[$i] );
+		log_debug( $work_data, "[%d line % 2d] Check '%s'", $pid, $i, $last_20_lines[$i] );
 		if ( is_progress_line( $last_20_lines[$i] ) ) {
 			$progress_count++;
 		} else {
@@ -1520,8 +1527,8 @@ sub read_and_reverse_last_lines {
 #
 # @param[in] $pid The Process ID of child process to be reaped.
 #
-# @return Returns 1 if the PID is defined and child process has finished
-# or was not found in PIDs. 0 is returned if the PID is still busy.
+# @return Returns PID if the PID is defined and the child process has finished.
+# If the PID was not found, -1 is returned. 0 is returned if the PID is still busy.
 #
 # @note It also reports an error and aborts if the provided PID is not
 # valid or not defined.
@@ -1534,13 +1541,14 @@ sub reap_pid {
 	defined( $work_data->{PIDs}{$pid} ) or return 1;
 	( $FF_REAPED == get_pid_status( $work_data, $pid ) ) and return 1;
 
-	( 0 == ( waitpid $pid, POSIX::WNOHANG ) ) and return 0;  ## PID is still busy!
+	my $pidstat = waitpid $pid, POSIX::WNOHANG;
+	( 0 == $pidstat ) and return 0;  ## PID is still busy!
 
-	log_debug( $work_data, '(reap_pid) KID %d finished', $pid );
+	log_debug( $work_data, '(reap_pid) KID %d %s', $pid, ( $pidstat < 0 ) ? 'is already gone' : 'has been ended' );
 	set_pid_status( $work_data, $pid, $FF_REAPED );
 	log_debug( $work_data, '(reap_pid) KID %d status set to %s', $pid, pid_status_to_str( get_pid_status( $work_data, $pid ) ) );
 
-	return 1;
+	return $pidstat;
 } ## end sub reap_pid
 
 # ---------------------------------------------------------
@@ -1669,7 +1677,8 @@ sub run_cmd_from_fork {
 
 sub select_termination_message {
 	return (
-		  ( $death_note < 1 ) ? 'ended'
+		  ( $death_note < 0 ) ? 'killed'
+		: ( $death_note < 1 ) ? 'ended'
 		: ( $death_note < 4 ) ? 'terminated'
 		:                       'killed'
 	);
@@ -1685,6 +1694,7 @@ sub sigHandler {
 	if ( exists $SIGS_CAUGHT{$sig} ) {
 		if ( ++$death_note > 4 ) {
 			log_error( undef, 'Caught %s Signal %d times - breaking all off!', $sig, $death_note );
+			( $$ == $main_pid ) and $death_note = -1;  ## This means we are completely screwed.
 			kill 'KILL', $$ or croak('KILL failed');
 		} else {
 			log_warning( undef, 'Caught %s Signal - Ending Tasks...', $sig );
@@ -1760,7 +1770,9 @@ sub segment_source_group {
 sub send_forks_the_kill() {
 	lock_data($work_data);
 	my @PIDs = keys %{ $work_data->{PIDs} };
-	( $work_data->{DEATH} > $death_note ) and $death_note = $work_data->{DEATH};
+	( $death_note < 0 )          and $work_data->{DEATH} = -1;
+	( $work_data->{DEATH} >= 0 ) and ( $work_data->{DEATH} > $death_note ) and $death_note = $work_data->{DEATH};
+	( $work_data->{DEATH} < 0 )  and ++$death_note;
 	unlock_data($work_data);
 
 	foreach my $pid (@PIDs) {
@@ -1779,7 +1791,7 @@ sub send_forks_the_kill() {
 	++$death_note;
 
 	lock_data($work_data);
-	( $work_data->{DEATH} < $death_note ) and $work_data->{DEATH} = $death_note;
+	( $work_data->{DEATH} >= 0 ) and ( $work_data->{DEATH} < $death_note ) and $work_data->{DEATH} = $death_note;
 	unlock_data($work_data);
 
 	return 1;
@@ -2165,15 +2177,27 @@ sub wait_for_all_forks {
 		# Wait for PID
 		while ( 0 == reap_pid($pid) ) {
 			usleep(100_000);  # Poll 10 times per second
-			                  # TERM after 3, KILL after 6 seconds.
-			( 30 == ++$dsecs ) and terminator( $pid, 'TERM' ) or ( 60 == $dsecs ) and terminator( $pid, 'KILL' );
-		}
+			                  # TERM after 3, 4, 5, 6, 7 seconds, and KILL after 10 seconds.
+			if ( 0 == ( ++$dsecs % 10 ) ) {
+				( $dsecs >= 30 ) and ( $dsecs <= 70 ) and terminator( $pid, 'TERM' )
+				  or ( 100 <= $dsecs )
+				  and terminator( $pid, 'KILL' );
+			}
+		} ## end while ( 0 == reap_pid($pid...))
 
 		remove_pid( $pid, 1 ) or $result = 0;
 
 	} ## end foreach my $pid (@PIDs)
 
-	log_debug( $work_data, 'All PIDs ended.' );
+	log_debug( $work_data, "All PIDs ended '%s'.", ( $result > 0 ) ? 'successfully' : 'with errors!' );
+
+	# If all forks ended well, we have to reset the death note variable
+	if ( $result > 0 ) {
+		lock_data($work_data);
+		( $death_note > 0 ) and $death_note = 0;
+		( 0 == $death_note ) and $work_data->{DEATH} = 0;
+		unlock_data($work_data);
+	} ## end if ( $result > 0 )
 
 	return $result;
 } ## end sub wait_for_all_forks
