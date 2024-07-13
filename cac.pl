@@ -34,18 +34,24 @@ my $work_done = 0;            # Needed to know whether to log anything on END{}
 # 1.0.4    2024-06-20  sed, EdenWorX  Review log system to produce easier to read log. Great for debugging!
 #                                     If libplacebo freezes ffmpeg, which can happen although it is rare, kill the fork and
 #                                     restart it using minterpolate instead. Better be slow than break.
+# 1.0.5    2024-07-13  sed, EdenWorX  We no longer call for sepecific hardware initialisation and let ffmpeg decide for itself.
+#                                     Also all forks now share knowledge about breaks and signals, so called processes can be
+#                                       torn down, too, now. No more zombie processes if something goes wrong!
+#                                     To make this work we switched to IPC::Open3 utilizing IO::Select.
 #
 # Please keep this current:
-Readonly our $VERSION => '1.0.4';
+Readonly our $VERSION => '1.0.5';
 
 # =======================================================================================
 # Workflow:
 # Phase 1: Get Values via ffprobe and determine minimum seconds to split into 4 segments.
 # Phase 2: Split the source into 4 segments, streamcopy, length from Phase 1.
-# Phase 3: 1 Thread per Segment does mpdecimate(7)+libplacebo(120|60) into UTVideo.
-# Phase 4: 1 Thread per Segment does mpdecimate(2)+libplacebo(60|30) into UTVideo.
+# Phase 3: 1 Fork per Segment does mpdecimate(7)+libplacebo(120|60) into UTVideo.
+# Phase 4: 1 Fork per Segment does mpdecimate(2)+libplacebo(60|30) into UTVideo.
 # Phase 5: h264_nvenc produces output from all segments, highest quality
 # Cleanup: segments and temporaries are to be deleted.
+# Note   : We use h264 instead of x265, because the format is less expensive to decode,
+#          and thus more performant in video editors, especially when seeking backwards.
 # =======================================================================================
 
 # ---------------------------------------------------------
@@ -140,8 +146,8 @@ my @FF_ARGS_CODEC_h264 = qw(
 my @FF_ARGS_CODEC_UTV   = qw( -codec:v utvideo -pred median );
 my @FF_ARGS_FILTER      = qw( -ignore_unknown -vf );
 my @FF_ARGS_FORMAT      = qw( -colorspace bt709 -color_range pc -pix_fmt yuv444p -f matroska -write_crc32 0 );
-my @FF_ARGS_INPUT_CUDA  = qw( -loglevel level+warning -nostats -init_hw_device cuda -colorspace bt709 -color_range pc -f concat -safe 0 -i );
-my @FF_ARGS_INPUT_VULK  = qw( -loglevel level+warning -nostats -init_hw_device vulkan -colorspace bt709 -color_range pc -i );
+my @FF_ARGS_INPUT_CAT   = qw( -f concat -safe 0 );
+my @FF_ARGS_INPUT_INIT  = qw( -loglevel level+warning -nostats -colorspace bt709 -color_range pc );
 my @FF_ARGS_START       = qw( -hide_banner -loglevel level+info -y );
 my @FF_CONCAT_BEGIN     = qw( -loglevel level+warning -nostats -f concat -safe 0 -i );
 my @FF_CONCAT_END       = qw( -map 0 -c copy );
@@ -881,8 +887,9 @@ sub create_target_file {
 	can_work() or return 1;
 	my @fps_opts = ( '-r', $target_fps, '-fps_mode', 'cfr' );
 	my @ffargs   = (
-		$FF, @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-		@FF_ARGS_INPUT_CUDA, $lstfile, @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled, @fps_opts, @FF_ARGS_FORMAT, @FF_ARGS_CODEC_h264, $path_target, @mapVoice
+		$FF,                 @FF_ARGS_START,     '-progress',         $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_ARGS_INPUT_INIT, @FF_ARGS_INPUT_CAT, '-i',                $lstfile,     @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled,
+		@fps_opts,           @FF_ARGS_FORMAT,    @FF_ARGS_CODEC_h264, $path_target, @mapVoice
 	);
 
 	log_info( $work_data, "Starting Worker 1 for:\n%s", ( join $SPACE, @ffargs ) );
@@ -1620,6 +1627,7 @@ sub run_cmd_from_fork {
 	my $chld_error = 0;
 
 	my $res = eval {
+
 		# Catch signals within the fork, too.
 		local $SIG{INT}  = \&sigHandler;
 		local $SIG{QUIT} = \&sigHandler;
@@ -1958,7 +1966,7 @@ sub start_worker_fork {
 	my @fps_opts      = ( 'idn' eq $target ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
 	my @ffargs        = (
 		$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-		@FF_ARGS_INPUT_VULK, $file_from,      @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
+		@FF_ARGS_INPUT_INIT, '-i',            $file_from,         @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
 		@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
 	);
 
@@ -2035,7 +2043,7 @@ sub strike_fork_restart {
 		my @fps_opts      = ( 'idn' eq $inter_opts->{'tgt'} ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
 		my @ffargs        = (
 			$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-			@FF_ARGS_INPUT_VULK, $file_from,      @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
+			@FF_ARGS_INPUT_INIT, '-i',            $file_from,         @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
 			@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
 		);
 
