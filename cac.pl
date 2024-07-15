@@ -594,8 +594,13 @@ sub build_source_groups {
 } ## end sub build_source_groups
 
 sub can_work {
-	return ( ( 0 <= $death_note ) && ( 0 == $ret_global ) );
-}
+	if ( 0 != $ret_global ) {
+
+		# A non-zero ret_global means: We have to go!
+		( $death_note > 0 ) or $death_note = 1;
+	}
+	return ( ( 0 == $death_note ) && ( 0 == $ret_global ) );
+} ## end sub can_work
 
 # ----------------------------------------------------------------
 # Simple Wrapper around IPC::Cmd to capture simple command outputs
@@ -940,7 +945,7 @@ sub declare_single_source {
 sub dieHandler {
 	my ($err) = @_;
 
-	$death_note = -1;
+	$death_note = 5;
 	$ret_global = 42;
 
 	log_error( undef, '%s', $err );
@@ -1219,23 +1224,21 @@ sub handle_io_operations {
 	return 1;
 } ## end sub handle_io_operations
 
+# React on getting a termination request from the main program by signal or by DEATH counter
 sub handle_termination_request {
 	my ( $fork_data, $cmd_pid ) = @_;
 
+	( $$ != $main_pid ) or confess("FATAL: handle_termination_request() called from MAIN PID $main_pid instead from a fork !");
+
+	# Transfer DEATH from main program if set
 	lock_data($fork_data);
-	( $death_note < 0 ) and $fork_data->{DEATH} = -1;
 	( $fork_data->{DEATH} > $death_note ) and $death_note = $fork_data->{DEATH};
-	( $fork_data->{DEATH} < 0 ) and ++$death_note;  ## < 0 means the main program is going to die
 	unlock_data($fork_data);
 
 	( $death_note > 0 ) and ( $death_note < 4 ) and log_debug( $fork_data, "Sending 'TERM' to PID %d", $cmd_pid ) and ( kill 'TERM', $cmd_pid );
 
-	# react on 4, 5 will kill this fork (See terminator();
+	# react on 4, because on 5 this fork will be killed (See terminator())
 	( 3 < $death_note ) and log_debug( $fork_data, "Sending 'KILL' to PID %d", $cmd_pid ) and ( kill 'KILL', $cmd_pid );
-
-	lock_data($fork_data);
-	( $fork_data->{DEATH} >= 0 ) and ( $fork_data->{DEATH} < $death_note ) and $fork_data->{DEATH} = $death_note;
-	unlock_data($fork_data);
 
 	return 1;
 } ## end sub handle_termination_request
@@ -1677,7 +1680,7 @@ sub run_cmd_from_fork {
 
 sub select_termination_message {
 	return (
-		  ( $death_note < 0 ) ? 'killed'
+		  ( $death_note < 0 ) ? 'frozen'
 		: ( $death_note < 1 ) ? 'ended'
 		: ( $death_note < 4 ) ? 'terminated'
 		:                       'killed'
@@ -1692,9 +1695,10 @@ sub select_termination_message {
 sub sigHandler {
 	my ($sig) = @_;
 	if ( exists $SIGS_CAUGHT{$sig} ) {
-		if ( ++$death_note > 4 ) {
+		if ( ++$death_note > 5 ) {
+
+			# This is very crude, so only do _THAT_ if everything else failed
 			log_error( undef, 'Caught %s Signal %d times - breaking all off!', $sig, $death_note );
-			( $$ == $main_pid ) and $death_note = -1;  ## This means we are completely screwed.
 			kill 'KILL', $$ or croak('KILL failed');
 		} else {
 			log_warning( undef, 'Caught %s Signal - Ending Tasks...', $sig );
@@ -1768,11 +1772,17 @@ sub segment_source_group {
 } ## end sub segment_source_group
 
 sub send_forks_the_kill() {
+
+	# Everytime this subroutine is called, it raises the death_note.
+	# The plan is, that it is called every half second from watch_my_forks() if can_work() returns false
+	# So do not call it from anywhere else, and do not manipulate $death_note from anywhere else
+	++$death_note;
+
+	# Ensure that global termination requests get transferred next
+	update_termination_request();
+
 	lock_data($work_data);
 	my @PIDs = keys %{ $work_data->{PIDs} };
-	( $death_note < 0 )          and $work_data->{DEATH} = -1;
-	( $work_data->{DEATH} >= 0 ) and ( $work_data->{DEATH} > $death_note ) and $death_note = $work_data->{DEATH};
-	( $work_data->{DEATH} < 0 )  and ++$death_note;
 	unlock_data($work_data);
 
 	foreach my $pid (@PIDs) {
@@ -1787,12 +1797,6 @@ sub send_forks_the_kill() {
 			terminator( $pid, 'KILL' );
 		}
 	} ## end foreach my $pid (@PIDs)
-
-	++$death_note;
-
-	lock_data($work_data);
-	( $work_data->{DEATH} >= 0 ) and ( $work_data->{DEATH} < $death_note ) and $work_data->{DEATH} = $death_note;
-	unlock_data($work_data);
 
 	return 1;
 } ## end sub send_forks_the_kill
@@ -2142,6 +2146,23 @@ sub unlock_data {
 	return 1;
 } ## end sub unlock_data
 
+## @brief Update $work_data->{DEATH} if the main PID has raised $death_note via signal catching
+sub update_termination_request {
+
+	( $$ == $main_pid ) or confess("FATAL: update_termination_request() called from PID $$ instead of $main_pid !");
+
+	lock_data($work_data);
+
+	# Has DEATH to be raise?
+	( $death_note > $work_data->{DEATH} ) and $work_data->{DEATH} = $death_note;
+
+	# Has DEATH to be reset?
+	( 0 == $death_note ) and $work_data->{DEATH} = 0;
+	unlock_data($work_data);
+
+	return 1;
+} ## end sub update_termination_request
+
 # A warnings handler that lets perl warnings be printed via log
 sub warnHandler {
 	my ($warn) = @_;
@@ -2190,14 +2211,6 @@ sub wait_for_all_forks {
 	} ## end foreach my $pid (@PIDs)
 
 	log_debug( $work_data, "All PIDs ended '%s'.", ( $result > 0 ) ? 'successfully' : 'with errors!' );
-
-	# If all forks ended well, we have to reset the death note variable
-	if ( $result > 0 ) {
-		lock_data($work_data);
-		( $death_note > 0 ) and $death_note = 0;
-		( 0 == $death_note ) and $work_data->{DEATH} = 0;
-		unlock_data($work_data);
-	} ## end if ( $result > 0 )
 
 	return $result;
 } ## end sub wait_for_all_forks
@@ -2281,6 +2294,9 @@ sub watch_my_forks {
 			out_time_ms => 0,
 			total_size  => 0
 		);
+
+		# If the main program was signalled to leave, transfer the message
+		update_termination_request();
 
 		lock_data($work_data);
 		my $fork_cnt = $work_data->{cnt};
