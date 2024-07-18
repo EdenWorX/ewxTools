@@ -274,8 +274,18 @@ foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 # ---
 # --- 5) And finally we can put all the latest temp files together and create the target vid
 # ---
-can_work() and log_status( $work_data, 'Creating %s ...', $path_target );
-assemble_output();
+if ( can_work() ) {
+	log_status( $work_data, 'Creating %s ...', $path_target );
+	my $inter_opts = {
+		'src'      => 'idn',
+		'tgt'      => 'out',
+		'dec_max'  => 5,
+		'dec_frac' => 0.8,
+		'fps'      => $target_fps,
+		'do_alt'   => 0
+	};
+	assemble_output($inter_opts);
+} ## end if ( can_work() )
 
 # ---------------------------------------------------------
 # END Handler
@@ -434,7 +444,7 @@ sub analyze_input {
 	  and $formats->{duration} = floor( 1. + ( 1. * $1 ) );
 
 	# Now we can go through the read stream information and determine video and audio stream details
-	analyze_stream_info( $src, $streams ) or return 0;
+	analyze_stream_info( $src, $streams ) or log_error( $work_data, "Analyzing '%s' FAILED!", $src ) and return 0;
 
 	# If the second analysis somehow came up with a different average framerate, we have to adapt:
 	if (   ( $formats->{duration} > 0 )
@@ -467,11 +477,11 @@ sub analyze_stream_info {
 
 	for ( 0 .. ( $source_info{$src}{nb_streams} - 1 ) ) {
 		my $i = $_;  ## save the magic bullet
-		if ( $streams->[$i]{codec_type} eq 'video' ) {
+		if ( ( defined $streams->[$i]{codec_type} ) && ( $streams->[$i]{codec_type} eq 'video' ) ) {
 			$have_video   = 1;
 			$video_stream = $i;
 		}
-		if ( $streams->[$i]{codec_type} eq 'audio' ) {
+		if ( ( defined $streams->[$i]{codec_type} ) && ( $streams->[$i]{codec_type} eq 'audio' ) ) {
 			if ( 0 == $have_audio ) {
 				$have_audio   = 1;
 				$audio_stream = $i;
@@ -490,7 +500,7 @@ sub analyze_stream_info {
 				log_error( $work_data, "Found third audio channel in '%s' - no idea what to do with it!", $src );
 				return 0;
 			}
-		} ## end if ( $streams->[$i]{codec_type...})
+		} ## end if ( ( defined $streams...))
 	} ## end for ( 0 .. ( $source_info...))
 	( 0 == $have_video ) and log_error( $work_data, "Source file '%s' has no video stream!", $src ) and return 0;
 
@@ -498,6 +508,8 @@ sub analyze_stream_info {
 } ## end sub analyze_stream_info
 
 sub assemble_output {
+	my ($inter_opts) = @_;
+
 	can_work() or return 1;
 	my $lstfile = sprintf 'temp_%d_src.lst', $main_pid;
 	my $prgfile = sprintf 'temp_%d_prg.log', $main_pid;
@@ -518,7 +530,7 @@ sub assemble_output {
 
 	# Having a list file we can go and create our output:
 	if ( can_work() ) {
-		create_target_file( $lstfile, $prgfile, $mapfile ) or exit 12;
+		create_target_file( $lstfile, $prgfile, $mapfile, $inter_opts ) or exit 12;
 	}
 
 	# When everything is good, we no longer need the list file, progress file and the temp files
@@ -863,13 +875,11 @@ sub close_standard_io {
 } ## end sub close_standard_io
 
 sub create_target_file {
-	my ( $lstfile, $prgfile, $mapfile ) = @_;
+	my ( $lstfile, $prgfile, $mapfile, $inter_opts ) = @_;
 	can_work() or return 1;
 
-	# The filters are only for keeping full color ranges
-	my $F_in_scale  = "scale='in_range=full:out_range=full'";
-	my $F_out_scale = "scale='flags=accurate_rnd+full_chroma_inp+full_chroma_int:in_range=full:out_range=full'";
-	my $F_assembled = "${B_in}${F_in_scale}${B_middle}${F_out_scale}${B_out}";
+	# The filters enforce the target FPS as cfr stream, and get rid of duplicates caused by concatting the parts.
+	my $filter_string = make_filter_string( -1, $inter_opts );
 
 	# If we have a second stream, it is the voice-under that has to be stored in a separate file
 	my @mapVoice = ();
@@ -890,10 +900,10 @@ sub create_target_file {
 
 	# Building the worker fork is quite trivial
 	can_work() or return 1;
-	my @fps_opts = ( '-r', $target_fps, '-fps_mode', 'cfr' );
+	my @fps_opts = ( '-fps_mode', 'cfr', '-r', $target_fps );
 	my @ffargs   = (
 		$FF,                 @FF_ARGS_START,     '-progress',         $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-		@FF_ARGS_INPUT_INIT, @FF_ARGS_INPUT_CAT, '-i',                $lstfile,     @mapAudio, @metaAudio, @FF_ARGS_FILTER, $F_assembled,
+		@FF_ARGS_INPUT_INIT, @FF_ARGS_INPUT_CAT, '-i',                $lstfile,     @mapAudio, @metaAudio, @FF_ARGS_FILTER, $filter_string,
 		@fps_opts,           @FF_ARGS_FORMAT,    @FF_ARGS_CODEC_h264, $path_target, @mapVoice
 	);
 
@@ -1391,10 +1401,10 @@ sub log_debug {
 sub make_filter_string {
 	my ( $gid, $inter_opts ) = @_;
 	my $do_alt   = $inter_opts->{'do_alt'};
-	my $dropdups = $source_groups{$gid}{dropdups} // 0;
+	my $dropdups = $gid >= 0 ? $source_groups{$gid}{dropdups} // 0 : 0;
 	my $dec_max  = $inter_opts->{'dec_max'};
 	my $dec_frac = $inter_opts->{'dec_frac'};
-	my $src_fps  = $source_groups{$gid}{fps} // $target_fps;
+	my $src_fps  = $gid >= 0 ? $source_groups{$gid}{fps} // $target_fps : $target_fps;
 	my $tgt      = $inter_opts->{'tgt'};
 	my $tgt_fps  = $inter_opts->{'fps'};
 	( defined $do_alt ) and ( ( 0 == $do_alt ) or ( 1 == $do_alt ) ) or confess("do_alt $do_alt out of range! (0/1)");
@@ -1416,7 +1426,14 @@ sub make_filter_string {
 		# When calculating down to the target FPS, we always use high libplacebo interpolation.
 		# But on alternative interpolation we only use high minterpolate if there actually are dropped/dupped frames
 		$F_interpolate = sprintf 0 == $do_alt ? $ff_interp_libp_high : ( 0 == $dropdups ? $ff_interp_mint_none : $ff_interp_mint_high ), $tgt_fps;
-	} ## end elsif ( 'idn' eq $tgt )
+	} else {
+
+		# This is the last step, the creation of the target video.
+		$F_interpolate = sprintf 0 == $do_alt ? $ff_interp_libp_high : $ff_interp_mint_none, $tgt_fps;
+
+		# Here we also need an fps filter, the output will be cfr anyway.
+		$F_mpdecimate = "fps=fps=$target_fps:round=near,$F_mpdecimate";
+	} ## end else [ if ( 'iup' eq $tgt ) ]
 
 	return "pad=ceil(iw/2)*2:ceil(ih/2)*2,${F_in_scale}${B_decimate}${F_mpdecimate}${B_middle}${F_out_scale}${B_interp}${F_interpolate}";
 } ## end sub make_filter_string
@@ -1827,13 +1844,19 @@ sub show_progress {
 	# qw( bitrate drop_frames dup_frames fps frame out_time_ms total_size )
 
 	# Formualate the progress line
-	my $size_str     = human_readable_size( $prgData->{total_size} // 0, 1 );
-	my $time_str     = format_out_time( $prgData->{out_time_ms}    // 0 );
-	my $bitrate_str  = format_bitrate( ( $prgData->{bitrate} // 0.0 ) / $thr_count );                               ## Average, not the sum.
-	my $progress_str = sprintf '[%d/%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ',
-	  $thr_active, $thr_count,
-	  $prgData->{frame}, $prgData->{drop_frames}, $prgData->{dup_frames},
-	  $time_str, $prgData->{fps}, $bitrate_str, $size_str;
+	my $size_str    = human_readable_size( $prgData->{total_size} // 0, 1 );
+	my $time_str    = format_out_time( $prgData->{out_time_ms}    // 0 );
+	my $bitrate_str = format_bitrate( ( $prgData->{bitrate} // 0.0 ) / $thr_count );  ## Average, not the sum.
+	my $progress_str =
+	  ( $prgData->{frame} > 0 )
+	  ? (
+		sprintf '[%d/%d running] Frame %d (%d drp, %d dup); %s; FPS: %03.2f; %s; File Size: %s    ',
+		$thr_active, $thr_count, $prgData->{frame},
+		$prgData->{drop_frames},
+		$prgData->{dup_frames},
+		$time_str, $prgData->{fps}, $bitrate_str, $size_str
+	  )
+	  : ( sprintf '[%d/%d running] %s    ', $thr_active, $thr_count, $time_str );
 
 	# Clear a previous progress line
 	( $have_progress_msg > 0 ) and print "\r" . ( $SPACE x length $progress_str ) . "\r";
@@ -1979,8 +2002,9 @@ sub start_worker_fork {
 	my $file_from     = sprintf $source_groups{$gid}{$source}, $tid;
 	my $file_to       = sprintf $source_groups{$gid}{$target}, $tid;
 	my $filter_string = make_filter_string( $gid, $inter_opts );
-	my @fps_opts      = ( 'idn' eq $target ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
-	my @ffargs        = (
+	my @fps_opts      = ('-fps_mode');
+	( 'idn' eq $target ) and ( push @fps_opts, ( 'cfr', '-r', $inter_opts->{'fps'} ) ) or ( push @fps_opts, 'vfr' );
+	my @ffargs = (
 		$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
 		@FF_ARGS_INPUT_INIT, '-i',            $file_from,         @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
 		@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
@@ -2056,8 +2080,9 @@ sub strike_fork_restart {
 		my $file_from     = sprintf $work_data->{PIDs}{$pid}{source}, $tid;
 		my $file_to       = sprintf $work_data->{PIDs}{$pid}{target}, $tid;
 		my $filter_string = make_filter_string( $gid, $inter_opts );
-		my @fps_opts      = ( 'idn' eq $inter_opts->{'tgt'} ) ? ( '-r', $inter_opts->{'fps'}, '-fps_mode', 'cfr' ) : ();
-		my @ffargs        = (
+		my @fps_opts      = ('-fps_mode');
+		( 'idn' eq $inter_opts->{'tgt'} ) and ( push @fps_opts, ( 'cfr', '-r', $inter_opts->{'fps'} ) ) or ( push @fps_opts, 'vfr' );
+		my @ffargs = (
 			$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
 			@FF_ARGS_INPUT_INIT, '-i',            $file_from,         @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
 			@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
