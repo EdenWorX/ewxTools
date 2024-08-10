@@ -1685,6 +1685,10 @@ sub run_cmd_from_fork {
 		$chld_error = ( $? > 0 ) ? $? : 0;  ## -1 means, that waitpid has not have had a process to reap. Not an error!
 		${$exc_p} = $chld_error >> 8;
 
+		# Before we can leave, make sure no lingering output is in the pipeline
+		handle_io_operations( $io_selector, $stderr, $msg_out_p, $msg_err_p );
+
+		# Now everything is sqeaky clean.
 		$io_selector->remove($stderr);
 		$io_selector->remove($stdout);
 
