@@ -34,9 +34,9 @@ my $work_done = 0;            # Needed to know whether to log anything on END{}
 # 1.0.4    2024-06-20  sed, EdenWorX  Review log system to produce easier to read log. Great for debugging!
 #                                     If libplacebo freezes ffmpeg, which can happen although it is rare, kill the fork and
 #                                     restart it using minterpolate instead. Better be slow than break.
-# 1.0.5    2024-07-13  sed, EdenWorX  We no longer call for sepecific hardware initialisation and let ffmpeg decide for itself.
+# 1.0.5    2024-07-13  sed, EdenWorX  We no longer call for specific hardware initialisation and let ffmpeg decide for itself.
 #                                     Also all forks now share knowledge about breaks and signals, so called processes can be
-#                                       torn down, too, now. No more zombie processes if something goes wrong!
+#                                       torn down, too. No more zombie processes if something goes wrong!
 #                                     To make this work we switched to IPC::Open3 utilizing IO::Select.
 #
 # Please keep this current:
@@ -44,8 +44,10 @@ Readonly our $VERSION => '1.0.5';
 
 # =======================================================================================
 # Workflow:
+# Prepare: If multiple sources are set, concatenate them to one source MKV.
+#          (Doing this and the split in one go often leads to splits that freeze ffmpeg.)
 # Phase 1: Get Values via ffprobe and determine minimum seconds to split into 4 segments.
-# Phase 2: Split the source into 4 segments, streamcopy, length from Phase 1.
+# Phase 2: Split the source into 4 segments, streamcopy, lengths from Phase 1.
 # Phase 3: 1 Fork per Segment does mpdecimate(7)+libplacebo(120|60) into UTVideo.
 # Phase 4: 1 Fork per Segment does mpdecimate(2)+libplacebo(60|30) into UTVideo.
 # Phase 5: h264_nvenc produces output from all segments, highest quality
@@ -396,20 +398,20 @@ sub analyze_all_inputs {
 		};
 		$source_ids{$pathID} = $src;
 
-		analyze_input( 0, $src ) or exit 6;
+		analyze_input($src) or exit 6;
 	} ## end foreach my $src (@path_source)
 
 	return 1;
 } ## end sub analyze_all_inputs
 
 sub analyze_input {
-	my ( $gid, $src ) = @_;
+	my ($src) = @_;
 
 	my $formats = $source_info{$src};  ## Shortcut
 
 	# Get basic duration
 	my $stream_fields = 'avg_frame_rate,duration';
-	my $frstream_no   = get_info_from_ffprobe( $gid, $src, $stream_fields );
+	my $frstream_no   = get_info_from_ffprobe( $src, $stream_fields );
 	( $frstream_no >= 0 ) or return 0;        ## Something went wrong
 	my $streams  = $formats->{streams};       ## shortcut, too
 	my $frstream = $streams->[$frstream_no];  ## shortcut, three
@@ -435,7 +437,7 @@ sub analyze_input {
 	# Now that we have good (and sane) values for probing sizes and durations, lets query ffprobe again to get the final value we need.
 	can_work() or return 0;
 	$stream_fields = 'avg_frame_rate,channels,codec_name,codec_type,nb_streams,pix_fmt,r_frame_rate,stream_type,duration';
-	$frstream      = get_info_from_ffprobe( $gid, $src, $stream_fields );
+	$frstream      = get_info_from_ffprobe( $src, $stream_fields );
 	( $frstream_no >= 0 ) or return 0;                                ## Something went wrong this time
 	$frstream = $streams->[$frstream_no];                             ## shortcut, four...
 
@@ -618,7 +620,7 @@ sub can_work {
 # Simple Wrapper around IPC::Cmd to capture simple command outputs
 # ----------------------------------------------------------------
 sub capture_cmd {
-	my ( $gid, @cmd ) = @_;
+	my (@cmd) = @_;
 	my $kid = fork;
 
 	( defined $kid ) or croak("Cannot fork()! $!\n");
@@ -632,7 +634,7 @@ sub capture_cmd {
 
 	# === Do the bookkeeping before we wait
 	# =======================================
-	add_pid( $kid, $gid );
+	add_pid( $kid, 0 );
 
 	# Wait on the fork to finish
 	# =======================================
@@ -990,13 +992,13 @@ sub format_out_time {
 } ## end sub format_out_time
 
 sub get_info_from_ffprobe {
-	my ( $gid, $src, $stream_fields ) = @_;
+	my ( $src, $stream_fields ) = @_;
 	my $avg_frame_rate_stream = -1;
 	my @fpcmd                 = ( $FP, @FP_ARGS, "stream=$stream_fields", split( $SPACE, $source_info{$src}{probeStrings} ), $src );
 
 	log_info( $work_data, 'Calling: %s', ( join $SPACE, @fpcmd ) );
 
-	my @fplines = split /\n/ms, capture_cmd( $gid, @fpcmd );
+	my @fplines = split /\n/ms, capture_cmd(@fpcmd);
 	can_work or return 0;
 
 	foreach my $line (@fplines) {
