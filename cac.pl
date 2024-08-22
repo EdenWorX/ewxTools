@@ -32,15 +32,18 @@ my $work_done = 0;            # Needed to know whether to log anything on END{}
 # 1.0.2    2024-05-30  sed, EdenWorX  Rewrote the workers to be true forks instead of using iThreads.
 # 1.0.3    2024-06-10  sed, EdenWorX  Greatly reduced complexity by untangling all the spaghetti code areas
 # 1.0.4    2024-06-20  sed, EdenWorX  Review log system to produce easier to read log. Great for debugging!
-#                                     If libplacebo freezes ffmpeg, which can happen although it is rare, kill the fork and
-#                                     restart it using minterpolate instead. Better be slow than break.
-# 1.0.5    2024-07-13  sed, EdenWorX  We no longer call for specific hardware initialisation and let ffmpeg decide for itself.
-#                                     Also all forks now share knowledge about breaks and signals, so called processes can be
-#                                       torn down, too. No more zombie processes if something goes wrong!
+#                                     If libplacebo freezes ffmpeg, which can happen although it is rare, kill the fork
+#                                     and restart it using minterpolate instead. Better be slow than break.
+# 1.0.5    2024-07-13  sed, EdenWorX  We no longer call for specific hardware initialization and let ffmpeg decide for
+#                                       itself what hardware to use and how to use it (if any).
+#                                     Also all forks now share knowledge about breaks and signals, so called processes
+#                                       can be torn down, too. No more zombie processes if something goes wrong!
 #                                     To make this work we switched to IPC::Open3 utilizing IO::Select.
+# 1.0.6    2024-08-21  sed, EdenWorX  Split concatenating multiple sources from the segment creation, it is safer to do
+#                                       this in two steps.
 #
 # Please keep this current:
-Readonly our $VERSION => '1.0.5';
+Readonly our $VERSION => '1.0.6';
 
 # =======================================================================================
 # Workflow:
@@ -152,7 +155,9 @@ my @FF_ARGS_INPUT_CAT   = qw( -f concat -safe 0 );
 my @FF_ARGS_INPUT_INIT  = qw( -loglevel level+warning -nostats -colorspace bt709 -color_range pc );
 my @FF_ARGS_START       = qw( -hide_banner -loglevel level+info -y );
 my @FF_CONCAT_BEGIN     = qw( -loglevel level+warning -nostats -f concat -safe 0 -i );
-my @FF_CONCAT_END       = qw( -map 0 -c copy );
+my @FF_CONCAT_END       = qw( -map 0 -f matroska -write_crc32 0 -c copy );
+my @FF_SEGMENT_BEGIN    = qw( -f segment -segment_time );
+my @FF_SEGMENT_END      = qw( -map 0 -c copy );
 my @FP_ARGS             = qw( -hide_banner -loglevel error -v quiet -show_format -of flat=s=_ -show_entries );
 my $ff_interp_libp_none = "libplacebo='extra_opts=preset=high_quality:frame_mixer=none:fps=%d'";
 my $ff_interp_libp_high = "libplacebo='extra_opts=preset=high_quality:frame_mixer=mitchell_clamp:fps=%d'";
@@ -246,12 +251,13 @@ can_work() and log_status( $work_data, 'Interpolating segments up to %d FPS...',
 foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	can_work() or last;
 	my $inter_opts = {
+		'dec_frac' => 0.5,
+		'dec_max'  => 7,
+		'do_alt'   => 0,
+		'fps'      => $max_fps,
+		'prg'      => $source_groups{$groupID}{prgu},
 		'src'      => 'tmp',
 		'tgt'      => 'iup',
-		'dec_max'  => 7,
-		'dec_frac' => 0.5,
-		'fps'      => $max_fps,
-		'do_alt'   => 0
 	};
 	interpolate_source_group( $groupID, $inter_opts ) or exit 9;
 } ## end foreach my $groupID ( sort ...)
@@ -263,12 +269,13 @@ can_work() and log_status( $work_data, 'Interpolating segments down to %d FPS...
 foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 	can_work() or last;
 	my $inter_opts = {
-		'src'      => 'iup',
-		'tgt'      => 'idn',
-		'dec_max'  => 3,
 		'dec_frac' => 0.667,
+		'dec_max'  => 3,
+		'do_alt'   => 0,
 		'fps'      => $target_fps,
-		'do_alt'   => 0
+		'prg'      => $source_groups{$groupID}{prgd},
+		'src'      => 'iup',
+		'tgt'      => 'idn'
 	};
 	interpolate_source_group( $groupID, $inter_opts ) or exit 10;
 } ## end foreach my $groupID ( sort ...)
@@ -583,14 +590,17 @@ sub build_source_groups {
 		if ( ( $dir_changed + $ch_changed + $codec_changed ) > 0 ) {
 			## no critic (ProhibitParensWithBuiltins)
 			$source_groups{ ++$group_id } = {
+				cat  => sprintf( '%s/temp_%d_segments_%d_src.mkv', $last_dir, $main_pid, ++$tmp_count ),
+				cnt  => 0,
 				dir  => abs_path($last_dir),
 				dur  => 0,
 				fps  => 0,
 				idn  => sprintf( '%s/temp_%d_inter_dn_%d_%%d.mkv', $last_dir, $main_pid, ++$tmp_count ),
 				ids  => [],
-				iup  => sprintf( '%s/temp_%d_inter_up_%d_%%d.mkv', $last_dir, $main_pid, ++$tmp_count ),
-				lst  => sprintf( '%s/temp_%d_segments_%d_src.lst', $last_dir, $main_pid, ++$tmp_count ),
-				prg  => sprintf( '%s/temp_%d_progress_%d_%%d.prg', $last_dir, $main_pid, ++$tmp_count ),
+				iup  => sprintf( '%s/temp_%d_inter_up_%d_%%d.mkv',    $last_dir, $main_pid, ++$tmp_count ),
+				lst  => sprintf( '%s/temp_%d_segments_%d_src.lst',    $last_dir, $main_pid, ++$tmp_count ),
+				prgu => sprintf( '%s/temp_%d_progress_up_%d_%%d.prg', $last_dir, $main_pid, ++$tmp_count ),
+				prgd => sprintf( '%s/temp_%d_progress_dn_%d_%%d.prg', $last_dir, $main_pid, ++$tmp_count ),
 				srcs => [],
 				tmp  => sprintf( '%s/temp_%d_segments_%d_%%d.mkv', $last_dir, $main_pid, ++$tmp_count )
 			};
@@ -600,6 +610,7 @@ sub build_source_groups {
 		$source_groups{$group_id}{dur} += $data->{duration};
 		$data->{sourceFPS} > $source_groups{$group_id}{fps}
 		  and $source_groups{$group_id}{fps} = $data->{sourceFPS};
+		$source_groups{$group_id}{cnt} += 1;
 		push @{ $source_groups{$group_id}{ids} },  $fileID;
 		push @{ $source_groups{$group_id}{srcs} }, abs_path($src);
 	}  ## End of grouping input files
@@ -845,10 +856,11 @@ sub cleanint {
 
 sub cleanup_source_groups {
 	foreach my $gid ( sort { $a <=> $b } keys %source_groups ) {
-		if ( -f $source_groups{$gid}{lst} ) {
+		if ( ( defined $source_groups{$gid}{lst} ) && ( -f $source_groups{$gid}{lst} ) ) {
 			( $do_debug > 0 ) and log_debug( $work_data, 'See: %s', $source_groups{$gid}{lst} ) or unlink $source_groups{$gid}{lst};
 		}
 		for my $area (qw( tmp idn iup prg )) {
+			( defined $source_groups{$gid}{$area} ) or next;
 			for my $i ( 0 .. 3 ) {
 				my $f = sprintf $source_groups{$gid}{$area}, $i;
 				if ( -f $f ) {
@@ -928,6 +940,50 @@ sub commify {
 	return scalar reverse $text;
 } ## end sub commify
 
+sub concat_source_group {
+	my ( $gid, $prgfile_fmt ) = @_;
+	my $result = 1;
+	can_work() or return 1;
+
+	# To concatenate we use the concat demuxer. It needs an input file which lists the sources:
+	if ( open my $fOut, '>', $source_groups{$gid}{lst} ) {
+		foreach my $fid ( sort { $a <=> $b } @{ $source_groups{$gid}{ids} } ) {
+			printf {$fOut} "file '%s'\n", abs_path( $source_ids{$fid} );
+		}
+		close $fOut or confess("Closing listfile '$source_groups{$gid}{lst}' FAILED!");
+	} else {
+		log_error( $work_data, q{Cannot write list file '%s': %s}, $source_groups{$gid}{lst}, $! );
+		return 0;
+	}
+
+	# Let's build the command line arguments:
+	my $prgfile = sprintf $prgfile_fmt, 1;
+	my @ffargs  = (
+		$FF,              @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		@FF_CONCAT_BEGIN, $source_groups{$gid}{lst},
+		@FF_CONCAT_END,   $source_groups{$gid}{cat}
+	);
+
+	log_info( $work_data, "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ) );
+	my $pid = start_work( 1, $gid, @ffargs );
+	( defined $pid ) and ( $pid > 0 ) or croak('BUG! start_work() returned invalid PID!');
+	lock_data($work_data);
+	@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
+	$work_data->{PIDs}{$pid}{prgfile} = $prgfile;
+	unlock_data($work_data);
+
+	# Watch and join
+	$result = watch_my_forks();
+
+	# The list file is no longer needed.
+	-f $source_groups{$gid}{lst} and ( 0 == $do_debug ) and unlink $source_groups{$gid}{lst};
+
+	# As is the progress file
+	-f $prgfile and ( 0 == $do_debug ) and unlink $prgfile;
+
+	return $result;
+} ## end sub concat_source_group
+
 sub declare_single_source {
 	can_work()             or return 1;
 	( 1 == $source_count ) or return 0;
@@ -938,16 +994,19 @@ sub declare_single_source {
 
 	## no critic (ProhibitParensWithBuiltins)
 	$source_groups{0} = {
+		cat  => sprintf( '%s/temp_%d_segments_%d_src.mkv', $last_dir, $main_pid, 1 ),
+		cnt  => 1,
 		dir  => $last_dir,
 		dur  => $data->{duration},
 		fps  => $data->{sourceFPS},
-		idn  => sprintf( '%s/temp_%d_inter_dn_%d_%%d.mkv', $last_dir, $main_pid, 1 ),
+		idn  => sprintf( '%s/temp_%d_inter_dn_%d_%%d.mkv', $last_dir, $main_pid, 2 ),
 		ids  => [$fileID],
-		iup  => sprintf( '%s/temp_%d_inter_up_%d_%%d.mkv', $last_dir, $main_pid, 2 ),
-		lst  => sprintf( '%s/temp_%d_segments_%d_src.lst', $last_dir, $main_pid, 3 ),
-		prg  => sprintf( '%s/temp_%d_progress_%d_%%d.prg', $last_dir, $main_pid, 4 ),
+		iup  => sprintf( '%s/temp_%d_inter_up_%d_%%d.mkv',    $last_dir, $main_pid, 3 ),
+		lst  => sprintf( '%s/temp_%d_segments_%d_src.lst',    $last_dir, $main_pid, 4 ),
+		prgu => sprintf( '%s/temp_%d_progress_up_%d_%%d.prg', $last_dir, $main_pid, 5 ),
+		prgd => sprintf( '%s/temp_%d_progress_dn_%d_%%d.prg', $last_dir, $main_pid, 5 ),
 		srcs => [$src],
-		tmp  => sprintf( '%s/temp_%d_segments_%d_%%d.mkv', $last_dir, $main_pid, 5 )
+		tmp  => sprintf( '%s/temp_%d_segments_%d_%%d.mkv', $last_dir, $main_pid, 6 )
 	};
 
 	return 1;
@@ -1363,6 +1422,14 @@ sub logMsg {
 		$fmt = shift @args // $EMPTY;
 	}
 
+	# If $fmt is now a fixed string, and @args is empty, we have to make sure that all
+	# possible formatting strings are ignored, as the string might come from an error
+	# handler.
+	if ( 0 == scalar @args ) {
+		push @args, $fmt;  ## Make the fixed string the first (and only) argument
+		$fmt = '%s';       ## And print it "as-is".
+	}
+
 	my $stTime  = get_time_now();
 	my $stLevel = get_log_level($lvl);
 	my $stMsg   = sprintf "%s|%s|%s|$fmt", $stTime, $stLevel, get_location($data), @args;
@@ -1480,7 +1547,7 @@ sub parse_progress_data {
 
 	# Attempt 2: bitrate
 	if ( $line =~ m/^${property_name}="?([.0-9]+)(.)b?its?\/s"?\s*$/xms ) {
-		my $bits = 1 * $1;
+		my $bits = 1.0 * $1;
 		my $exp  = lc $2;
 		log_debug( $work_data, "${EIGHTSPACE}==> %s=%f%sbits/s", $property_name, $bits, $exp );
 		( 'g' eq $exp ) and $bits *= 1024 and $exp = 'm';
@@ -1739,16 +1806,16 @@ sub segment_all_groups {
 
 	foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 		can_work() or last;
-		my $prgfile = sprintf '%s/temp_%d_progress_%d.log', $source_groups{$groupID}{dir}, $main_pid, $groupID;
-		segment_source_group( $groupID, $prgfile ) or exit 8;
-		-f $prgfile and ( 0 == $do_debug ) and unlink $prgfile;
-	} ## end foreach my $groupID ( sort ...)
+		my $prgfile_fmt = sprintf '%s/temp_%d_progress_cc_%d_%%d.prg', $source_groups{$groupID}{dir}, $main_pid, $groupID;
+		segment_source_group( $groupID, $prgfile_fmt ) or exit 8;
+	}
 
 	return 1;
 } ## end sub segment_all_groups
 
 sub segment_source_group {
-	my ( $gid, $prgfile ) = @_;
+	my ( $gid, $prgfile_fmt ) = @_;
+	my $result = 1;
 	( defined $source_groups{$gid} ) or log_error( $work_data, 'Source Group ID %d does not exist!', $gid ) and return 0;
 	can_work()                       or return 1;
 
@@ -1758,23 +1825,28 @@ sub segment_source_group {
 	# Each segment must be a quarter of the total duration, raised to the next full second
 	my $seg_len = floor( 1. + ( $source_groups{$gid}{dur} / 4. ) );
 
-	# Luckily we can concat and segment in one go, but we need the concat demuxer for that, which requires an input file
-	if ( open my $fOut, '>', $source_groups{$gid}{lst} ) {
-		foreach my $fid ( sort { $a <=> $b } @{ $source_groups{$gid}{ids} } ) {
-			printf {$fOut} "file '%s'\n", abs_path( $source_ids{$fid} );
-		}
-		close $fOut or confess("Closing listfile '$source_groups{$gid}{lst}' FAILED!");
-	} else {
-		log_error( $work_data, q{Cannot write list file '%s': %s}, $source_groups{$gid}{lst}, $! );
-		return 0;
+	# Before we can segment the video, we have to concatenate associated parts.
+	# If we do it in one go, some segments might be able to freeze ffmpeg later.
+	if ( $source_groups{$gid}{cnt} > 1 ) {
+		log_status( $work_data, 'Concatenating %d source files...', $source_groups{$gid}{cnt} );
+		$result = concat_source_group( $gid, $prgfile_fmt );
+		( 1 == $result ) or return $result;
+		can_work()       or return 1;
+		log_status( $work_data, 'Segmenting concatenated file...' );
+	} ## end if ( $source_groups{$gid...})
+
+	# If there is only one source file, we do not have a concatenated one now, so use the source directly.
+	else {
+		$source_groups{$gid}{cat} = abs_path( $source_groups{$gid}{srcs}[0] );
 	}
 
+	# The segmentations is rather simple, just copy the source and add the segment format
 	# Let's build the command line arguments:
-	my @ffargs = (
-		$FF,              @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
-		@FF_CONCAT_BEGIN, $source_groups{$gid}{lst},
-		@FF_CONCAT_END,   qw( -f segment -segment_time ),
-		"$seg_len",       $source_groups{$gid}{tmp}
+	my $prgfile = sprintf $prgfile_fmt, 2;
+	my @ffargs  = (
+		$FF,  @FF_ARGS_START, '-progress', $prgfile, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
+		'-i', $source_groups{$gid}{cat},
+		@FF_SEGMENT_BEGIN, "$seg_len", @FF_SEGMENT_END, $source_groups{$gid}{tmp}
 	);
 
 	log_info( $work_data, "Starting Worker %d for:\n%s", 1, ( join $SPACE, @ffargs ) );
@@ -1786,10 +1858,13 @@ sub segment_source_group {
 	unlock_data($work_data);
 
 	# Watch and join
-	my $result = watch_my_forks();
+	$result = watch_my_forks();
 
-	# The list file is no longer needed.
-	-f $source_groups{$gid}{lst} and ( 0 == $do_debug ) and unlink $source_groups{$gid}{lst};
+	# The concatenation file is no longer needed.
+	( $source_groups{$gid}{cnt} > 1 ) and ( -f $source_groups{$gid}{cat} ) and ( 0 == $do_debug ) and unlink $source_groups{$gid}{cat};
+
+	# The progress file can go, too
+	-f $prgfile and ( 0 == $do_debug ) and unlink $prgfile;
 
 	return $result;
 } ## end sub segment_source_group
@@ -2004,7 +2079,7 @@ sub start_worker_fork {
 
 	my $source        = $inter_opts->{'src'};
 	my $target        = $inter_opts->{'tgt'};
-	my $prgLog        = sprintf $source_groups{$gid}{prg}, $tid;
+	my $prgLog        = sprintf $inter_opts->{'prg'}, $tid;
 	my $file_from     = sprintf $source_groups{$gid}{$source}, $tid;
 	my $file_to       = sprintf $source_groups{$gid}{$target}, $tid;
 	my $filter_string = make_filter_string( $gid, $inter_opts );
