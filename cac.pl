@@ -1684,7 +1684,14 @@ sub remove_pid {
 		my $have_error = handle_fork_message( $work_data->{PIDs}{$pid}{error_msg} // $EMPTY );
 
 		if ( ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) || $have_error ) {
-			log_error( $work_data, "Worker PID %d FAILED [%d]!\n%s", $pid, $work_data->{PIDs}{$pid}{exit_code}, $work_data->{PIDs}{$pid}{result} );
+			$result = pid_shall_restart( $work_data, $pid );  ## We _did_ fail unless a restart was triggered.
+			log_error(
+				$work_data, "Worker PID %d %s [%d]!\n%s",
+				$pid,
+				$result ? 'killed for restart' : 'FAILED',
+				$work_data->{PIDs}{$pid}{exit_code},
+				$work_data->{PIDs}{$pid}{result}
+			);
 
 			# We do not need the target file any more, the thread failed! (if an fmt is set)
 			if ( ( 0 == $do_debug ) && ( length( $work_data->{PIDs}{$pid}{target} ) > 0 ) ) {
@@ -1692,7 +1699,6 @@ sub remove_pid {
 				log_debug( $work_data, "Removing target file '%s' ...", $f );
 				-f $f and unlink $f;
 			}
-			$result = 0;  ## We _did_ fail!
 		} ## end if ( ( defined( $work_data...)))
 
 		# We do not need the source file any more (if an fmt is set)
@@ -1776,28 +1782,6 @@ sub select_termination_message {
 		:                       'killed'
 	);
 } ## end sub select_termination_message
-
-# ---------------------------------------------------------
-# A signal handler that sets global vars according to the
-# signal given.
-# Unknown signals are ignored.
-# ---------------------------------------------------------
-sub sigHandler {
-	my ($sig) = @_;
-	if ( exists $SIGS_CAUGHT{$sig} ) {
-		if ( ++$death_note > 5 ) {
-
-			# This is very crude, so only do _THAT_ if everything else failed
-			log_error( undef, 'Caught %s Signal %d times - breaking all off!', $sig, $death_note );
-			kill 'KILL', $$ or croak('KILL failed');
-		} else {
-			log_warning( undef, 'Caught %s Signal - Ending Tasks...', $sig );
-		}
-	} else {
-		log_warning( $work_data, 'Caught Unknown Signal [%s] ... ignoring Signal!', $sig );
-	}
-	return 1;
-} ## end sub sigHandler
 
 sub segment_all_groups {
 	can_work() or return 1;
@@ -1965,6 +1949,28 @@ sub show_progress {
 
 	return 1;
 } ## end sub show_progress
+
+# ---------------------------------------------------------
+# A signal handler that sets global vars according to the
+# signal given.
+# Unknown signals are ignored.
+# ---------------------------------------------------------
+sub sigHandler {
+	my ($sig) = @_;
+	if ( exists $SIGS_CAUGHT{$sig} ) {
+		if ( ++$death_note > 5 ) {
+
+			# This is very crude, so only do _THAT_ if everything else failed
+			log_error( undef, 'Caught %s Signal %d times - breaking all off!', $sig, $death_note );
+			kill 'KILL', $$ or croak('KILL failed');
+		} else {
+			log_warning( undef, 'Caught %s Signal - Ending Tasks...', $sig );
+		}
+	} else {
+		log_warning( $work_data, 'Caught Unknown Signal [%s] ... ignoring Signal!', $sig );
+	}
+	return 1;
+} ## end sub sigHandler
 
 sub start_capture {
 	my ($cmd) = @_;
@@ -2196,9 +2202,9 @@ sub strike_fork_term {
 
 	if ( 0 == reap_pid($pid) ) {
 		log_warning( $work_data, 'Worker PID %d looks frozen...', $pid );
+		mark_pid_restart( $work_data, $pid );
 		terminator( $pid, 'TERM' );
 		( get_pid_status( $work_data, $pid ) < $FF_KILLED ) and set_pid_status( $work_data, $pid, $FF_KILLED );
-		mark_pid_restart( $work_data, $pid );
 		return 1;
 	} ## end if ( 0 == reap_pid($pid...))
 
