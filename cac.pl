@@ -747,29 +747,27 @@ sub check_pid {
 # while we are just late to the party.
 # So let's check all PID data again, before we force the whole thing down.
 sub check_pids_crashed {
-	my ($pids_crashed) = @_;
+	my @PIDs         = @_;
+	my $forks_found  = 0;
+	my $pids_crashed = 0;
 
-	if ( $pids_crashed > 0 ) {
-		my $forks_found = 0;
+	log_debug( $work_data, 'Found %d PIDs that might have crashed. Checking PIDs...', $pids_crashed );
 
-		log_debug( $work_data, 'Found %d PIDs that might have crashed. Checking PIDs...', $pids_crashed );
+	lock_data($work_data);
+	my $forks_active = $work_data->{cnt};
 
-		lock_data($work_data);
-		my $forks_active = $work_data->{cnt};
-		my @PIDs         = sort keys %{ $work_data->{PIDs} };
-		$pids_crashed = 0;
+	foreach my $pid (@PIDs) {
+		my $is_active = is_pid_active($pid);
+		( $is_active > 0 ) and ++$forks_found  and log_debug( $work_data, 'PID %d found active' );
+		( $is_active < 0 ) and ++$pids_crashed and log_debug( $work_data, 'PID %d found CRASHED!' );
+	}
 
-		foreach my $pid (@PIDs) {
-			my $is_active = is_pid_active( $work_data, $pid );
-			( $is_active > 0 ) and ++$forks_found  and log_debug( $work_data, 'PID %d found active' );
-			( $is_active < 0 ) and ++$pids_crashed and log_debug( $work_data, 'PID %d found CRASHED!' );
-		}
+	log_debug( $work_data, '%d/%d PID%s found working, %d PID%s crashed.',
+		$forks_found, $forks_active, plural_s($forks_found), $pids_crashed, plural_s($pids_crashed) );
 
-		log_debug( $work_data, '%d/%d PID%s found working, %d PID%s crashed.',
-			$forks_found, $forks_active, plural_s($forks_found), $pids_crashed, plural_s($pids_crashed) );
+	( $forks_found != $forks_active ) and $work_data->{cnt} = $forks_active;
 
-		unlock_data($work_data);
-	} ## end if ( $pids_crashed > 0)
+	unlock_data($work_data);
 
 	return $pids_crashed;
 } ## end sub check_pids_crashed
@@ -893,6 +891,52 @@ sub cleanint {
 	my $int = floor($float);
 	return commify($int);
 }
+
+sub cleanup_pid {
+	my ($pid) = @_;
+	my $result = 1;
+
+	lock_data($work_data);
+
+	# If we shall clean up source and maybe target files, do so now
+	log_debug( $work_data, 'args      => %d', scalar @{ $work_data->{PIDs}{$pid}{args} // [] } );
+	log_debug( $work_data, 'exit_code => %d', $work_data->{PIDs}{$pid}{exit_code} // 0 );
+	log_debug( $work_data, 'id        => %d', $work_data->{PIDs}{$pid}{id}        // -1 );
+	log_debug( $work_data, 'prgfile   => %s', $work_data->{PIDs}{$pid}{prgfile}   // 'undef' );
+	log_debug( $work_data, 'source    => %s', $work_data->{PIDs}{$pid}{source}    // 'undef' );
+	log_debug( $work_data, 'target    => %s', $work_data->{PIDs}{$pid}{target}    // 'undef' );
+	log_debug( $work_data, 'STDOUT    => %s', $work_data->{PIDs}{$pid}{result}    // 'undef' );
+	log_debug( $work_data, 'STDERR    => %s', $work_data->{PIDs}{$pid}{error_msg} // 'undef' );
+
+	my $have_error = handle_fork_message( $work_data->{PIDs}{$pid}{error_msg} // $EMPTY );
+
+	if ( ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) || $have_error ) {
+		$result = pid_shall_restart( $work_data, $pid );  ## We _did_ fail unless a restart was triggered.
+		log_error(
+			$work_data, "Worker PID %d %s [%d]!\n%s",
+			$pid,
+			$result ? 'killed for restart' : 'FAILED',
+			$work_data->{PIDs}{$pid}{exit_code},
+			$work_data->{PIDs}{$pid}{result}
+		);
+
+		# We do not need the target file any more, the thread failed! (if an fmt is set)
+		if ( ( 0 == $do_debug ) && ( length( $work_data->{PIDs}{$pid}{target} ) > 0 ) ) {
+			my $f = sprintf $work_data->{PIDs}{$pid}{target}, $work_data->{PIDs}{$pid}{id};
+			log_debug( $work_data, "Removing target file '%s' ...", $f );
+			-f $f and unlink $f;
+		}
+	} ## end if ( ( defined( $work_data...)))
+
+	# We do not need the source file any more (if an fmt is set)
+	if ( ( 0 == $do_debug ) && defined( $work_data->{PIDs}{$pid}{source} ) && ( length( $work_data->{PIDs}{$pid}{source} ) > 0 ) ) {
+		my $f = sprintf $work_data->{PIDs}{$pid}{source}, $work_data->{PIDs}{$pid}{id};
+		log_debug( $work_data, "Removing source file '%s' ...", $f );
+		-f $f and unlink $f;
+	}
+
+	return $result;
+} ## end sub cleanup_pid
 
 sub cleanup_source_groups {
 	foreach my $gid ( sort { $a <=> $b } keys %source_groups ) {
@@ -1265,7 +1309,7 @@ sub handle_fork_message {
 # @return   Returns -1 if the PID is gone without any progress, 0 if progress has ended successfully and 1 if it is still running.
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout ) = @_;
-	my $pidstat        = is_pid_active( $work_data, $pid );
+	my $pidstat        = is_pid_active($pid);
 	my $prgfile        = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;
 	my $progress_state = $PROGRESS_NONE;
 
@@ -1412,7 +1456,7 @@ sub interpolate_source_group {
 # @brief Check whether a PID is active
 # @return -1 if the PID is no longer listed or reap_pid() detected a crashed PID0 1 if the PID is working and 0 if has ended.
 sub is_pid_active {
-	my ( $work_data, $pid ) = @_;
+	my ($pid)       = @_;
 	my $data_exists = pid_exists( $work_data, $pid );
 	my $reap_status = reap_pid($pid);
 
@@ -1671,7 +1715,7 @@ sub pid_status_to_str {
 sub plural_s {
 	my ($num) = @_;
 
-	if ( $num =~ m/^(\d+)$/ ) {
+	if ( $num =~ m/^(\d+)$/xms ) {
 		( 1 != $1 ) and return 's';
 	}
 
@@ -1755,46 +1799,9 @@ sub remove_pid {
 		usleep(250_000);  ## For times a second is enough
 	}
 
+	( 1 == $do_cleanup ) and $result = cleanup_pid($pid);
+
 	lock_data($work_data);
-
-	# If we shall clean up source and maybe target files, do so now
-	if ( 1 == $do_cleanup ) {
-		log_debug( $work_data, 'args      => %d', scalar @{ $work_data->{PIDs}{$pid}{args} // [] } );
-		log_debug( $work_data, 'exit_code => %d', $work_data->{PIDs}{$pid}{exit_code} // 0 );
-		log_debug( $work_data, 'id        => %d', $work_data->{PIDs}{$pid}{id}        // -1 );
-		log_debug( $work_data, 'prgfile   => %s', $work_data->{PIDs}{$pid}{prgfile}   // 'undef' );
-		log_debug( $work_data, 'source    => %s', $work_data->{PIDs}{$pid}{source}    // 'undef' );
-		log_debug( $work_data, 'target    => %s', $work_data->{PIDs}{$pid}{target}    // 'undef' );
-		log_debug( $work_data, 'STDOUT    => %s', $work_data->{PIDs}{$pid}{result}    // 'undef' );
-		log_debug( $work_data, 'STDERR    => %s', $work_data->{PIDs}{$pid}{error_msg} // 'undef' );
-
-		my $have_error = handle_fork_message( $work_data->{PIDs}{$pid}{error_msg} // $EMPTY );
-
-		if ( ( defined( $work_data->{PIDs}{$pid}{exit_code} ) && ( $work_data->{PIDs}{$pid}{exit_code} != 0 ) ) || $have_error ) {
-			$result = pid_shall_restart( $work_data, $pid );  ## We _did_ fail unless a restart was triggered.
-			log_error(
-				$work_data, "Worker PID %d %s [%d]!\n%s",
-				$pid,
-				$result ? 'killed for restart' : 'FAILED',
-				$work_data->{PIDs}{$pid}{exit_code},
-				$work_data->{PIDs}{$pid}{result}
-			);
-
-			# We do not need the target file any more, the thread failed! (if an fmt is set)
-			if ( ( 0 == $do_debug ) && ( length( $work_data->{PIDs}{$pid}{target} ) > 0 ) ) {
-				my $f = sprintf $work_data->{PIDs}{$pid}{target}, $work_data->{PIDs}{$pid}{id};
-				log_debug( $work_data, "Removing target file '%s' ...", $f );
-				-f $f and unlink $f;
-			}
-		} ## end if ( ( defined( $work_data...)))
-
-		# We do not need the source file any more (if an fmt is set)
-		if ( ( 0 == $do_debug ) && defined( $work_data->{PIDs}{$pid}{source} ) && ( length( $work_data->{PIDs}{$pid}{source} ) > 0 ) ) {
-			my $f = sprintf $work_data->{PIDs}{$pid}{source}, $work_data->{PIDs}{$pid}{id};
-			log_debug( $work_data, "Removing source file '%s' ...", $f );
-			-f $f and unlink $f;
-		}
-	} ## end if ( 1 == $do_cleanup )
 
 	# Progress files are always removed, because the only part where they are used
 	# will no longer pick them up once the PID was removed from %work_data (See watch_my_forks())
@@ -2529,7 +2536,12 @@ sub watch_my_forks {
 		} ## end foreach my $pid (@PIDs)
 
 		# Ensure that we do not tear everything down if a PID looks crashed. Check it again first
-		$ret_global = ( check_pids_crashed($pids_crashed) > 0 ) ? 23 : 0;
+		if ( $pids_crashed > 0 ) {
+			lock_data($work_data);
+			@PIDs = sort keys %{ $work_data->{PIDs} };
+			unlock_data($work_data);
+			$ret_global = ( check_pids_crashed(@PIDs) > 0 ) ? 23 : 0;
+		} ## end if ( $pids_crashed > 0)
 
 		# Now handle progress data
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
