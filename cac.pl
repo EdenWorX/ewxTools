@@ -2180,10 +2180,12 @@ sub strike_fork_restart {
 
 	lock_data($work_data);
 	my @args       = @{ $work_data->{PIDs}{$pid}{args} };
-	my $inter_opts = $work_data->{PIDs}{$pid}{interp};
-	my $tid        = $work_data->{PIDs}{$pid}{id};
 	my $gid        = $work_data->{PIDs}{$pid}{gid};
+	my $inter_opts = $work_data->{PIDs}{$pid}{interp};
 	my $prgLog     = $work_data->{PIDs}{$pid}{prgfile};
+	my $src        = $work_data->{PIDs}{$pid}{source};
+	my $tgt        = $work_data->{PIDs}{$pid}{target};
+	my $tid        = $work_data->{PIDs}{$pid}{id};
 	unlock_data($work_data);
 
 	# If we have interpolation data, this is an interpolating worker who has their
@@ -2198,14 +2200,11 @@ sub strike_fork_restart {
 		my $filter_string = make_filter_string( $gid, $inter_opts );
 		my @fps_opts      = ('-fps_mode');
 		( 'idn' eq $inter_opts->{'tgt'} ) and ( push @fps_opts, ( 'cfr', '-r', $inter_opts->{'fps'} ) ) or ( push @fps_opts, 'vfr' );
-		my @ffargs = (
+		@args = (
 			$FF,                 @FF_ARGS_START,  '-progress',        $prgLog, ( ( 'guess' ne $audio_layout ) ? qw( -guess_layout_max 0 ) : () ),
 			@FF_ARGS_INPUT_INIT, '-i',            $file_from,         @FF_ARGS_ACOPY_FIL, "${B_in}${filter_string}${B_out}",
 			@fps_opts,           @FF_ARGS_FORMAT, @FF_ARGS_CODEC_UTV, $file_to
 		);
-
-		@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
-		@args = @{ $work_data->{PIDs}{$pid}{args} };
 
 		# Before we can continue, the old progress file has to be deleted, or handle_fork_progress() might believe the fork
 		# already ended, because the old progress file might have a "progress=end" line at the end.
@@ -2218,11 +2217,11 @@ sub strike_fork_restart {
 	my $kid = start_work( $tid, $gid, @args );
 	( defined $kid ) and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
-	@{ $work_data->{PIDs}{$kid}{args} } = @{ $work_data->{PIDs}{$pid}{args} };
-	$work_data->{PIDs}{$kid}{gid}     = $work_data->{PIDs}{$pid}{gid};
+	@{ $work_data->{PIDs}{$kid}{args} } = @args;
+	$work_data->{PIDs}{$kid}{gid}     = $gid;
 	$work_data->{PIDs}{$kid}{prgfile} = $prgLog;
-	$work_data->{PIDs}{$kid}{source}  = $work_data->{PIDs}{$pid}{source};
-	$work_data->{PIDs}{$kid}{target}  = $work_data->{PIDs}{$pid}{target};
+	$work_data->{PIDs}{$kid}{source}  = $src;
+	$work_data->{PIDs}{$kid}{target}  = $tgt;
 	unlock_data($work_data);
 
 	remove_pid( $pid, 0 );  ## No cleanup, the restarted process will overwrite and we don't want to interfere with the substitute
@@ -2461,9 +2460,15 @@ sub watch_my_forks {
 			# Make sure we later know how many frames got dropped/dup'd.
 			my $dropdups = $prgData{drop_frames} + $prgData{dup_frames};
 			my $gid      = $work_data->{PIDs}{$pid}{gid};
-			( defined $source_groups{$gid}{dropdups} ) and ( $source_groups{$gid}{dropdups} >= $dropdups )
-			  or $source_groups{$gid}{dropdups} = $dropdups;
+
+			# If a PID got just restarted, the gid might not have been set, yet, so better check it.
+			# (This is rare. Locking/Unlocking work_data for every request is too much overhead.)
+			if ( defined $gid ) {
+				( defined $source_groups{$gid}{dropdups} ) and ( $source_groups{$gid}{dropdups} >= $dropdups )
+				  or $source_groups{$gid}{dropdups} = $dropdups;
+			}
 		} ## end foreach my $pid (@PIDs)
+
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
 		can_work or send_forks_the_kill();
