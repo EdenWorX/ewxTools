@@ -41,9 +41,10 @@ my $work_done = 0;            # Needed to know whether to log anything on END{}
 #                                     To make this work we switched to IPC::Open3 utilizing IO::Select.
 # 1.0.6    2024-08-21  sed, EdenWorX  Split concatenating multiple sources from the segment creation, it is safer to do
 #                                       this in two steps.
+# 1.0.7    2024-09-02  sed, EdenWorX  Rework the code for terminating and restarting a frozen fork.
 #
 # Please keep this current:
-Readonly our $VERSION => '1.0.6';
+Readonly our $VERSION => '1.0.7';
 
 # =======================================================================================
 # Workflow:
@@ -347,6 +348,7 @@ sub add_pid {
 	  and confess('FATAL BUG!');
 	defined( $work_data->{PIDs}{$pid} ) and confess("add_pid($pid) called but work_data already defined!");
 	lock_data($work_data);
+	log_debug( $work_data, 'Adding PID %d for GID %d ...', $pid, $gid );
 	$work_data->{PIDs}{$pid} = {
 		args      => [],     ## Shall be added by the caller as a reference
 		exit_code => 0,
@@ -359,9 +361,8 @@ sub add_pid {
 		source    => $EMPTY,
 		target    => $EMPTY
 	};
-	$work_data->{cnt}++;
 	unlock_data($work_data);
-	return 1;
+	return pid_count_inc();
 } ## end sub add_pid
 
 ##
@@ -757,6 +758,7 @@ sub check_pids_crashed {
 
 	lock_data($work_data);
 	my $forks_active = $work_data->{cnt};
+	unlock_data($work_data);
 
 	foreach my $pid (@PIDs) {
 		my $is_active = is_pid_active($pid);
@@ -766,10 +768,6 @@ sub check_pids_crashed {
 
 	log_debug( $work_data, '%d/%d PID%s found working, %d PID%s crashed.',
 		$forks_found, $forks_active, plural_s($forks_found), $pids_crashed, plural_s($pids_crashed) );
-
-	( $forks_found != $forks_active ) and $work_data->{cnt} = $forks_active;
-
-	unlock_data($work_data);
 
 	return $pids_crashed;
 } ## end sub check_pids_crashed
@@ -1436,6 +1434,26 @@ sub human_readable_size {
 	return sprintf '%3.2f %s', floor( $int * 100. ) / 100., $is_byte ? $exps[$exp] : $exp > 0 ? lc $exps[$exp] : $EMPTY;
 } ## end sub human_readable_size
 
+sub initialize_fork_watch {
+	my ( $fork_strikes, $fork_timeout, @PIDs ) = @_;
+	my $forks_active = 0;
+
+	# Initialize timeout, strike data and fork count
+	foreach my $pid (@PIDs) {
+		$fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
+		$fork_strikes->{$pid} = 0;
+		is_pid_active($pid) and ++$forks_active;
+	}
+
+	# Let's do a little check to see whether everything is set up properly
+	if ( $work_data->{cnt} != $forks_active ) {
+		log_warning( $work_data, '%d forks should be active, but %d are!', $work_data->{cnt}, $forks_active );
+		( $work_data->{cnt} > $forks_active ) and $forks_active = $work_data->{cnt};
+	}
+
+	return $forks_active;
+} ## end sub initialize_fork_watch
+
 sub interpolate_source_group {
 	my ( $gid, $inter_opts ) = @_;
 	can_work() or return 1;
@@ -1524,7 +1542,7 @@ sub lock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	my $stLoc = get_location($data);
+	my $stLoc = get_location(undef);
 
 	( $do_lock_debug > 0 ) and log_debug( $work_data, '%s try lock ...', $stLoc );
 	( defined $lock ) and ( $result = $lock->lock(LOCK_EX) ) or $result = 0;
@@ -1691,6 +1709,32 @@ sub pid_exists {
 	return $exists;
 } ## end sub pid_exists
 
+sub pid_count_dec {
+	my $stLoc = get_location(undef);
+
+	lock_data($work_data);
+	my $new_count = ( $work_data->{cnt} // 0 ) - 1;
+	( $new_count >= 0 ) or $new_count = 0;
+	log_debug( $work_data, 'Decreasing PID count from %d to %d (%s)', $work_data->{cnt} // 0, $new_count, $stLoc );
+	$work_data->{cnt} = $new_count;
+	unlock_data($work_data);
+
+	return 1;
+} ## end sub pid_count_dec
+
+sub pid_count_inc {
+	my $stLoc = get_location(undef);
+
+	lock_data($work_data);
+	my $new_count = ( $work_data->{cnt} // 0 ) + 1;
+	( $new_count > 0 ) or $new_count = 1;
+	log_debug( $work_data, 'Increasing PID count from %d to %d (%s)', $work_data->{cnt} // 0, $new_count, $stLoc );
+	$work_data->{cnt} = $new_count;
+	unlock_data($work_data);
+
+	return 1;
+} ## end sub pid_count_inc
+
 sub pid_shall_restart {
 	my ( $data, $pid ) = @_;
 
@@ -1817,9 +1861,9 @@ sub remove_pid {
 
 	delete( $work_data->{RESTART}{$pid} );
 	delete( $work_data->{PIDs}{$pid} );
-	--$work_data->{cnt};
-
 	unlock_data($work_data);
+
+	pid_count_dec();
 
 	return $result;
 } ## end sub remove_pid
@@ -2004,6 +2048,8 @@ sub set_pid_status {
 # Show data from between the last two "progress=<state>" lines in the given log file
 sub show_progress {
 	my ( $thr_count, $thr_active, $prgData, $log_as_status ) = @_;
+
+	( $thr_count > 0 ) or $thr_count = 1;
 
 	# qw( bitrate drop_frames dup_frames fps frame out_time_ms total_size )
 
@@ -2354,7 +2400,7 @@ sub unlock_data {
 	#@type IPC::Shareable
 	my $lock = tied %{$data};
 
-	( $do_lock_debug > 0 ) and log_debug( $data, '%s <== unlock', get_location($data) );
+	( $do_lock_debug > 0 ) and log_debug( $data, '%s <== unlock', get_location(undef) );
 	( defined $lock ) and $lock->unlock or return 0;
 
 	return 1;
@@ -2446,16 +2492,16 @@ sub wait_for_pid_status {
 	my ( $pid, $fork_data, $status ) = @_;
 
 	lock_data($fork_data);
-	my $stLoc = get_location($fork_data);
-	log_debug( $fork_data, '%s Fork Status %d / %d', $stLoc, get_pid_status( $fork_data, $pid ), $status );
+	my $stLoc = get_location(undef);
+	log_debug( $fork_data, '%s: Fork Status %d / %d', $stLoc, get_pid_status( $fork_data, $pid ), $status );
 	unlock_data($fork_data);
 
 	usleep(1);  ## A little "yield()" simulation
 	while ( $status > get_pid_status( $fork_data, $pid ) ) {
 		usleep(500);  # poll each half millisecond
-		log_debug( $fork_data, '%s Fork Status %d / %d', $stLoc, get_pid_status( $fork_data, $pid ), $status );
+		log_debug( $fork_data, '%s: Fork Status %d / %d', $stLoc, get_pid_status( $fork_data, $pid ), $status );
 	}
-	log_debug( $fork_data, '%s() Fork Status %d / %d reached -> ending wait', $stLoc, get_pid_status( $fork_data, $pid ), $status );
+	log_debug( $fork_data, '%s: Fork Status %d / %d reached -> ending wait', $stLoc, get_pid_status( $fork_data, $pid ), $status );
 
 	return 1;
 } ## end sub wait_for_pid_status
@@ -2484,18 +2530,13 @@ sub wait_for_startup {
 sub watch_my_forks {
 	lock_data($work_data);
 	my $result       = 1;
-	my $forks_active = $work_data->{cnt};
 	my %fork_timeout = ();
 	my %fork_strikes = ();
 	my @PIDs         = sort keys %{ $work_data->{PIDs} };
-	log_debug( $work_data, 'Forks : %s (%d active)', ( join ', ', keys %{ $work_data->{PIDs} } ), $forks_active );
+	log_debug( $work_data, 'Forks : %s (%d active)', ( join ', ', keys %{ $work_data->{PIDs} } ), $work_data->{cnt} );
 	unlock_data($work_data);
 
-	# Initialize timeout and strike data
-	foreach my $pid (@PIDs) {
-		$fork_timeout{$pid} = $TIMEOUT_INTERVALS;
-		$fork_strikes{$pid} = 0;
-	}
+	my $forks_active = initialize_fork_watch( \%fork_strikes, \%fork_timeout, @PIDs );
 
 	# Now check on all forks periodically until all are gone
 	while ( $forks_active > 0 ) {
@@ -2545,6 +2586,9 @@ sub watch_my_forks {
 			@PIDs = sort keys %{ $work_data->{PIDs} };
 			unlock_data($work_data);
 			$ret_global = ( check_pids_crashed(@PIDs) > 0 ) ? 23 : 0;
+			lock_data($work_data);
+			$fork_cnt = $work_data->{cnt};
+			unlock_data($work_data);
 		} ## end if ( $pids_crashed > 0)
 
 		# Now handle progress data
