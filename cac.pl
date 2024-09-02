@@ -1232,19 +1232,24 @@ sub handle_fork_message {
 # @return   Returns -1 if the PID is gone without any progress, 0 if progress has ended successfully and 1 if it is still running.
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout ) = @_;
-	my $pidstat = pid_exists( $work_data, $pid ) ? reap_pid($pid) : -1;
-	my $result  = $pidstat                       ? 0              : 1;  ## If $pidstat is 0, reap_pid($pid) returned it because the PID is still busy.
+	my $pidstat        = pid_exists( $work_data, $pid ) ? reap_pid($pid) : -1;
+	my $prgfile        = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;
+	my $progress_state = $PROGRESS_NONE;
 
-	log_debug( $work_data, "Loading Progress PID %d, File '%s' [%d/%d]", $pid, $work_data->{PIDs}{$pid}{prgfile}, $pidstat, $result );
+	# If $pidstat is 0, reap_pid($pid) returned it because the PID is still busy.
+	my $result = $pidstat ? 0 : 1;
 
-	my $progress_state = load_progress( $pid, $work_data->{PIDs}{$pid}{prgfile}, $prgData );
+	if ( ( 0 < ( length $prgfile ) ) && ( -f $prgfile ) ) {
+		log_debug( $work_data, "Loading Progress PID %d, File '%s' [%d/%d]", $pid, $work_data->{PIDs}{$pid}{prgfile}, $pidstat, $result );
+		$progress_state = load_progress( $pid, $work_data->{PIDs}{$pid}{prgfile}, $prgData );
 
-	# If the PID has just been terminated due to a frozen sub process, it now looks quite nicely ended,
-	# and a terminated ffmpeg will have written so in its progress log ("progress=end" as the final line)
-	# Therefore the progress state has to be overridden if we just have killed this PID
-	if ( ( $FF_RUNNING < get_pid_status( $work_data, $pid ) ) && pid_shall_restart( $work_data, $pid ) ) {
-		$progress_state = $PROGRESS_NONE;
-	}
+		# If the PID has just been terminated due to a frozen sub process, it now looks quite nicely ended,
+		# and a terminated ffmpeg will have written so in its progress log ("progress=end" as the final line)
+		# Therefore the progress state has to be overridden if we just have killed this PID
+		if ( ( $FF_RUNNING < get_pid_status( $work_data, $pid ) ) && pid_shall_restart( $work_data, $pid ) ) {
+			$progress_state = $PROGRESS_NONE;
+		}
+	} ## end if ( ( 0 < ( length $prgfile...)))
 
 	# Now handle timeouts according to the actual progress state
 	( $PROGRESS_NONE == $progress_state )     and ( $result > 0 ) and --$fork_timeout->{$pid};
@@ -1449,8 +1454,8 @@ sub logMsg {
 	# possible formatting strings are ignored, as the string might come from an error
 	# handler.
 	if ( 0 == scalar @args ) {
-		push @args, $fmt;  ## Make the fixed string the first (and only) argument
-		$fmt = '%s';       ## And print it "as-is".
+		@args = ($fmt);  ## Make the fixed string the first (and only) argument
+		$fmt  = '%s';    ## And print it "as-is".
 	}
 
 	my $stTime  = get_time_now();
@@ -2178,6 +2183,7 @@ sub strike_fork_restart {
 	my $inter_opts = $work_data->{PIDs}{$pid}{interp};
 	my $tid        = $work_data->{PIDs}{$pid}{id};
 	my $gid        = $work_data->{PIDs}{$pid}{gid};
+	my $prgLog     = $work_data->{PIDs}{$pid}{prgfile};
 	unlock_data($work_data);
 
 	# If we have interpolation data, this is an interpolating worker who has their
@@ -2187,7 +2193,6 @@ sub strike_fork_restart {
 		$inter_opts->{'do_alt'} = 1;
 
 		lock_data($work_data);
-		my $prgLog        = $work_data->{PIDs}{$pid}{prgfile};
 		my $file_from     = sprintf $work_data->{PIDs}{$pid}{source}, $tid;
 		my $file_to       = sprintf $work_data->{PIDs}{$pid}{target}, $tid;
 		my $filter_string = make_filter_string( $gid, $inter_opts );
@@ -2201,6 +2206,11 @@ sub strike_fork_restart {
 
 		@{ $work_data->{PIDs}{$pid}{args} } = @ffargs;
 		@args = @{ $work_data->{PIDs}{$pid}{args} };
+
+		# Before we can continue, the old progress file has to be deleted, or handle_fork_progress() might believe the fork
+		# already ended, because the old progress file might have a "progress=end" line at the end.
+		( -f $prgLog ) and unlink $prgLog;
+
 		unlock_data($work_data);
 	} ## end if ( defined $inter_opts)
 
@@ -2209,7 +2219,8 @@ sub strike_fork_restart {
 	( defined $kid ) and ( $kid > 0 ) or croak('BUG! start_work() returned invalid PID!');
 	lock_data($work_data);
 	@{ $work_data->{PIDs}{$kid}{args} } = @{ $work_data->{PIDs}{$pid}{args} };
-	$work_data->{PIDs}{$kid}{prgfile} = $work_data->{PIDs}{$pid}{prgfile};
+	$work_data->{PIDs}{$kid}{gid}     = $work_data->{PIDs}{$pid}{gid};
+	$work_data->{PIDs}{$kid}{prgfile} = $prgLog;
 	$work_data->{PIDs}{$kid}{source}  = $work_data->{PIDs}{$pid}{source};
 	$work_data->{PIDs}{$kid}{target}  = $work_data->{PIDs}{$pid}{target};
 	unlock_data($work_data);
