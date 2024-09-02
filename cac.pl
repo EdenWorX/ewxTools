@@ -528,9 +528,11 @@ sub assemble_output {
 	if ( open my $fOut, '>', $lstfile ) {
 		foreach my $groupID ( sort { $a <=> $b } keys %source_groups ) {
 			for my $i ( 0 .. 3 ) {
-				printf {$fOut} "file '%s'\n", abs_path( sprintf $source_groups{$groupID}{idn}, $i );
+				my $outname = abs_path( sprintf $source_groups{$groupID}{idn}, $i );
+				printf {$fOut} "file '%s'\n", $outname;
+				log_debug( $work_data, 'Adding "%s" to output source list', $outname );
 			}
-		}
+		} ## end foreach my $groupID ( sort ...)
 		close $fOut or croak("Closing listfile '$lstfile' FAILED!");
 	} else {
 		log_error( $work_data, "Unable to write into '%s': %s", $lstfile, $! );
@@ -720,10 +722,10 @@ sub check_logger {
 sub check_output_existence {
 	my ($errCount) = @_;
 
-	-f $path_target and log_error( $work_data, 'Output file already exists!', $path_target ) and ++${$errCount};
+	-f $path_target and log_error( $work_data, "Output file '%s' already exists!", $path_target ) and ++${$errCount};
+	$path_target =~ m/[.]mkv$/ms or log_error( $work_data, "Output file '%s' does not have mkv ending!", $path_target ) and ++${$errCount};
 	foreach my $src (@path_source) {
-		$src eq $path_target and log_error( $work_data, 'Input file equals output file!', $src ) and ++${$errCount};
-		$path_target =~ m/[.]mkv$/ms or log_error( $work_data, 'Output file does not have mkv ending!' ) and ++${$errCount};
+		$src eq $path_target and log_error( $work_data, "Input file '%s' equals output file!", $src ) and ++${$errCount};
 	}
 
 	return 1;
@@ -1431,7 +1433,7 @@ sub human_readable_size {
 		$int /= 1024;
 	}
 
-	return sprintf '%3.2f%s', floor( $int * 100. ) / 100., $is_byte ? $exps[$exp] : $exp > 0 ? lc $exps[$exp] : $EMPTY;
+	return sprintf '%3.2f %s', floor( $int * 100. ) / 100., $is_byte ? $exps[$exp] : $exp > 0 ? lc $exps[$exp] : $EMPTY;
 } ## end sub human_readable_size
 
 sub interpolate_source_group {
@@ -1669,11 +1671,12 @@ sub parse_progress_data {
 	if ( $line =~ m/^${property_name}="?([.0-9]+)(.)b?its?\/s"?\s*$/xms ) {
 		my $bits = 1.0 * $1;
 		my $exp  = lc $2;
-		log_debug( $work_data, "${EIGHTSPACE}==> %s=%f%sbits/s", $property_name, $bits, $exp );
+		log_debug( $work_data, "${EIGHTSPACE}==> %s=%f %sbits/s", $property_name, $bits, $exp );
 		( 'g' eq $exp ) and $bits *= 1024 and $exp = 'm';
 		( 'm' eq $exp ) and $bits *= 1024 and $exp = 'k';
-		( 'k' eq $exp ) and $bits *= 1024 and $exp = 'b';
-		$data->{$property_name} += ( 1 * $1 );
+		( 'k' eq $exp ) and $bits *= 1024 and $exp = $EMPTY;
+		log_debug( $work_data, "${EIGHTSPACE}==> %s=%f %sbits/s", $property_name, $bits, $exp );
+		$data->{$property_name} += ( 1 * $bits );
 		return 1;
 	} ## end if ( $line =~ m/^${property_name}="?([.0-9]+)(.)b?its?\/s"?\s*$/xms)
 
@@ -2485,7 +2488,7 @@ sub watch_my_forks {
 	my %fork_timeout = ();
 	my %fork_strikes = ();
 	my @PIDs         = sort keys %{ $work_data->{PIDs} };
-	log_debug( $work_data, 'Forks : %s', ( join ', ', keys %{ $work_data->{PIDs} } ) );
+	log_debug( $work_data, 'Forks : %s (%d active)', ( join ', ', keys %{ $work_data->{PIDs} } ), $forks_active );
 	unlock_data($work_data);
 
 	# Initialize timeout and strike data
@@ -2537,6 +2540,7 @@ sub watch_my_forks {
 
 		# Ensure that we do not tear everything down if a PID looks crashed. Check it again first
 		if ( $pids_crashed > 0 ) {
+			log_debug( $work_data, 'Found %d suspicious forks, checking status...', $pids_crashed );
 			lock_data($work_data);
 			@PIDs = sort keys %{ $work_data->{PIDs} };
 			unlock_data($work_data);
