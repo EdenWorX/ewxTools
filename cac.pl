@@ -741,6 +741,39 @@ sub check_pid {
 	return 1;
 } ## end sub check_pid
 
+# If we are in the middle of a frozen PID restart, the above loop might have tried to question
+# a PID that was already substituted. In that case the old PID would have been gone, but it
+# is no longer listed as being about to start. In that case we might think the PID crashed,
+# while we are just late to the party.
+# So let's check all PID data again, before we force the whole thing down.
+sub check_pids_crashed {
+	my ($pids_crashed) = @_;
+
+	if ( $pids_crashed > 0 ) {
+		my $forks_found = 0;
+
+		log_debug( $work_data, 'Found %d PIDs that might have crashed. Checking PIDs...', $pids_crashed );
+
+		lock_data($work_data);
+		my $forks_active = $work_data->{cnt};
+		my @PIDs         = sort keys %{ $work_data->{PIDs} };
+		$pids_crashed = 0;
+
+		foreach my $pid (@PIDs) {
+			my $is_active = is_pid_active( $work_data, $pid );
+			( $is_active > 0 ) and ++$forks_found  and log_debug( $work_data, 'PID %d found active' );
+			( $is_active < 0 ) and ++$pids_crashed and log_debug( $work_data, 'PID %d found CRASHED!' );
+		}
+
+		log_debug( $work_data, '%d/%d PID%s found working, %d PID%s crashed.',
+			$forks_found, $forks_active, plural_s($forks_found), $pids_crashed, plural_s($pids_crashed) );
+
+		unlock_data($work_data);
+	} ## end if ( $pids_crashed > 0)
+
+	return $pids_crashed;
+} ## end sub check_pids_crashed
+
 sub check_source_and_target {
 	my ( $errCount, $have_source, $have_target ) = @_;
 
@@ -1232,12 +1265,12 @@ sub handle_fork_message {
 # @return   Returns -1 if the PID is gone without any progress, 0 if progress has ended successfully and 1 if it is still running.
 sub handle_fork_progress {
 	my ( $pid, $prgData, $fork_timeout ) = @_;
-	my $pidstat        = pid_exists( $work_data, $pid ) ? reap_pid($pid) : -1;
+	my $pidstat        = is_pid_active( $work_data, $pid );
 	my $prgfile        = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;
 	my $progress_state = $PROGRESS_NONE;
 
-	# If $pidstat is 0, reap_pid($pid) returned it because the PID is still busy.
-	my $result = $pidstat ? 0 : 1;
+	# is_pid_active() returns -1 on PID crash/missing and 1 if the PID is active, so just check >0.
+	my $result = $pidstat > 0;
 
 	if ( ( 0 < ( length $prgfile ) ) && ( -f $prgfile ) ) {
 		log_debug( $work_data, "Loading Progress PID %d, File '%s' [%d/%d]", $pid, $work_data->{PIDs}{$pid}{prgfile}, $pidstat, $result );
@@ -1259,7 +1292,8 @@ sub handle_fork_progress {
 	# Warn if a fork looks like it is freezing...
 	( $result > 0 ) and ( ( $TIMEOUT_INTERVALS / 2 ) == $fork_timeout->{$pid} ) and log_warning( $work_data, 'Fork PID %d seems to be frozen...', $pid );
 
-	return ( $pidstat >= 0 ) ? $result : -1;
+	# if th epid is gone, only return -1 (has crashed, program will be torn down) if the PID is not marked for restart already.
+	return ( $pidstat >= 0 ) ? $result : pid_shall_restart( $work_data, $pid ) ? 0 : -1;
 } ## end sub handle_fork_progress
 
 sub handle_fork_strikes {
@@ -1374,6 +1408,20 @@ sub interpolate_source_group {
 	# Watch and join
 	return watch_my_forks();
 } ## end sub interpolate_source_group
+
+# @brief Check whether a PID is active
+# @return -1 if the PID is no longer listed or reap_pid() detected a crashed PID0 1 if the PID is working and 0 if has ended.
+sub is_pid_active {
+	my ( $work_data, $pid ) = @_;
+	my $data_exists = pid_exists( $work_data, $pid );
+	my $reap_status = reap_pid($pid);
+
+	# reap_pid() returns PID if the PID is defined and the child process has finished.
+	# If the PID was not found, -1 is returned. 0 is returned if the PID is still busy.
+	# Therefore $pid_exists is 1 if $reap_status is 0, because it means reap_pid() found it to be active.
+	my $pid_exists = $reap_status < 0 ? -1 : $reap_status > 0 ? 0 : 1;
+	return $data_exists ? $pid_exists : -1;
+} ## end sub is_pid_active
 
 sub is_progress_line {
 	my ($line) = @_;
@@ -1620,6 +1668,16 @@ sub pid_status_to_str {
 	  :                               '***unknown***';
 } ## end sub pid_status_to_str
 
+sub plural_s {
+	my ($num) = @_;
+
+	if ( $num =~ m/^(\d+)$/ ) {
+		( 1 != $1 ) and return 's';
+	}
+
+	return $EMPTY;
+} ## end sub plural_s
+
 sub read_and_reverse_last_lines {
 	my ( $filename, $linecount ) = @_;
 
@@ -1688,7 +1746,8 @@ sub reaper {
 
 sub remove_pid {
 	my ( $pid, $do_cleanup ) = @_;
-	my $result = 1;
+	my $result       = 1;
+	my $is_restarted = pid_shall_restart( $work_data, $pid );
 
 	check_pid($pid) or return 1;
 
@@ -1739,9 +1798,11 @@ sub remove_pid {
 
 	# Progress files are always removed, because the only part where they are used
 	# will no longer pick them up once the PID was removed from %work_data (See watch_my_forks())
+	# However, if the PID got restarted, the new might have already started a new progress file, so
+	# leave it alone in that case. The old one was deleted then anyway.
 	my $prgfile = $work_data->{PIDs}{$pid}{prgfile} // $EMPTY;  ## shortcut including (defined check)
-	if ( ( length($prgfile) > 0 ) && ( -f $prgfile ) ) {
-		( $do_debug > 0 ) and log_debug( $work_data, 'See: %s', $prgfile ) or unlink $prgfile;
+	if ( ( length($prgfile) > 0 ) && ( -f $prgfile ) && ( 0 == $is_restarted ) ) {
+		( $do_debug > 0 ) and ( 0 == $is_restarted ) and log_debug( $work_data, 'See: %s', $prgfile ) or unlink $prgfile;
 	}
 
 	delete( $work_data->{RESTART}{$pid} );
@@ -1959,14 +2020,11 @@ sub show_progress {
 		# Write into log file
 		$have_progress_msg = 0;  ## ( We already deleted the line above, leaving it at 1 would add a useless empty line. )
 		( $prgData->{frame} > 0 ) and log_status(
-			$work_data,
-			"%d fork%s finished after %d frames, duration %s, FPS %03.2f, %s, file size %s\n"
-			  . '    (%d frames dropped, %d frames duplicated)',
-			$thr_count, $thr_count > 1 ? 's' : $EMPTY,
-			$prgData->{frame}, $time_str, $prgData->{fps}, $bitrate_str, $size_str,
+			$work_data, "%d fork%s finished after %d frames, duration %s, FPS %03.2f, %s, file size %s\n" . '    (%d frames dropped, %d frames duplicated)',
+			$thr_count, plural_s($thr_count), $prgData->{frame}, $time_str, $prgData->{fps}, $bitrate_str, $size_str,
 			$prgData->{drop_frames},
 			$prgData->{dup_frames}
-		) or log_status( $work_data, '%d fork%s finished, total duration is: %s', $thr_count, $thr_count > 1 ? 's' : $EMPTY, $time_str );
+		) or log_status( $work_data, '%d fork%s finished, total duration is: %s', $thr_count, plural_s($thr_count), $time_str );
 	} else {
 
 		# Output on console
@@ -2431,7 +2489,8 @@ sub watch_my_forks {
 
 	# Now check on all forks periodically until all are gone
 	while ( $forks_active > 0 ) {
-		my %prgData = (
+		my $pids_crashed = 0;
+		my %prgData      = (
 			bitrate     => 0.0,
 			drop_frames => 0,
 			dup_frames  => 0,
@@ -2453,7 +2512,7 @@ sub watch_my_forks {
 
 		foreach my $pid (@PIDs) {
 			my $fork_status = handle_fork_progress( $pid, \%prgData, \%fork_timeout );
-			( $fork_status < 0 ) and $ret_global = 23       # The fork has crashed or broken off with an error
+			( $fork_status < 0 ) and ++$pids_crashed        # The fork has crashed or broken off with an error
 			  or ( $fork_status > 0 ) and ++$forks_active;  # The fork is still running
 			usleep(0);
 
@@ -2469,6 +2528,10 @@ sub watch_my_forks {
 			}
 		} ## end foreach my $pid (@PIDs)
 
+		# Ensure that we do not tear everything down if a PID looks crashed. Check it again first
+		$ret_global = ( check_pids_crashed($pids_crashed) > 0 ) ? 23 : 0;
+
+		# Now handle progress data
 		( $forks_active > 0 ) or show_progress( $fork_cnt, $forks_active, \%prgData, 1 ) and next;
 		show_progress( $fork_cnt, $forks_active, \%prgData, 0 );
 		can_work or send_forks_the_kill();
