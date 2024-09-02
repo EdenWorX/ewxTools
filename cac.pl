@@ -836,7 +836,14 @@ sub check_single_temp_dir {
 sub check_target_fps {
 	can_work() or return 1;
 	$target_fps = ( ( $max_fps < 50 ) && ( 0 == $force_upgrade ) ) ? 30 : 60;
-	$max_fps    = 2 * $target_fps;
+	if ( $max_fps < ( 2 * $target_fps ) ) {
+
+		# Only use 2x the target FPS, as maximum, if it does not mean a downscaling.
+		# If we downscale here, like from 144 to 120 FPS, we will already produce
+		# mixed frames on high movement scenes, and blended frames due to 144 FPS
+		# timing being _very_ different from 120 FPS timing.
+		$max_fps = 2 * $target_fps;
+	} ## end if ( $max_fps < ( 2 * ...))
 	log_info( $work_data, 'Decimate and interpolate up to %d FPS', $max_fps );
 	log_info( $work_data, 'Then interpolate to the target %d FPS', $target_fps );
 	return 1;
@@ -1166,7 +1173,7 @@ sub get_time_now {
 sub handle_eval_result {
 	my ( $fork_data, $res, $eval_err, $child_error, $p_exit_code, $p_exit_message ) = @_;
 
-	log_debug( $fork_data, "Handling eval result res %d, err '%s', chld %d, exc %d, exm '%s'", $res, $eval_err, $child_error, $p_exit_code, $p_exit_message );
+	log_debug( $fork_data, "Handling eval result res %d, err '%s', chld %d, exc %d, exm '%s'", $res, $eval_err, $child_error, ${$p_exit_code}, ${$p_exit_message} );
 
 	if ( length($eval_err) > 0 ) {
 		( 0 == ${$p_exit_code} ) and ${$p_exit_code} = -1;
@@ -1184,7 +1191,10 @@ sub handle_eval_result {
 			${$p_exit_message} = 'Exited with error ' . ( $child_error >> 8 );
 			$res = 0;
 			log_debug( $fork_data, 'eval exited with error %d [%d]', ( $child_error >> 8 ), $child_error );
-		} ## end elsif ( $child_error >> 8)
+		} else {
+			log_debug( $fork_data, 'eval exited cleanly, child errno is %d', $child_error );
+			$res = 1;
+		}
 	} ## end elsif ( -1 != $child_error)
 
 	return $res;
@@ -1229,6 +1239,14 @@ sub handle_fork_progress {
 
 	my $progress_state = load_progress( $pid, $work_data->{PIDs}{$pid}{prgfile}, $prgData );
 
+	# If the PID has just been terminated due to a frozen sub process, it now looks quite nicely ended,
+	# and a terminated ffmpeg will have written so in its progress log ("progress=end" as the final line)
+	# Therefore the progress state has to be overridden if we just have killed this PID
+	if ( ( $FF_RUNNING < get_pid_status( $work_data, $pid ) ) && pid_shall_restart( $work_data, $pid ) ) {
+		$progress_state = $PROGRESS_NONE;
+	}
+
+	# Now handle timeouts according to the actual progress state
 	( $PROGRESS_NONE == $progress_state )     and ( $result > 0 ) and --$fork_timeout->{$pid};
 	( $PROGRESS_CONTINUE == $progress_state ) and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS;
 	( $PROGRESS_ENDED == $progress_state )    and $fork_timeout->{$pid} = $TIMEOUT_INTERVALS and $result = 0;
@@ -1306,10 +1324,15 @@ sub handle_termination_request {
 	( $fork_data->{DEATH} > $death_note ) and $death_note = $fork_data->{DEATH};
 	unlock_data($fork_data);
 
-	( $death_note > 0 ) and ( $death_note < 4 ) and log_debug( $fork_data, "Sending 'TERM' to PID %d", $cmd_pid ) and ( kill 'TERM', $cmd_pid );
+	if ( $death_note > 0 ) {
+		( $death_note < 4 ) and log_debug( $fork_data, "Sending 'TERM' to PID %d", $cmd_pid ) and ( kill 'TERM', $cmd_pid );
 
-	# react on 4, because on 5 this fork will be killed (See terminator())
-	( 3 < $death_note ) and log_debug( $fork_data, "Sending 'KILL' to PID %d", $cmd_pid ) and ( kill 'KILL', $cmd_pid );
+		# react on 4, because on 5 this fork will be killed (See terminator())
+		( 3 < $death_note ) and log_debug( $fork_data, "Sending 'KILL' to PID %d", $cmd_pid ) and ( kill 'KILL', $cmd_pid );
+
+		# In any way, sleep 180ms, so the wait in run:_cmd_from_fork() reaches 200ms.
+		usleep(180_000);
+	} ## end if ( $death_note > 0 )
 
 	return 1;
 } ## end sub handle_termination_request
@@ -1767,7 +1790,7 @@ sub run_cmd_from_fork {
 		$io_selector->remove($stderr);
 		$io_selector->remove($stdout);
 
-		log_debug( $fork_data, "'%s' PID %d '%s", $cmd->[0], $cmd_pid, select_termination_message() );
+		log_debug( $fork_data, "'%s' PID %d %s", $cmd->[0], $cmd_pid, select_termination_message() );
 	};
 	$res = handle_eval_result( $fork_data, $res, $@, $chld_error, $exc_p, $exm_p );
 
@@ -2046,7 +2069,7 @@ sub start_forked {
 	} ## end if ( lock_data($fork_data...))
 
 	# This fork is finished now
-	set_pid_status( $fork_data, $pid, $FF_FINISHED );
+	set_pid_status( $fork_data, $pid, $res ? $FF_FINISHED : $FF_KILLED );
 
 	return $res;
 } ## end sub start_forked
@@ -2118,9 +2141,10 @@ sub strike_fork_kill {
 	my ($pid) = @_;
 
 	if ( 0 == reap_pid($pid) ) {
+		log_error( $work_data, 'Worker PID %d can not be terminated, trying to KILL...', $pid );
+		mark_pid_restart( $work_data, $pid );
 		terminator( $pid, 'KILL' );
 		( get_pid_status( $work_data, $pid ) < $FF_KILLED ) and set_pid_status( $work_data, $pid, $FF_KILLED );
-		mark_pid_restart( $work_data, $pid );
 		return 7;
 	} ## end if ( 0 == reap_pid($pid...))
 
