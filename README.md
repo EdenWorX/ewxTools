@@ -93,13 +93,13 @@ the incredible [ShotCut Software](https://www.shotcut.org/).
 
 The recording is done using [OBS Studio](https://obsproject.com) with my own
 custom ffmpeg settings to record with near lossless quality.
-Those recordings are done in 120 frames per second, but I need them, I-Frames
+Those recordings are done in 144 frames per second, but I need them, I-Frames
 only, in 60 FPS for the editing.
 
-My hardware is also not the best, so those 120 frames are not perfectly laid
+My hardware is also not the best, so those 144 frames are not perfectly laid
 out on the timeline.
 Therefore, what was a smooth gaming experience, became quite choppy and chunky
-after the skaling down to 60 fps.
+after the scaling down to 60 fps.
 
 What I previously did was to use ffmpeg's mpdecimate filter to erase all frames
 which got duplicated due to rendering lag. After that the minterpolate filter
@@ -120,12 +120,12 @@ work hardware accelerated.
 Additionally the following workflow has been implemented:
 
 1) Split the (group of) video(s) into 4 parts
-2) Use mpdecimate plus libplacebo frame mixer to clean/mix up to 120 fps UTVideo.
+2) Use mpdecimate plus libplacebo frame mixer to clean/mix up to 144(*) fps UTVideo.
 
-    This ensures that the next step is done on a squeaky clean 120 fps source.
+    This ensures that the next step is done on a squeaky clean 144(*) fps source.
 3) Use mpdecimate plus frame mixer again to scale down to 60 fps, still UTVideo.
 
-    This causes frames to be mixed to nmatch their exact place on the timeline.
+    This causes frames to be mixed to match their exact place on the timeline.
 4) Re-encode with h264_nvenc, maximum quality, and do the sound remixing.
 
 The sound remixing is another part, that is best done in the last step.
@@ -181,13 +181,17 @@ DESCRIPTION
     See: @HurryKane76 yt channel )
 
     The program uses ffmpeg to remove duplicate frames and to interpolate
-    the video to twice the target FPS in a first step, then do another
+    the video to twice (*) the target FPS in a first step, then do another
     search for duplicate frames and interpolate down the the target FPS.
 
     If the source has at least 50 FPS in average, the target is set to 60
     FPS. For sources with less than 50 FPS in average, the target is set to
     30 FPS. You can use the -u/--upgrade option to force the target to be 60
     FPS, no matter the source average.
+
+    (*): If the source video has more than twice the target FPS, it will not
+    be down- scaled, but the source fps will be kept for the first
+    interpolation.
 ````
 
 
