@@ -42,9 +42,12 @@ my $work_done = 0;            # Needed to know whether to log anything on END{}
 # 1.0.6    2024-08-21  sed, EdenWorX  Split concatenating multiple sources from the segment creation, it is safer to do
 #                                       this in two steps.
 # 1.0.7    2024-09-02  sed, EdenWorX  Rework the code for terminating and restarting a frozen fork.
+# 24.09.09 2024-09-09  sed, EdenWorX  New Version Scheme release
+#                                     The classic <major>.<minor>.<patch> scheme does not say anything at all. The
+#                                     reverse date scheme at least tells you the release date.
 #
 # Please keep this current:
-Readonly our $VERSION => '1.0.7';
+Readonly our $VERSION => '24.09.09';
 
 # =======================================================================================
 # Workflow:
