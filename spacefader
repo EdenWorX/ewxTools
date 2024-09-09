@@ -6,7 +6,7 @@ VERSION="1.0.5"
 TGTDIR="$1"
 USERND="$2"
 
-if [[ "x" = "x${TGTDIR}" || "x-h" = "x${TGTDIR}" || "x--help" = "x${TGTDIR}" ]]; then
+if [[ "" = "${TGTDIR}" || "-h" = "${TGTDIR}" || "--help" = "${TGTDIR}" ]]; then
     cat <<_USAGE
   Overwrite all remaining space ${VERSION}
 ------------------------------------------
