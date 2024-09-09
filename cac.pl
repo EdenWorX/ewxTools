@@ -2747,7 +2747,7 @@ Cleanup And Convert: HurryKane's tool for overhauling gaming clips.
 ( See: @HurryKane76 yt channel )
 
 The program uses ffmpeg to remove duplicate frames and to interpolate the video
-to twice the target FPS in a first step, then do another search for duplicate
+to twice (*) the target FPS in a first step, then do another search for duplicate
 frames and interpolate down the the target FPS.
 
 If the source has at least 50 FPS in average, the target is set to 60 FPS. For
@@ -2755,6 +2755,8 @@ sources with less than 50 FPS in average, the target is set to 30 FPS.
 You can use the -u/--upgrade option to force the target to be 60 FPS, no matter
 the source average.
 
+(*): If the source video has more than twice the target FPS, it will not be down-
+     scaled, but the source fps will be kept for the first interpolation.
 
 =head1 REQUIRED ARGUMENTS
 
