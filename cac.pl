@@ -1474,7 +1474,7 @@ sub interpolate_source_group {
 } ## end sub interpolate_source_group
 
 # @brief Check whether a PID is active
-# @return -1 if the PID is no longer listed or reap_pid() detected a crashed PID0 1 if the PID is working and 0 if has ended.
+# @return -1 if the PID is no longer listed or reap_pid() detected a crashed PID, 1 if the PID is working and 0 if has ended.
 sub is_pid_active {
 	my ($pid)       = @_;
 	my $data_exists = pid_exists( $work_data, $pid );
@@ -1663,13 +1663,13 @@ sub make_location_fmt {
 } ## end sub make_location_fmt
 
 sub mark_pid_restart {
-	my ( $data, $pid ) = @_;
+	my ($pid) = @_;
 
-	( defined $data ) and ( defined $pid ) or return 1;
-
-	lock_data($data);
-	( defined $data ) and $work_data->{RESTART}{$pid} = 1;
-	log_debug( $work_data, 'PID %5d marked for restart', $pid );
+	lock_data($work_data);
+	if ( !( defined $work_data->{RESTART}{$pid} ) || ( $work_data->{RESTART}{$pid} < 1 ) ) {
+		$work_data->{RESTART}{$pid} = 1;
+		log_debug( $work_data, 'PID %5d marked for restart', $pid );
+	}
 	unlock_data($work_data);
 
 	return 1;
@@ -2261,7 +2261,7 @@ sub strike_fork_kill {
 
 	if ( 0 == reap_pid($pid) ) {
 		log_error( $work_data, 'Worker PID %d can not be terminated, trying to KILL...', $pid );
-		mark_pid_restart( $work_data, $pid );
+		mark_pid_restart($pid);
 		terminator( $pid, 'KILL' );
 		( get_pid_status( $work_data, $pid ) < $FF_KILLED ) and set_pid_status( $work_data, $pid, $FF_KILLED );
 		return 7;
@@ -2281,7 +2281,7 @@ sub strike_fork_reap {
 		usleep(50);
 	}
 
-	mark_pid_restart( $work_data, $pid );
+	mark_pid_restart($pid);
 
 	return 13;
 } ## end sub strike_fork_reap
@@ -2350,7 +2350,7 @@ sub strike_fork_term {
 
 	if ( 0 == reap_pid($pid) ) {
 		log_warning( $work_data, 'Worker PID %d looks frozen...', $pid );
-		mark_pid_restart( $work_data, $pid );
+		mark_pid_restart($pid);
 		terminator( $pid, 'TERM' );
 		( get_pid_status( $work_data, $pid ) < $FF_KILLED ) and set_pid_status( $work_data, $pid, $FF_KILLED );
 		return 1;
@@ -2602,9 +2602,12 @@ sub watch_my_forks {
 
 		foreach my $pid (@PIDs) {
 			can_work or last;
-			pid_exists( $work_data, $pid ) or pid_shall_restart( $work_data, $pid ) or next;
+			pid_exists( $work_data, $pid )
+			  or pid_shall_restart( $work_data, $pid )
+			  or log_debug( '(BUG???) PID %d neither exists nor shall restart. Why is it still in the list, then?', $pid )
+			  and next;
 			handle_fork_strikes( $pid, \%fork_timeout, \%fork_strikes );
-		}
+		} ## end foreach my $pid (@PIDs)
 
 		usleep(500_000);
 	} ## end while ( $forks_active > 0)
