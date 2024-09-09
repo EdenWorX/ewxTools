@@ -1633,13 +1633,22 @@ sub make_filter_string {
 		$F_interpolate = sprintf 0 == $do_alt ? ( $src_fps > $tgt_fps ? $ff_interp_libp_high : $ff_interp_libp_none ) : $ff_interp_mint_none, $tgt_fps;
 	} elsif ( 'idn' eq $tgt ) {
 
-		# When calculating down to the target FPS, we always use high libplacebo interpolation.
+		# When calculating down to the target FPS, we always use high interpolation.
 		# But on alternative interpolation we only use high minterpolate if there actually are dropped/dupped frames
-		$F_interpolate = sprintf 0 == $do_alt ? $ff_interp_libp_high : ( 0 == $dropdups ? $ff_interp_mint_none : $ff_interp_mint_high ), $tgt_fps;
+		$F_interpolate = sprintf 0 == $do_alt ? $ff_interp_libp_high : $ff_interp_mint_high, $tgt_fps;
 	} else {
+		my $interpolation_type;
 
 		# This is the last step, the creation of the target video.
-		$F_interpolate = sprintf 0 == $do_alt ? $ff_interp_libp_high : $ff_interp_mint_none, $tgt_fps;
+		# If there wasn't any dropped frames, use the simple minterpolate if libplacebo freezes.
+		# This latest mpdecimate/minterpolate only happen, to solve lengthier lag parts, that aren't fully solved by the up.-/down-scaling.
+		if ( 0 == $dropdups ) {
+			$interpolation_type = ( 0 == $do_alt ) ? $ff_interp_libp_none : $ff_interp_mint_none;
+		} else {
+			$interpolation_type = ( 0 == $do_alt ) ? $ff_interp_libp_high : $ff_interp_mint_high;
+		}
+
+		$F_interpolate = sprintf $interpolation_type, $tgt_fps;
 
 		# Here we also need an fps filter, the output will be cfr anyway.
 		$F_mpdecimate = "fps=fps=$target_fps:round=near,$F_mpdecimate";
