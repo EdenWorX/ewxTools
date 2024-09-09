@@ -235,7 +235,7 @@ log_status( $work_data, 'Processing %s start', $path_target );
 # ---
 # --- 1) we need information about each source file
 # ---
-analyze_all_inputs();
+analyze_all_inputs() and check_temp_dir() or exit 6;
 
 # ---
 # --- 2) All input files per temp directory have to be grouped. Each group is then segmented
@@ -398,6 +398,7 @@ sub analyze_all_inputs {
 		## no critic (ProhibitParensWithBuiltins)
 		$source_info{$src} = {
 			avg_frame_rate => 0,
+			bit_rate       => 0,
 			dir            => dirname($src),
 			duration       => 0,
 			id             => ++$pathID,
@@ -695,19 +696,18 @@ sub check_arguments {
 	my $errCount    = 0;
 	my $have_source = 0;
 	my $have_target = 0;
-	my $total_size  = 0;
 
 	check_source_and_target( \$errCount, \$have_source, \$have_target );
-	$have_source and check_input_files( \$errCount, \$total_size );
-	$have_target and check_output_existence( \$errCount ) and $have_source and check_temp_dir( \$errCount, $total_size );
+	$have_source and check_input_files( \$errCount );
+	$have_target and check_output_existence( \$errCount );
 
 	return $errCount;
 } ## end sub check_arguments
 
 sub check_input_files {
-	my ( $errCount, $total_size ) = @_;
+	my ($errCount) = @_;
 	foreach my $src (@path_source) {
-		validate_input_file( $src, $total_size ) or ${$errCount}++;
+		validate_input_file($src) or ${$errCount}++;
 	}
 	return 1;
 } ## end sub check_input_files
@@ -788,7 +788,7 @@ sub check_source_and_target {
 } ## end sub check_source_and_target
 
 sub check_multi_temp_dir {
-	my ($errCount) = @_;
+	my $errCount = 0;
 
 	foreach my $src (@path_source) {
 		if ( -f $src ) {
@@ -800,34 +800,35 @@ sub check_multi_temp_dir {
 			push @{ $dir_stats{$dir}{srcs} }, $src;
 			my $ref = df($dir);
 			if ( ( defined $ref ) ) {
+				my $size_factor = get_size_factor($src);
+				my $size        = ( -s $src ) / 1024 / 1024;  ## Size of the file in MiB blocks
 
-				# The temporary UT Video files will need roughly 70-75 times the input
-				# Plus a probably 3 times bigger output than input and we end at x80.
-				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;           ## df returns 1K blocks, but we calculate in M.
-				$dir_stats{$dir}{need_space} += ( -s $src ) / 1024 / 1024 * 80;  ## also in M now, 80 times the source size.
+				$dir_stats{$dir}{has_space}  += $ref->{bavail} / 1024;  ## df returns 1K blocks, but we calculate in M.
+				$dir_stats{$dir}{need_space} += $size * $size_factor;   ## also in M now, $size_factor times the source size.
 			} else {
 
 				# =) df() failed? WTF?
-				log_error( $work_data, "df'ing directory '%s' FAILED!", $dir ) and ++${$errCount};
+				log_error( $work_data, "df'ing directory '%s' FAILED!", $dir ) and ++$errCount;
 			}
 		}  # No else, that error has already been recorded under Test 1
 	} ## end foreach my $src (@path_source)
 	## Now check the stats...
 	foreach my $dir ( sort keys %dir_stats ) {
-		$dir_stats{$dir}{need_space} > $dir_stats{$dir}{has_space}
-		  and log_error(
+		$dir_stats{$dir}{need_space} > $dir_stats{$dir}{has_space} and log_error(
 			$work_data, "Not enough space! '%s' has only %s / %s M free!",
 			$dir,
 			cleanint( $dir_stats{$dir}{has_space} ),
 			cleanint( $dir_stats{$dir}{need_space} )
-		  ) and ++${$errCount};
+		  )
+		  and ++$errCount
+		  or log_info( $work_data, "Directory '%s' needs approximately %s MiB space for temporary files.", $dir, cleanint( $dir_stats{$dir}{need_space} ) );
 	} ## end foreach my $dir ( sort keys...)
 
-	return 1;
+	return $errCount > 0 ? 0 : 1;
 } ## end sub check_multi_temp_dir
 
 sub check_single_temp_dir {
-	my ( $errCount, $total_size ) = @_;
+	my $errCount = 0;
 
 	if ( -d $path_temp ) {
 
@@ -837,31 +838,43 @@ sub check_single_temp_dir {
 		foreach my $src (@path_source) {
 			push @{ $dir_stats{$path_temp}{srcs} }, $src;
 		}
+
 		if ( defined $ref ) {
 
-			# Note: See check_multi_temp_dir() about tghe sizes.
-			$dir_stats{$path_temp}{has_space}  = $ref->{bavail} / 1024;
-			$dir_stats{$path_temp}{need_space} = $total_size * 80;
-			if ( $dir_stats{$path_temp}{has_space} < $dir_stats{$path_temp}{need_space} ) {
-				log_error(
-					$work_data, "Not enough space! '%s' has only %s / %s M free!",
-					$path_temp,
-					cleanint( $dir_stats{$path_temp}{has_space} ),
-					cleanint( $dir_stats{$path_temp}{need_space} )
-				) and ++${$errCount};
-			} ## end if ( $dir_stats{$path_temp...})
+			# We have to accumulate all sizes and estimated temp sizes
+			$dir_stats{$path_temp}{need_space} = 0;
+			foreach my $src (@path_source) {
+				if ( -f $src ) {
+					my $size_factor = get_size_factor($src);
+					my $size        = ( -s $src ) / 1024 / 1024;  ## Size of the file in MiB blocks
+
+					$dir_stats{$path_temp}{need_space} += $size * $size_factor;  ## also in M now, $size_factor times the source size.
+				}  # No else, that error has already been recorded under Test 1
+			} ## end foreach my $src (@path_source)
+
+			# Note: See check_multi_temp_dir() about the sizes.
+			$dir_stats{$path_temp}{has_space} = $ref->{bavail} / 1024;
+			$dir_stats{$path_temp}{need_space} > $dir_stats{$path_temp}{has_space} and log_error(
+				$work_data, "Not enough space! '%s' has only %s / %s M free!",
+				$path_temp,
+				cleanint( $dir_stats{$path_temp}{has_space} ),
+				cleanint( $dir_stats{$path_temp}{need_space} )
+			  )
+			  and ++$errCount
+			  or log_info( $work_data, "Directory '%s' needs approximately %s MiB space for temporary files.", $path_temp,
+				cleanint( $dir_stats{$path_temp}{need_space} ) );
 		} else {
 
 			# =) df() failed? WTH?
-			log_error( $work_data, "df'ing directory '%s' FAILED!", $path_temp ) and ++${$errCount};
+			log_error( $work_data, "df'ing directory '%s' FAILED!", $path_temp ) and ++$errCount;
 		}
 	} else {
 
 		# =) Temp Dir does NOT exist
-		log_error( $work_data, "Temp directory '%s' does not exist!", $path_temp ) and ++${$errCount};
+		log_error( $work_data, "Temp directory '%s' does not exist!", $path_temp ) and ++$errCount;
 	}
 
-	return 1;
+	return $errCount > 0 ? 0 : 1;
 } ## end sub check_single_temp_dir
 
 # Make sure we have a sane target FPS. max_fps is reused as upper fps
@@ -882,9 +895,7 @@ sub check_target_fps {
 } ## end sub check_target_fps
 
 sub check_temp_dir {
-	my ( $errCount, $total_size ) = @_;
-
-	return ( ( length $path_temp ) > 0 ) ? check_single_temp_dir( $errCount, $total_size ) : check_multi_temp_dir($errCount);
+	return ( ( length $path_temp ) > 0 ) ? check_single_temp_dir() : check_multi_temp_dir();
 }
 
 sub cleanint {
@@ -1242,6 +1253,29 @@ sub get_pid_status {
 
 	return $status;
 } ## end sub get_pid_status
+
+sub get_size_factor {
+	my ($src) = @_;
+
+	# Experiments showed, that the lower the bitrate of the source videos is, the more temporary space is needed.
+	# This is mainly due to the usage of ut video, which means a pure set of iframes with bitrates going through
+	# the roof.
+	# Test videos went from a factor of ~20 with source bitrates around 180 mbit up to a factor of ~117 with
+	# sources that had only 35 mbit.
+	# We therefore use these two as boundaries, and the range in between is interpolated linear.
+	my $mbit = ( $source_info{$src}{'bit_rate'} // 80_000_000 ) / 1024 / 1024;               ## MBit/s of the source file
+	my $d1   = $mbit - 35;                                                                   ## Distance to lower bound
+	my $f1   = $d1 / 145;                                                                    ## Amount of the lower bound factor
+	my $d2   = 180 - $mbit;                                                                  ## Distance to upper bound
+	my $f2   = $d2 / 145;                                                                    ## Amount of the upper bound factor
+	my $res  = ( $mbit <= 45 ) ? 100 : ( $mbit >= 180 ) ? 20 : ( $f1 * 120 ) + ( $f2 * 20 );
+
+	log_debug( $work_data, "File '%s': %d lower distance, %d upper distance", $src, $d1, $d2 );
+	log_debug( $work_data, '  => %3.2f lower factor, %3.2f upper factor',     $f1,  $f2 );
+	log_debug( $work_data, '  => %3.2f Final factor',                         $res );
+
+	return $res;
+} ## end sub get_size_factor
 
 sub get_time_now {
 	my @tLocalTime = localtime;
@@ -2440,11 +2474,10 @@ sub warnHandler {
 }
 
 sub validate_input_file {
-	my ( $src, $total_size ) = @_;
+	my ($src) = @_;
 	if ( -f $src ) {
 		my $in_size = -s $src;
 		( $in_size > 0 ) or log_error( $work_data, "Input file '%s' is empty!", $src ) and return 0;
-		${$total_size} += $in_size / 1024 / 1024;  # We count 1M blocks
 		++$source_count;
 	} else {
 		log_error( $work_data, "Input file '%s' does not exist!", $src );
