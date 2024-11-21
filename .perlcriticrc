@@ -11,7 +11,7 @@ allow-unsafe    = 0
 
 [Documentation::PodSpelling]
 spell_command = aspell --lang=en list
-stop_words = EdenWorX HurryKane MERCHANTABILITY cac ffmpeg mkv splitaudio tempdir wav yt
+stop_words = EdenWorX HurryKane MERCHANTABILITY cac ffmpeg maxfps mkv splitaudio tempdir targetfps wav yt
 
 [InputOutput::ProhibitBacktickOperators]
 only_in_void_context = 1

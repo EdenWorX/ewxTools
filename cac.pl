@@ -42,12 +42,14 @@ my $work_done = 0;            # Needed to know whether to log anything on END{}
 # 1.0.6    2024-08-21  sed, EdenWorX  Split concatenating multiple sources from the segment creation, it is safer to do
 #                                       this in two steps.
 # 1.0.7    2024-09-02  sed, EdenWorX  Rework the code for terminating and restarting a frozen fork.
-# 24.09.09 2024-09-09  sed, EdenWorX  New Version Scheme release
+#   ( Version is the date from hereon )
+# 24.09.09             sed, EdenWorX  New Version Scheme release
 #                                     The classic <major>.<minor>.<patch> scheme does not say anything at all. The
 #                                     reverse date scheme at least tells you the release date.
+# 24.09.24             sed, EdenWorX  Allow users to specify maximum and target fps.
 #
 # Please keep this current:
-Readonly our $VERSION => '24.09.09';
+Readonly our $VERSION => '24.09.24';
 
 # =======================================================================================
 # Workflow:
@@ -168,6 +170,8 @@ my $ff_interp_libp_high = "libplacebo='extra_opts=preset=high_quality:frame_mixe
 my $ff_interp_mint_none = "minterpolate='fps=%d:mi_mode=dup:scd=none'";
 my $ff_interp_mint_high = "minterpolate='fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'";
 
+my $arg_max_fps      = 0;
+my $arg_tgt_fps      = 0;
 my %dir_stats        = ();                ## <dir> => { has_space => <what df says>, need_space => all inputs in there x 80, srcs => @src }
 my $do_print_help    = 0;
 my $do_print_version = 0;
@@ -211,9 +215,11 @@ my %program_options = (
 	'debug|D'       => \$do_debug,
 	'input|i=s'     => \@path_source,
 	'lock-debug'    => \$do_lock_debug,
+	'maxfps=i'      => \$arg_max_fps,
 	'output|o=s'    => \$path_target,
 	'splitaudio|s!' => \$do_split_audio,
 	'tempdir|t:s'   => \$path_temp,
+	'targetfps=i'   => \$arg_tgt_fps,
 	'upgrade|u'     => \$force_upgrade,
 	'version|V'     => \$do_print_version
 );
@@ -883,6 +889,8 @@ sub check_single_temp_dir {
 # Make sure we have a sane target FPS. max_fps is reused as upper fps
 sub check_target_fps {
 	can_work() or return 1;
+
+	# First set defaults:
 	$target_fps = ( ( $max_fps < 50 ) && ( 0 == $force_upgrade ) ) ? 30 : 60;
 	if ( $max_fps < ( 2 * $target_fps ) ) {
 
@@ -892,6 +900,17 @@ sub check_target_fps {
 		# timing being _very_ different from 120 FPS timing.
 		$max_fps = 2 * $target_fps;
 	} ## end if ( $max_fps < ( 2 * ...))
+
+	# If the maximum FPS set by the user is larger than the currently set maximum FPS,
+	# we'll use the users choice.
+	( $arg_max_fps > $max_fps ) and $max_fps = $arg_max_fps;
+
+	# If the user has set a target FPS, we use that one unless it exceeds maximum FPS
+	( $arg_tgt_fps > 0 ) and $target_fps = $arg_tgt_fps;
+
+	# Target FPS must not exceed maximum FPS
+	( $target_fps > $max_fps ) and $target_fps = $max_fps;
+
 	log_info( $work_data, 'Decimate and interpolate up to %d FPS', $max_fps );
 	log_info( $work_data, 'Then interpolate to the target %d FPS', $target_fps );
 	return 1;
@@ -2722,6 +2741,20 @@ The file to write. Must not equal any input file. Must have .mkv ending.
 =item B<-h | --help>
 
 This help message
+
+=item B<--maxfps>
+
+The maximum FPS to upscale the video to. Must be larger than the target FPS and
+defaults to twice the target FPS. If the FPS of the source material is higher
+than the set maximum FPS, the source FPS will be used instead.
+
+=item B<--targetfps>
+
+The target FPS to produce the target video in. Defaults to 60 FPS for all videos
+that are made from source material of 50+ FPS, and to 30 FPS for all videos with
+lower source FPS. If it is set to a larger number than the set maximum FPS, it
+will be lowered to the maximum FPS set.
+The lower bound is 1, any value below 1 is ignored.
 
 =item B<-t | --tempdir>
 
