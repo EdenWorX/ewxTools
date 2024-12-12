@@ -1,5 +1,9 @@
 #!/bin/bash
 
+VERSION="1.1"
+# V0.1 - V1.0 ; years ago  ; sed ; Various versions fixing and optimizing on the run
+# Version 1.1 ; 2024-12-12 ; sed ; Modernization and a history section (sort of)
+
 SHORT="a,c,f,h,l:,n,s:t:,v,z"
 LONG="auto,cleanup,fsync,help,logfile,no-dir,source:,target:,verify,compress"
 OPTS=$(getopt --name backup_dir --options $SHORT --longoptions $LONG -- "$@")
@@ -13,55 +17,53 @@ xLogFile=""
 xShowHelp="no"
 xSrc=""
 xSubDir="yes"
-ySync=""
 xTgt=""
 xVerify="no"
 
-while :
-do
+while :; do
 	case "$1" in
-		-a | --auto )
+		-a | --auto)
 			xAsk="no"
 			shift 1
 			;;
-		-c | --cleanup )
+		-c | --cleanup)
 			xDel="--delete-during"
 			shift 1
 			;;
-		-h | --help )
+		-h | --help)
 			xShowHelp="yes"
 			shift 1
 			;;
-		-f | --fsync )
+		-f | --fsync)
 			xSync="--fsync"
 			shift 1
 			;;
-		-l | --logfile )
+		-l | --logfile)
 			xLogFile="$2"
 			shift 2
 			;;
-		-n | --no-dir )
+		-n | --no-dir)
 			xSubDir="no"
 			shift 1
 			;;
-		-s | --source )
+		-s | --source)
 			xSrc="$2"
 			shift 2
 			;;
-		-t | --target )
+		-t | --target)
 			xTgt="$2"
 			shift 2
 			;;
-		-v | --verify )
+		-v | --verify)
 			xVerify="yes"
 			shift 1
 			;;
-		-z | --compress )
+		-z | --compress)
 			xCompress="z"
 			shift 1
 			;;
 		--)
-			shift;
+			shift
 			break
 			;;
 		*)
@@ -71,10 +73,9 @@ do
 	esac
 done
 
-xExtras="$@"
+xExtras="$*"
 
-
-if [[ "x$xTgt" = "x" || "x$xSrc" = "x" || "x$xShowHelp" = "xyes" ]] ; then
+if [[ -z $xTgt || -z $xSrc || "$xShowHelp" = "yes" ]]; then
 	echo "Usage: $0 [OPTIONS] <-s|--source source> <-t|--target target> [-- [rsync options]]"
 	echo
 	echo "Backup <source> into <target>"
@@ -89,7 +90,8 @@ if [[ "x$xTgt" = "x" || "x$xSrc" = "x" || "x$xShowHelp" = "xyes" ]] ; then
 	echo "  -n --no-dir   : Do not create a subdirectory in the target, copy directly"
 	echo "  -v --verify   : Add a second rsync run that checks all checksums"
 	echo "  -z --compress : Compress file streams. Only use on very slow network connections"
-  exit 0
+	echo -e "\n\tV${VERSION}"
+	exit 0
 fi
 
 # Normalize trailing spaces
@@ -98,59 +100,59 @@ xTgt="$(echo -n "$xTgt" | sed -e 's,/*$,,g')/"
 
 # If the --no-dir option was not used, add basename of source as a subdirectory to target
 if [[ "yes" = "$xSubDir" ]]; then
-	xTgt="$xTgt$(basename $xSrc)/"
+	xTgt="$xTgt$(basename "$xSrc")/"
 fi
 
-
 # Log into dirname of (the final) target, that should always be writable by the caller.
-xLog="$(dirname $xTgt)/backup_$(basename $xSrc)_$(date '+%Y%m%d').log"
+xLog="$(dirname "$xTgt")/backup_$(basename "$xSrc")_$(date '+%Y%m%d').log"
 
 # If a logfile was set, use that instead
 if [[ "x" != "x$xLogFile" ]]; then
 	xLog="${xLogFile}"
 fi
 
-
 function log {
-	local xMsg="$@"
-	local xNow="$(date '+%Y-%m-%d %H:%M:%S')"
+	local xMsg
+	local xNow
+	xMsg="$*"
+	xNow="$(date '+%Y-%m-%d %H:%M:%S')"
 	echo "$xNow : $xMsg"
-	echo "$xNow : $xMsg" >> $xLog
+	echo "$xNow : $xMsg" >>"$xLog"
 	return 0
 }
-
 
 # Instead of getting killed directly by CTRL-C, let's try a cleaner interrupt.
 # Also a verification run should not start if we where told to break off
 xHaveCtrlC=0
 
-
 function ctrlc {
+	# shellcheck disable=SC2317
 	xHaveCtrlC=1
+	# shellcheck disable=SC2317
 	log "CTRL-C caught, breaking off..."
+	# shellcheck disable=SC2317
 	return 0
 }
 
-
 # -----------------------------------------------------------------------------
 
-if [ "x$xAsk" = "xno" ] ; then
+if [ "$xAsk" = "no" ]; then
 	echo -n "Backing up content from $xSrc into $xTgt ("
-	if [ -n "$xDel" ] ; then
+	if [ -n "$xDel" ]; then
 		echo "WITH cleanup)"
 	else
 		echo " no  cleanup)"
 	fi
 else
 	echo -n "Backup content from $xSrc into $xTgt ? [Y/n] ("
-	if [ -n "$xDel" ] ; then
+	if [ -n "$xDel" ]; then
 		echo -n "WITH cleanup) : "
 	else
 		echo -n " no  cleanup) : "
 	fi
-	read answer
+	read -r answer
 
-	if [ "xn" = "x$answer" ] ; then
+	if [ "n" = "$answer" ]; then
 		echo "Backup aborted"
 		exit 0
 	fi
@@ -169,7 +171,7 @@ if [[ 0 -eq $xHaveCtrlC ]]; then
 fi
 
 # SECOND run; Verification rsync check
-if [[ "x$xVerify" = "xyes" && 0 -eq $xHaveCtrlC && 0 -eq $xReturn ]]; then
+if [[ "$xVerify" = "yes" && 0 -eq $xHaveCtrlC && 0 -eq $xReturn ]]; then
 	log "Start Verify $xTgt"
 	cmd="rsync $cmd_args -c $xSrc $xTgt"
 	log "$cmd"
@@ -179,16 +181,14 @@ fi
 
 # Make sure we do post a useful exit code
 xExit=0
-if [[ 0 -ne $xReturn ]];    then xExit=1; fi
+if [[ 0 -ne $xReturn ]]; then    xExit=1; fi
 if [[ 0 -ne $xHaveCtrlC ]]; then xExit=2; fi
 
 log "End Backup $xSrc into $xTgt [Exit $xExit]"
-
 
 # Pack logfile to safe space
 if [[ -f "${xLog}" ]]; then
 	bzip2 "${xLog}"
 fi
-
 
 exit $xExit
