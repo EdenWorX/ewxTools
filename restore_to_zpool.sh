@@ -2,7 +2,7 @@
 
 VERSION="1.0"
 
-# Version 0.1, 20240606, sed - First Version
+# Version 1.0, 20240606, sed - First Version
 
 xPool="$1"
 xBack="$2"
@@ -37,14 +37,14 @@ if [[ 0 -lt ${UID} ]]; then
 	cmdSudo="$(which sudo) "
 fi
 
-declare -a xFiles=( )
+declare -a xFiles=()
 xHaveStart=0
 
-for line in $(${cmdSudo}${cmdZPool} status -v ${xPool} 2>&1); do
+for line in $(${cmdSudo}${cmdZPool} status -v "${xPool}" 2>&1); do
 	word="$(echo -n "${line}" | xargs)"
 	if [[ 2 -eq ${xHaveStart} ]]; then
 		if [[ "/" = "${word:0:1}" ]]; then
-			xFiles+=( "${word}" )
+			xFiles+=("${word}")
 		fi
 	elif [[ 1 -eq ${xHaveStart} && "files:" = "${word}" ]]; then
 		xHaveStart=2
@@ -66,7 +66,7 @@ for xFile in "${xFiles[@]}"; do
 	[ -z "${xHashB}" ] && xHashB="unavailable"
 	echo "${xHashB}"
 
-	if [[ ( "unavailable" = "${xHashA}" ) || ( "unavailable" != "${xHashB}" && "${xHashA}" != "${xHashB}" ) ]]; then
+	if [[ ("unavailable" = "${xHashA}") || ("unavailable" != "${xHashB}" && "${xHashA}" != "${xHashB}")   ]]; then
 		echo -n " => restoring..."
 		${xNoDo}${cmdSudo}${cmdCP} "${xBack}${xFile}" "$(dirname "${xFile}")/"
 		echo "done"
